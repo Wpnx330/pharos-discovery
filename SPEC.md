@@ -67,7 +67,7 @@ We are deliberately **not adopting Google's ARD spec** as our north star. ARD is
 
 **The MCP protocol is a standard; `registry.modelcontextprotocol.io` is one registry that happened to launch first.** Pharos is complementary to the protocol, not subordinate to any single registry. The protocol defines how agents and servers speak to each other; a registry is a catalog of which servers exist. Those are different concerns. Multiple registries can coexist behind one protocol — exactly as the web has one HTTP protocol and many search engines. Pharos is built to be one such registry-backed discovery layer, neutral among registries and federating across all of them.
 
-### 2.4 Failure modes and triggers to pivot
+### 2.1 Failure modes and triggers to pivot
 
 The "next Google" framing is aspirational. The realistic outcomes form a spectrum, and the architecture should be robust to each:
 
@@ -271,7 +271,7 @@ The primary discovery endpoint. Accepts a natural-language query and optional st
 {
   "results": [
     {
-      "id": "urn:pharos:acme.com:travel:flight-booking",
+      "id": "urn:pharos:acme.com:travel/flight-booking",
       "display_name": "Acme Flight Booking",
       "description": "Search and book flights across 400+ airlines with live pricing.",
       "publisher": {
@@ -322,7 +322,10 @@ The primary discovery endpoint. Accepts a natural-language query and optional st
       },
       "trust": {
         "signature": "eyJ...",
-        "attestations": ["SOC2-Type2", "GDPR"]
+        "attestations": [
+          {"type": "SOC2-Type2", "uri": "https://example.com/soc2", "verified": true, "verifier": "pharos-registry", "verified_at": "2025-01-15T00:00:00Z"},
+          {"type": "GDPR", "uri": "https://example.com/gdpr", "verified": false, "verifier": null, "verified_at": null}
+        ]
       },
       "representative_queries": [
         "book a one-way flight from NYC to Tokyo",
@@ -383,7 +386,7 @@ The `ServerCard.id` is a logical URN (`urn:pharos:<fqdn>:<namespace>/<name>`, Ap
 3. If the card is federated from an upstream registry (§6.5), the registry resolves the canonical ID, fetches (or has cached) the card from upstream, and returns it. The returned card carries `source_registry` identifying the origin.
 4. URNs are stable across endpoint changes, transport changes, and registry migrations. A server that moves from `https://mcp.acme.com/...` to `https://mcp2.acme.com/...` keeps the same URN; only the `endpoint` field changes.
 
-**Key rotation and re-verification (H4).** Publisher keys pinned by the SDK (§9.3, §10.8) are re-validated on a TTL, not held forever:
+**Key rotation and re-verification (H4).** Publisher keys pinned by the SDK (§9.3, §10.9) are re-validated on a TTL, not held forever:
 
 - The SDK re-fetches `https://<publisher>/.well-known/pharos-pubkey.json` at most every `key_pin_ttl_seconds` (default 86400 = 24h). A failed re-fetch after TTL quarantines the server (connection refused) until re-validation succeeds.
 - A change in the publisher domain's **WHOIS registrant or nameservers** triggers immediate re-verification of `domain_control` (§10.1), independent of TTL. A domain transferred to a new registrant is treated as a new publisher; the old `identity` verification does not carry over.
@@ -412,7 +415,7 @@ When the host agent's approval UX completes, the SDK emits a local `ApprovalToke
 
 ```json
 {
-  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "server_id": "urn:pharos:acme.com:travel/flight-booking",
   "user_id_hash": "sha256:...",
   "agent_id": "claude-code/1.2.3",
   "approved_at": "2026-07-19T08:42:11Z",
@@ -437,14 +440,14 @@ A Server-Sent Events (SSE) endpoint the SDK MAY subscribe to for push-based inva
 | `card.deleted` | `{server_id}` | Remove from cache; if currently connected, emit `ServerDeleted(server_id)` and tear down per §9.5. |
 | `card.deprecated` | `{server_id, successor_id}` | Update cached card `status="deprecated"`; surface deprecation in the approval UX. |
 | `blocklist.updated` | `{added: [...], removed: [...]}` | Merge into the local blocklist (§10.3); block newly-added servers before any in-flight connection. |
-| `publisher_key.rotated` | `{publisher_id, new_jwks_url}` | Re-fetch and re-pin the publisher key (§10.8); quarantine on fetch failure. |
+| `publisher_key.rotated` | `{publisher_id, new_jwks_url}` | Re-fetch and re-pin the publisher key (§10.9); quarantine on fetch failure. |
 | `ping` | `{}` | Keepalive; the SDK treats a missed ping beyond `health_check_interval` as a dead stream and reconnects. |
 
 **Reconnection.** The SDK reconnects with exponential backoff (initial 1s, cap 60s) and `Last-Event-ID` so the server can replay missed events. If the SSE stream is unavailable, the SDK falls back to TTL-based polling (the existing cache + blocklist TTLs) — `/v1/events` is an optimization for freshness, not a correctness requirement.
 
 **Auth.** Unauthenticated for public-registry events on the public Pharos Registry; enterprise registries MAY require an API key passed as a query param or `Authorization` header (SSE does not support custom headers on the EventSource API, so query-param auth is the norm).
 
-This endpoint is referenced from §8.5 (`events_endpoint` config), §10.3 (blocklist push invalidation), and §10.8 (publisher key rotation).
+This endpoint is referenced from §8.5 (`events_endpoint` config), §10.3 (blocklist push invalidation), and §10.9 (publisher key rotation).
 
 ### 6.8 `GET /v1/servers/{id}/oauth` — OAuth metadata (Phase 2)
 
@@ -454,7 +457,7 @@ Returns the full OAuth/authorization configuration for a server, used by the SDK
 
 ```json
 {
-  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "server_id": "urn:pharos:acme.com:travel/flight-booking",
   "auth": {
     "type": "oauth",
     "secret_handling": "server_side",
@@ -615,7 +618,7 @@ The approval card MUST surface — at minimum — the following fields from the 
 
 **Recommended:**
 
-- A link to the server's `documentationUrl`
+- A link to the server's `documentation_url`
 - The last-known `version` and `updated_at`
 - Any `representative_queries` so the user can sanity-check the server's purpose
 - Whether the connection will persist for this session, this request, or indefinitely
@@ -648,7 +651,7 @@ On approval, the SDK mints a local, signed `ApprovalToken`:
 ```json
 {
   "token_id": "uuid",
-  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "server_id": "urn:pharos:acme.com:travel/flight-booking",
   "approved_scopes": ["flight_search", "flight_book"],
   "approved_capabilities": ["flight_search", "flight_book"],
   "approved_oauth_scopes": ["bookings:write", "profile:read"],
@@ -670,7 +673,7 @@ The SDK exposes the approval flow as a **callback** so the host agent controls r
 1. **CLI / terminal agents** (Claude Code, Cursor, custom CLIs) — the SDK renders an inline text card and prompts `[y/N/scope:...]`. Default for `stdio` agents.
 2. **Chat / web agents** (ChatGPT, Claude.ai, Gemini web) — the SDK returns a JSON approval payload; the host renders a rich card with buttons. The host calls `pharos.resolve_approval(payload)` with the user's choice.
 3. **Voice / headless agents** — the SDK reads a short spoken summary and requires a verbal "yes, approve <server name>" confirmation. Headless pipelines (CI, batch, automated tests) MAY use `headless_mode=true`, which is a **scoped** bypass, not a blanket opt-out:
-   - `headless_mode` **requires** a pre-approved scope set and an explicit server allow-list supplied via config (e.g. `headless_allow_servers: ["urn:pharos:acme.com:travel:flight-booking"]` and `headless_allow_scopes: ["flight_search"]`). It is NOT "approve everything."
+   - `headless_mode` **requires** a pre-approved scope set and an explicit server allow-list supplied via config (e.g. `headless_allow_servers: ["urn:pharos:acme.com:travel/flight-booking"]` and `headless_allow_scopes: ["flight_search"]`). It is NOT "approve everything."
    - The SDK **refuses novel servers** in headless mode — any server not on the configured allow-list surfaces a `HeadlessApprovalRequired` error and the connection is not made. There is no silent connection to a server the user has never seen.
    - Every headless-mode connection is **logged prominently** (console warning + `on_tool_use` event tagged `headless=true`) so an operator auditing logs cannot miss that an automated approval occurred.
    - `headless_mode` and `trust_on_use` (§7.3) are mutually exclusive — automated trust propagation is too dangerous in a pipeline context.
@@ -849,6 +852,9 @@ class ServerCard:
     rate_limits: dict | None       # server's own rate limits, e.g. {"per_minute": 100, "per_day": 10000}
     health_endpoint: str | None    # liveness URL the registry probes
     protocol_versions: list[str]   # MCP protocol versions the server speaks, e.g. ["2025-03-26"]
+    source_urn: str | None        # Original native ID when federated from a non-Pharos registry (§6.5 dedup); None for Pharos-native cards
+    documentation_url: str | None  # URL to human-readable documentation for this server
+    tags: list[str]               # Free-form tags for categorization; indexed for filtering (§6.3.1)
 
 # ApprovalRequest (handed to the host's render callback)
 class ApprovalRequest:
@@ -1059,7 +1065,7 @@ For remote MCP servers:
 - The SDK negotiates automatically based on the `ServerCard.transport` and `endpoint` fields. No host-agent code required.
 - **Security**: all remote connections use TLS 1.2+. The SDK pins the publisher's public key when `trust.signature` is present and `verify_signatures=True`.
 - **Cert validation (H8).** Full chain validation is required; a missing intermediate, expired leaf, or hostname mismatch is a hard error and the connection is refused. Pinning failure (the pinned key does not match the leaf or SPKI chain presented at handshake) is also a hard error when `verify_signatures=True` — the SDK does NOT fall back to "regular" validation for a pinned server, because a pin mismatch is the signal that the publisher's key rotated (legitimately) or the connection is being intercepted (maliciously).
-- **Key pinning TTL and rotation (H9).** Pins are NOT held forever. The SDK re-fetches the publisher's `.well-known/pharos-pubkey.json` at most every 24h (configurable via `key_pin_ttl_seconds`, default 86400) and updates the pin. This allows legitimate key rotation (e.g. compromise response) without the pin becoming a self-inflicted denial of service. A pin that fails to refresh after TTL is quarantined — the server is not connectable until the publisher's key is re-validated (§10.8). Domain WHOIS changes trigger re-verification of the publisher's domain control.
+- **Key pinning TTL and rotation (H9).** Pins are NOT held forever. The SDK re-fetches the publisher's `.well-known/pharos-pubkey.json` at most every 24h (configurable via `key_pin_ttl_seconds`, default 86400) and updates the pin. This allows legitimate key rotation (e.g. compromise response) without the pin becoming a self-inflicted denial of service. A pin that fails to refresh after TTL is quarantined — the server is not connectable until the publisher's key is re-validated (§10.9). Domain WHOIS changes trigger re-verification of the publisher's domain control.
 
 ### 9.4 Per-server authentication
 
@@ -1138,7 +1144,7 @@ OAuth under App Registration Inheritance has a fundamentally smaller attack surf
 - **Scope minimization.** The `OAuthFlowHandler` passes to the MCP server only the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the vendor. If the authorization server grants a narrower set than requested, the MCP server reports the *actual* granted scopes back to the agent, and the Connection Manager enforces tool calls against those, not the requested set.
 - **DCR hygiene (legacy fallback only).** App Registration Inheritance is the preferred path; DCR is a fallback for vendors who did not pre-register an app. When DCR is used, the MCP server (not the agent) generates a fresh PKCE verifier per flow, discards the registered `client_id` after the session unless the user opts into `persistent` duration, and rate-limits DCR calls (max 1 per server per 5 minutes) to avoid the unbounded-DB-growth problem that motivated CIMD.
 - **Token leak prevention.** Because tokens are server-side, the agent has no token to leak. The `on_tool_use` callback receives redacted auth headers. `OAuthResult` objects are not serializable into logs by default and carry no secret material.
-- **Revocation proof (H16).** `OAuthFlowHandler.revoke_access()` is best-effort as a request, but the MCP server MUST return a `revocation_proof` — a signed assertion that it called `endpoints.revocation` with the token, or a token-introspection (RFC 7662) response showing `active: false`. The SDK verifies the proof against `endpoints.jwks`. If no proof arrives within 60s, the server is marked `revocation_unconfirmed` and the SDK surfaces a warning to the user: "Acme Flights may still have access to your account. Revoke directly at `<vendor app-management URL>`." The `ServerCard` exposes `endpoints.revocation` and the vendor's app-management URL (in `app_registration.endpoints.revocation` and a new `app_management_url` field) so the user can revoke at the IdP directly when the MCP server is unresponsive or malicious. This is added to the §10.7 threat model as "Revocation not honored."
+- **Revocation proof (H16).** `OAuthFlowHandler.revoke_access()` is best-effort as a request, but the MCP server MUST return a `revocation_proof` — a signed assertion that it called `endpoints.revocation` with the token, or a token-introspection (RFC 7662) response showing `active: false`. The SDK verifies the proof against `endpoints.jwks`. If no proof arrives within 60s, the server is marked `revocation_unconfirmed` and the SDK surfaces a warning to the user: "Acme Flights may still have access to your account. Revoke directly at `<vendor app-management URL>`." The `ServerCard` exposes `auth.app_registration.app_management_url` and `auth.app_registration.endpoints.revocation` on the ServerCard so the user can revoke at the IdP directly when the MCP server is unresponsive or malicious. This is added to the §10.7 threat model as "Revocation not honored."
 - **Server-side exfiltration (C7).** The agent never sees the token, but the MCP server holds it and can misuse it. A malicious MCP server can call the vendor's API with the user's token for *any* purpose within the granted scope — not just the agent's requested tool call — and can exfiltrate the resulting data to a third-party endpoint. The SDK's `egress_allowlist` (§10.2) only covers *agent* egress, not *MCP server* egress. Mitigations (all partial — server-side abuse is fundamentally out of the SDK's control and consent is the only leverage):
   - The inline OAuth UI (§17.5) SHOULD display: "This server will be able to call `<vendor API>` on your behalf for any purpose within the approved scopes." The over-broad risk is made explicit to the user before consent.
   - Vendors SHOULD use their IdP's fine-grained scopes (e.g. `bookings:write:flight_only` rather than `bookings:write`), and the SDK SHOULD surface scope granularity in the approval prompt so the user can see the difference.
@@ -1185,7 +1191,7 @@ The approval gate (§7) and the `approved_scopes` check (§4.2) are enforced **b
 
 - **Non-SDK agents bypass consent.** An agent that speaks MCP directly — without using the Pharos SDK — can call `initialize` and `tools/call` with no approval token, and a conformant MCP server will respond. The SDK cannot prevent this; nothing in the MCP protocol requires an `ApprovalToken`. Calling §7 "enforced" without this caveat overstates the guarantee.
 - **What the SDK enforces.** For conformant SDK-using agents, the approval gate is non-bypassable: there is no `pharos.connect()` code path that reaches `MCPClient.initialize()` without a valid `ApprovalToken`, and no `tools/call` path that reaches the transport without an `approved_scopes` check. This is a strong client-side guarantee, analogous to a browser's same-origin policy — enforced by the client, not the server.
-- **Future goal: server-side enforcement (requires protocol extension).** A future MCP protocol extension could make `ApprovalToken` a server-checked credential presented at `initialize`, so that a non-SDK agent connecting without a valid token is refused by the server itself. This would convert the client-side contract into a wire-level primitive. The Pharos spec tracks this as a future goal and will contribute the extension upstream (§5.5); until then, the threat model treats non-SDK bypass as out of the SDK's control.
+- **Future goal: server-side enforcement (requires protocol extension).** A future MCP protocol extension could make `ApprovalToken` a server-checked credential presented at `initialize`, so that a non-SDK agent connecting without a valid token is refused by the server itself. This would convert the client-side contract into a wire-level primitive. The Pharos spec tracks this as a future goal and will contribute the extension upstream (§14.2, future features); until then, the threat model treats non-SDK bypass as out of the SDK's control.
 - **Reporting non-conformance.** Agents that ship without the Pharos SDK but claim Pharos compatibility are non-conformant; the conformance test suite (§8.6) is the arbiter. The spec does not pretend to enforce against agents that never import it.
 
 ### 10.8 Query privacy
@@ -1200,7 +1206,7 @@ Every `pharos.search(query)` sends the user's natural-language query to a regist
 
 This reconciles the §13.6 "discovery as SEO" framing (which assumes queries are observable and rankable) with user privacy: ranking signals come from *aggregate, anonymized* query volume and post-connection success signals (§13.6 H12), not from per-user query text.
 
-### 10.8 Key rotation and pin freshness
+### 10.9 Key rotation and pin freshness
 
 Publisher keys pinned by the SDK (§9.3) are re-validated on a TTL, not held forever:
 
@@ -1267,7 +1273,7 @@ AGNTCY (Linux Foundation Internet of Agents) provides discovery, identity, messa
 
 Agent2Agent (A2A) publishes `AgentCard` JSON documents at `/.well-known/agent-card.json` describing an agent's `name`, `description`, `version`, `url`, `skills`, `defaultInputModes`, `defaultOutputModes`, and `authentication`.
 
-**Scope decision (H3): discovery-only.** The A2A adapter is **discovery-only**. The SDK fetches and maps the `AgentCard` to a canonical `ServerCard` (each A2A `skill` → a canonical `capability`), surfaces it in search results, and presents the approval flow noting that the target is an A2A agent (JSON-RPC 2.0 over HTTP) rather than an MCP server. On approval, the SDK **returns the `AgentCard` to the host and does not connect** — the host (or the host's A2A client) performs the A2A transport connection itself. This avoids the spec having to define a full A2A transport (§9.6) in v1; if full A2A transport becomes a requirement, it will be added as a separate §9.6 in a future revision rather than half-defined here. Picking discovery-only keeps the adapter surface small and avoids an ambiguous "SDK connects to A2A but only partially" state.
+**Scope decision (H3): discovery-only.** The A2A adapter is **discovery-only**. The SDK fetches and maps the `AgentCard` to a canonical `ServerCard` (each A2A `skill` → a canonical `capability`), surfaces it in search results, and presents the approval flow noting that the target is an A2A agent (JSON-RPC 2.0 over HTTP) rather than an MCP server. On approval, the SDK **returns the `AgentCard` to the host and does not connect** — the host (or the host's A2A client) performs the A2A transport connection itself. This avoids the spec having to define a full A2A transport in v1; if full A2A transport becomes a requirement, it will be added as a new subsection of §9 in a future revision (no such subsection exists today) rather than half-defined here. Picking discovery-only keeps the adapter surface small and avoids an ambiguous "SDK connects to A2A but only partially" state.
 
 ### 11.7 Walled-garden bridges
 
@@ -1353,7 +1359,7 @@ User gets the capability they needed; business got found by an agent.
 
 ```json
 {
-  "id": "urn:pharos:acme.com:travel:flight-booking",
+  "id": "urn:pharos:acme.com:travel/flight-booking",
   "display_name": "Acme Flight Booking",
   "description": "Search and book flights across 400+ airlines with live pricing.",
   "publisher": {
@@ -1502,7 +1508,7 @@ The MVP delivers the core discovery-to-connection loop, against the Pharos Regis
 **Explicitly out of MVP:**
 - stdio transport (added in Phase 2)
 - ARD adapter (Phase 2)
-- **OAuth via App Registration Inheritance / `OAuthFlowHandler` / MCP Apps inline OAuth (Phase 2 — §17).** The expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the OAuth metadata endpoint (§6.8), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at a vendor-provided `auth_url`, in-memory token).
+- **OAuth via App Registration Inheritance / `OAuthFlowHandler` / MCP Apps inline OAuth (Phase 2 — §17).** The expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the OAuth metadata endpoint (§6.8), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with `auth_type: none` and `auth_type: api_key` only; OAuth (App Registration Inheritance, §17) is Phase 2.
 - Federation / referrals (Phase 3)
 - A2A and AGNTCY adapters (Phase 3)
 - Reviews and pricing surfaces beyond display (Phase 3)
@@ -1679,7 +1685,7 @@ This schema is the canonical source of truth for the `ServerCard` type reference
           "items": {"type": "string"},
           "description": "Flat scope list. Precedence (M4): for OAuth servers, app_registration.scopes is authoritative and this top-level scopes field is a legacy/display-only copy; for non-OAuth auth types, this field is authoritative. When both are present and conflict, app_registration.scopes wins for OAuth servers."
         },
-        "auth_url": {"type": "string", "description": "Legacy: authorization URL for the Phase 1 simple OAuth flow (§9.4). Deprecated in favor of app_registration.endpoints.authorization."},
+        "auth_url": {"type": "string", "description": "Legacy field: authorization URL for a simple OAuth redirect. Not used by the App Registration Inheritance flow (§17), which is the supported OAuth path from Phase 2 onward. Deprecated in favor of app_registration.endpoints.authorization."},
         "auth_server_url": {"type": "string", "description": "Legacy top-level copy; prefer app_registration.auth_server_url."},
         "authorization_endpoint": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.authorization."},
         "token_endpoint": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.token."},
@@ -1741,6 +1747,8 @@ This schema is the canonical source of truth for the `ServerCard` type reference
     "source_registry": {"type": "string"},
     "source_score": {"type": ["number", "null"], "description": "Original score from the source registry before normalization (§11.4)."},
     "source_urn": {"type": ["string", "null"], "description": "Original native ID when federated from a non-Pharos registry (§6.5 dedup)."},
+    "documentation_url": {"type": ["string", "null"], "description": "URL to human-readable documentation for this server."},
+    "tags": {"type": "array", "items": {"type": "string"}, "description": "Free-form tags for categorization; indexed for filtering (§6.3.1)."},
     "published_at": {"type": "string", "description": "ISO8601 — when first published to a registry (H2)."},
     "updated_at": {"type": "string", "description": "ISO8601 — when the card was last modified (H2)."},
     "status": {"enum": ["active", "deprecated", "deleted"], "description": "Lifecycle status (§10.7)."},
