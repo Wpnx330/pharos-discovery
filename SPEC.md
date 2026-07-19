@@ -26,6 +26,7 @@
 14. [MVP Scope vs. Future Features](#14-mvp-scope-vs-future-features)
 15. [Development Roadmap](#15-development-roadmap)
 16. [Appendices](#16-appendices)
+17. [OAuth-Aware Discovery](#17-oauth-aware-discovery)
 
 ---
 
@@ -37,10 +38,10 @@ Today, agent providers are each building their own walled-garden discovery chann
 
 Pharos Discovery replaces this fragmentation with **one thin, open, embeddable layer** that any agent can import and any compatible registry can serve. It is:
 
-- **Provider-neutral** — not aligned with ARD, AGNTCY, or any single vendor's discovery vision; capable of federating across all of them.
+- **Provider-neutral** — not aligned with ARD, AGNTCY, or any single vendor's discovery vision; capable of federating across all of them. We are a **complementary superset to the official MCP Registry**: we read `server.json` and registry entries, and add discovery, consent, and OAuth brokering on top.
 - **Consent-first** — agents **never** connect to a discovered service without explicit user approval. No silent connections, ever.
-- **Registry-agnostic** — ships with first-class support for the **Pharos Registry** (sister project) but speaks a documented HTTP API that any compliant registry can implement. Bridges to the official MCP Registry, ARD catalogs, and walled gardens are provided as adapters.
-- **Thin and embeddable** — a Python and TypeScript client library, not a server. Agents embed it; registries serve it.
+- **Registry-agnostic** — ships with first-class support for the **Pharos Registry** (sister project, built in Rust) but speaks a documented HTTP API that any compliant registry can implement. Bridges to the official MCP Registry, ARD catalogs, and walled gardens are provided as adapters.
+- **Thin and embeddable** — a Python and TypeScript client library, not a server. Agents embed it; registries serve it. (The Pharos Registry is a separate Rust project; the discovery SDKs just speak HTTP to the registry API, so the SDK language choice is independent of the registry implementation language.)
 
 This document specifies the architecture, the discovery protocol agents call, the user-approval UX contract, the SDK surface, transport handling for stdio and HTTP/SSE MCP servers, the security model, the compatibility layer, and a phased roadmap.
 
@@ -59,6 +60,10 @@ For this economy to function, three things must exist:
 3. **A consent layer** so that agents don't silently connect to arbitrary services on the user's behalf. Discovery without consent is a surveillance and security hazard. Pharos Discovery bakes user approval into the protocol — it is a first-class flow, not an afterthought.
 
 We are deliberately **not adopting Google's ARD spec** as our north star. ARD is a strong technical proposal and we implement a compatibility adapter for it, but Pharos stays neutral — we want the agentic web to be multi-vendor, not a Google-led re-run of the open web's capture.
+
+**Dual positioning.** Pharos Discovery is:
+- **Neutral on ARD** — we implement an adapter (§11.4), not a commitment. ARD catalogs are federation peers.
+- **A complementary superset to the official MCP Registry.** We consume the official registry's `server.json` / `/v0.1/servers` entries unchanged and add three layers the official registry deliberately omits: semantic + structured discovery, a consent/approval gate, and OAuth brokering (§17). We do not compete with the official registry for the canonical record of which servers exist; we make that record discoverable, approvable, and connectable.
 
 ---
 
@@ -261,8 +266,16 @@ The primary discovery endpoint. Accepts a natural-language query and optional st
       "auth": {
         "type": "oauth",
         "scopes": ["bookings:write", "profile:read"],
-        "auth_url": "https://acme.com/oauth/authorize"
+        "auth_url": "https://acme.com/oauth/authorize",
+        "auth_server_url": "https://auth.acme.com",
+        "token_endpoint": "https://auth.acme.com/oauth/token",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "pkce_required": true,
+        "dcr_support": false,
+        "cimd_support": true,
+        "jwks_url": "https://auth.acme.com/.well-known/jwks.json"
       },
+      "availability": "mirrored",
       "pricing": {
         "model": "per_call",
         "price_usd": 0.002,
@@ -309,6 +322,7 @@ Filters compose with AND across keys and OR within a key. Field paths are dot-se
 | `capabilities` | array | Any capability matches |
 | `trust.attestations` | array | Any attestation type matches |
 | `pricing.model` | array | Any of `free`, `per_call`, `subscription`, `revenue_share` |
+| `availability` | array | Any of `mirrored`, `referenced`, `native` (§13.4) |
 | `metadata.*` | array | Custom publisher metadata |
 
 If a registry does not support a requested filter path, it returns `400` with `UNSUPPORTED_FILTER`. The SDK falls back to client-side filtering on the returned results where possible.
@@ -352,16 +366,47 @@ When the host agent's approval UX completes, the SDK emits a local `ApprovalToke
 
 The registry returns an `audit_id`. This is **opt-in per host agent** — privacy-preserving agents may keep consent purely local. The SDK supports both modes.
 
-### 6.7 `POST /v1/feedback` — reviews & reports
+### 6.7 `GET /v1/servers/{id}/oauth` — OAuth metadata (Phase 2)
+
+Returns the full OAuth/authorization configuration for a server, used by the SDK's `OAuthFlowHandler` (§17) to execute an OAuth flow without the agent separately discovering the auth setup. This endpoint is an optimization — the same fields are already embedded in the `ServerCard.auth` object (§6.3) — but it allows a client to refresh just the OAuth config (which may rotate, e.g. `jwks_url` key rolls) without re-fetching the whole card.
+
+**Response:**
+
+```json
+{
+  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "auth": {
+    "type": "oauth",
+    "auth_server_url": "https://auth.acme.com",
+    "authorization_endpoint": "https://auth.acme.com/oauth/authorize",
+    "token_endpoint": "https://auth.acme.com/oauth/token",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "scopes": [{"name": "bookings:write", "description": "Create and modify bookings"}, {"name": "profile:read", "description": "Read profile data"}],
+    "pkce_required": true,
+    "dcr_support": false,
+    "dcr_endpoint": null,
+    "cimd_support": true,
+    "jwks_url": "https://auth.acme.com/.well-known/jwks.json",
+    "token_auth_method": "client_secret_basic"
+  },
+  "pharos_cimd_url": "https://registry.pharos.dev/v1/agents/{agent_provider_id}/cimd",
+  "fetched_at": "2026-07-19T08:42:11Z",
+  "expires_at": "2026-07-19T09:42:11Z"
+}
+```
+
+The `pharos_cimd_url` field is the stable URL where the agent provider's Client ID Metadata Document (CIMD, §17.3) is hosted by the Pharos Registry. When a server's authorization server supports CIMD, the SDK uses this URL as the OAuth `client_id` — no per-server registration required.
+
+### 6.8 `POST /v1/feedback` — reviews & reports
 
 - `POST /v1/feedback/review` — submit a star rating + text review for a server.
 - `POST /v1/feedback/report` — report a malicious or misbehaving server (feeds the registry's trust system and the SDK's local blocklist).
 
-### 6.8 `POST /v1/publish` — business discovery (publisher-side)
+### 6.9 `POST /v1/publish` — business discovery (publisher-side)
 
 Used by businesses to register their MCP service so it can be discovered. See §13.
 
-### 6.9 Error codes
+### 6.10 Error codes
 
 | HTTP | Code | Meaning |
 |---|---|---|
@@ -414,6 +459,7 @@ The approval card MUST surface — at minimum — the following fields from the 
 - `description` — what the server does, in plain language
 - `capabilities` — the concrete capabilities the agent intends to use (not necessarily all of them)
 - `auth.type` and `auth.scopes` — what permissions the server is requesting
+- **OAuth scope approval (when `auth.type == "oauth"`).** The approval prompt MUST enumerate the OAuth scopes being requested alongside the MCP capability scopes, in plain language. The user approves *two* things in a single consent act: (a) the connection to the server, and (b) the OAuth scopes the server's authorization server will be asked to grant. The SDK records the approved OAuth scope set in the `ApprovalToken.approved_oauth_scopes` field and passes only those scopes to the `OAuthFlowHandler` (§17). The handler MUST NOT request scopes the user did not approve. If the user narrows the OAuth scope set, the handler performs scope minimization (§17.4) before starting the flow.
 - `pricing.model` and `pricing.price_usd` — what it will cost, if anything
 - `trust.attestations` — compliance claims (SOC2, GDPR, etc.), shown as badges
 - `rating.score` and `rating.count` — community signal
@@ -431,7 +477,7 @@ The approval card MUST surface — at minimum — the following fields from the 
 Approval is a **specific, scoped, revocable** event:
 
 - **Specific** — the user approves *one* server for *one* stated purpose, not "all future discovery."
-- **Scoped** — the user sees the `auth.scopes` and `capabilities` being requested and can approve a subset. The SDK records the approved scope set in the `ApprovalToken`; the Connection Manager refuses tool calls outside the approved scopes.
+- **Scoped** — the user sees the `auth.scopes` and `capabilities` being requested and can approve a subset. The SDK records the approved scope set in the `ApprovalToken`; the Connection Manager refuses tool calls outside the approved scopes. For OAuth servers, this applies *both* to MCP capability scopes *and* to OAuth scopes (§17.4) — the user may narrow either independently.
 - **Revocable** — the user can revoke approval at any time via `pharos.revoke(server_id)`. The SDK tears down the connection and invalidates the token.
 - **Duration-bound** — approval defaults to `session` scope. The user may choose `once` (single tool call) or `persistent` (remembered across sessions, encrypted locally). `persistent` requires a second confirmation.
 
@@ -445,6 +491,7 @@ On approval, the SDK mints a local, signed `ApprovalToken`:
   "server_id": "urn:pharos:acme.com:travel:flight-booking",
   "approved_scopes": ["flight_search", "flight_book"],
   "approved_capabilities": ["flight_search", "flight_book"],
+  "approved_oauth_scopes": ["bookings:write", "profile:read"],
   "duration": "session",
   "approved_at": "2026-07-19T08:42:11Z",
   "expires_at": "2026-07-19T10:42:11Z",
@@ -603,7 +650,8 @@ class ServerCard:
     stdio_command: str | None      # e.g. "npx -y @acme/flights-mcp"
     capabilities: list[str]
     tools_count: int
-    auth: AuthSpec                 # {type, scopes, auth_url}
+    auth: AuthSpec                 # expanded OAuth config; see §17 and Appendix A
+    availability: str              # "mirrored" | "referenced" | "native" (see §17.5)
     pricing: PricingSpec | None
     rating: RatingSpec | None
     trust: TrustSpec | None
@@ -633,6 +681,7 @@ class ApprovalToken:
     server_id: str
     approved_scopes: list[str]
     approved_capabilities: list[str]
+    approved_oauth_scopes: list[str]   # OAuth scopes the user approved (§17.4); empty if auth.type != oauth
     duration: str
     approved_at: str
     expires_at: str
@@ -650,6 +699,29 @@ class MCPClient:
     async def read_resource(uri: str) -> str: ...
     async def list_prompts() -> list[Prompt]: ...
     async def close() -> None: ...
+
+# OAuthFlowHandler — executes the OAuth flow for a discovered server (§17).
+# Agent providers implement this ONCE; it works for every MCP server.
+class OAuthFlowHandler:
+    async def authorize(
+        self,
+        server: ServerCard,
+        approval: ApprovalToken,
+        redirect_uri: str,
+    ) -> OAuthResult: ...
+    async def refresh(self, server: ServerCard, refresh_token: str) -> OAuthResult: ...
+    def store_token(self, server_id: str, token: dict) -> None: ...
+    def load_token(self, server_id: str) -> dict | None: ...
+    def revoke_token(self, server_id: str) -> None: ...
+
+# OAuthResult — returned by OAuthFlowHandler.authorize()
+class OAuthResult:
+    access_token: str
+    token_type: str                # "Bearer"
+    expires_in: int | None
+    refresh_token: str | None
+    scope: list[str]               # scopes actually granted (may be a subset of requested)
+    acquired_via: str              # "cimd" | "dcr" | "api_key" | "static"
 ```
 
 ### 8.4 Embedding model
@@ -722,7 +794,7 @@ Discovery returns the server's auth requirements in `ServerCard.auth`. The SDK d
 
 1. `auth.type == "none"` — connect directly.
 2. `auth.type == "api_key"` — the SDK calls the host's `credential_provider` callback (host-supplied) to fetch the key, then sets the appropriate header.
-3. `auth.type == "oauth"` — the SDK launches the OAuth flow at `auth.auth_url` with the requested scopes. The user completes it in the host's UX. The resulting token is held in memory for the session only (never written to disk unless `duration=persistent` and the user explicitly opts in).
+3. `auth.type == "oauth"` — the SDK delegates to the `OAuthFlowHandler` (§17). Based on the expanded `auth` config in the `ServerCard`, the handler selects the appropriate flow: CIMD (using the agent provider's Pharos-hosted metadata URL as `client_id`), DCR (dynamic registration against `auth.dcr_endpoint`), or a static/client-credentials path. The user completes authorization in the host's UX. The resulting token is held in memory for the session only (never written to disk unless `duration=persistent` and the user explicitly opts in). Token refresh, scope minimization, and revocation are handled by the handler.
 4. `auth.type == "mtls"` — the SDK uses a client certificate from the host's credential store.
 
 **The approval prompt (§7.2) MUST display the requested auth scopes before the user approves.** Connecting a server that requests `profile:read` is a different consent decision than connecting one that requests `profile:read` + `payments:write`.
@@ -769,7 +841,18 @@ Pharos Discovery does not impose a specific sandbox, but it provides hooks for h
 - The store is append-only and signed with a local key so tampering is detectable.
 - Hosts may opt to mirror consent events to the registry (`POST /v1/approve`, §6.6) for cross-device audit, with `user_id_hash` only (never raw user IDs).
 
-### 10.5 Threat model (summary)
+### 10.5 OAuth security (Phase 2, see §17)
+
+OAuth brokering introduces its own attack surface. The SDK mitigates:
+
+- **SSRF prevention when fetching CIMD metadata.** When a server's authorization server fetches the agent's Client ID Metadata Document (§17.3), or when the SDK fetches a server's OAuth metadata, the SDK MUST NOT issue requests to internal/loopback/link-local addresses. The `OAuthFlowHandler` validates the fetched URL against an egress allowlist (the same `egress_allowlist` used for §10.2) before any HTTP call. Redirect chains are followed with a max depth of 3 and each hop is re-validated.
+- **CIMD metadata integrity.** The Pharos Registry serves CIMD documents over HTTPS with a stable, signed URL. The SDK MUST verify the TLS certificate chain and pin the registry's public key when `verify_signatures=True`. CIMD documents are cached locally with a short TTL (default 1 hour); stale cache is rejected if the registry signals key rotation.
+- **Token storage.** Access tokens live in memory only for `session` duration. For `persistent` duration, tokens are encrypted at rest with a key derived from the host OS keychain (SecretService / Keychain / DPAPI) — never plaintext on disk. Refresh tokens, when issued, are stored with the same protections and revoked via `OAuthFlowHandler.revoke_token()` on `pharos.revoke()`.
+- **Scope minimization.** The `OAuthFlowHandler` requests only the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the server. If the authorization server returns a narrower scope set than requested, the SDK records the *actual* granted scopes and the Connection Manager enforces against those, not the requested set.
+- **DCR hygiene.** When falling back to Dynamic Client Registration (§17.2), the SDK generates a fresh PKCE verifier per flow, discards the registered `client_id` after the session unless the user opts into `persistent` duration, and rate-limits DCR calls (max 1 per server per 5 minutes) to avoid contributing to the unbounded-DB-growth problem that motivated CIMD.
+- **Token leak prevention.** Tokens are never logged. The `on_tool_use` callback receives redacted auth headers. `OAuthResult` objects are not serializable into logs by default.
+
+### 10.6 Threat model (summary)
 
 | Threat | Mitigation |
 |---|---|
@@ -781,6 +864,10 @@ Pharos Discovery does not impose a specific sandbox, but it provides hooks for h
 | Compromised registry | Signatures verified against publisher's own published keys, not the registry's |
 | Stale/revoked servers | Registry `status` field (`active`/`deprecated`/`deleted`); SDK re-checks before connect |
 | OAuth scope creep | Scopes shown in approval prompt; only approved scopes passed to OAuth flow |
+| OAuth SSRF via CIMD/metadata fetch | Egress allowlist enforced on all OAuth metadata fetches; redirect depth capped at 3 |
+| OAuth token theft | In-memory only for session; OS keychain encryption for persistent; never logged |
+| Per-instance client ID proliferation | CIMD hosted by Pharos Registry — one stable `client_id` per agent provider, not per install |
+| DCR endpoint DoS / DB growth | Rate-limited DCR fallback; ephemeral client IDs; CIMD preferred path avoids `/register` entirely |
 
 ---
 
@@ -865,6 +952,7 @@ For vendor registries that do not expose a public search API (Claude Connectors 
 | Business discovery (publish-once) | ✅ via Pharos Registry | ✅ via `ai-catalog.json` | ✅ | ❌ | ❌ | ❌ | ✅ (publish to registry) | ✅ |
 | Pricing/reviews metadata | ✅ first-class | Via Schema.org ext | ❌ | ❌ | Vendor-specific | ❌ | ❌ | ❌ |
 | Transport handling (stdio + HTTP/SSE) | ✅ | ❌ (pre-invocation) | ❌ | ❌ | ✅ (Claude-managed) | ✅ (Copilot-managed) | ❌ | ✅ (gateway) |
+| OAuth brokering (one-time agent provider registration) | ✅ via CIMD hosting + `OAuthFlowHandler` (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
 | Status | Pre-implementation | v0.9 draft | Active | v1.x | Shipping | Shipping | Shipping | Shipping |
 
 **Key differentiators of Pharos Discovery:**
@@ -873,6 +961,7 @@ For vendor registries that do not expose a public search API (Claude Connectors 
 2. **Consent is in the protocol, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass.
 3. **Neutrality by design.** ARD is Google-led; AGNTCY is Cisco/Linux Foundation; Claude Connectors is Anthropic. Pharos is positioned as the neutral middle — implementing adapters for all of them, canonicalizing none.
 4. **Business metadata is first-class.** Pricing, reviews, and publisher identity are core fields, not Schema.org extensions. This reflects the "next Google" thesis: businesses are being discovered, not just tools.
+5. **OAuth brokering solves the MCP auth bootstrap problem.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server. This does not scale. Pharos Discovery's `OAuthFlowHandler` (§17) lets agent providers implement OAuth *once* and have it work for all MCP servers — via one-time registration with the Pharos Registry, which hosts the provider's Client ID Metadata Document (CIMD) at a stable URL. No per-server app registration. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side.
 
 ---
 
@@ -926,8 +1015,16 @@ User gets the capability they needed; business got found by an agent.
   "auth": {
     "type": "oauth",
     "scopes": ["bookings:write", "profile:read"],
-    "auth_url": "https://acme.com/oauth/authorize"
+    "auth_url": "https://acme.com/oauth/authorize",
+    "auth_server_url": "https://auth.acme.com",
+    "token_endpoint": "https://auth.acme.com/oauth/token",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "pkce_required": true,
+    "dcr_support": false,
+    "cimd_support": true,
+    "jwks_url": "https://auth.acme.com/.well-known/jwks.json"
   },
+  "availability": "mirrored",
   "pricing": {
     "model": "per_call",
     "price_usd": 0.002,
@@ -960,7 +1057,21 @@ A business that publishes to the Pharos Registry is discoverable by:
 
 This is the core value proposition for businesses: **one publish, every agent.**
 
-### 13.4 Discovery as the new SEO
+### 13.4 Availability & tarball mirroring
+
+The Pharos Registry mirrors npm and PyPI tarballs for the MCP servers it indexes. This matters for discovery because an agent or user discovering a server needs to trust that the server will still be available when they go to connect — especially for stdio servers launched from a package (`npx -y @acme/flights-mcp`), where an unpublished or yanked upstream package means a discovered server silently vanishes.
+
+The `ServerCard.availability` field (Appendix A) captures this:
+
+| Value | Meaning | Discovery implication |
+|---|---|---|
+| `mirrored` | The Pharos Registry holds a copy of the server's tarball (npm/PyPI) or a cached HTTP snapshot. Guaranteed retrievable. | Highest availability. Agents can install/connect even if upstream disappears. Shown with a "mirrored" trust badge. |
+| `referenced` | The registry indexes the server but points at the upstream package/endpoint. Availability depends on upstream. | Standard. The card links to upstream; if upstream vanishes, the card is marked `status: deleted` on next re-index. |
+| `native` | The server is published directly to the Pharos Registry (first-party), not via npm/PyPI. | The registry is the source of truth; availability is the registry's own SLA. |
+
+The SDK surfaces `availability` in the approval prompt so the user can see whether they're connecting to a mirrored, guaranteed-available server or one that may disappear with upstream changes. The filter `availability` (array) is supported in `POST /v1/search` (§6.3.1).
+
+### 13.5 Discovery as the new SEO
 
 Pharos Discovery treats `representative_queries` as the agentic analog of SEO keywords. Businesses that author high-quality representative queries get ranked higher for relevant natural-language agent searches. The registry uses these (plus the description and capabilities) to build semantic embeddings. Businesses that omit them will be under-discovered — the agentic equivalent of a page with no `<title>`.
 
@@ -989,6 +1100,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - stdio transport (added in Phase 2)
 - TypeScript SDK (Phase 2)
 - ARD adapter (Phase 2)
+- **OAuth-aware discovery / `OAuthFlowHandler` / CIMD hosting (Phase 2 — §17).** The expanded `auth` schema, the OAuth metadata endpoint (§6.7), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at `auth.auth_url`, in-memory token).
 - Federation / referrals (Phase 3)
 - A2A and AGNTCY adapters (Phase 3)
 - Reviews and pricing surfaces beyond display (Phase 3)
@@ -999,6 +1111,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 ### 14.2 Future features (post-MVP)
 
 - **Sandbox execution** for stdio servers (Docker/firejail/nsjail wrappers)
+- **OAuth-aware discovery** (§17): `OAuthFlowHandler`, CIMD hosting via Pharos Registry, DCR fallback, scope minimization, one-time agent provider registration
 - **Cross-registry federation** with automatic referral following
 - **A2A agent discovery** (treating A2A Agent Cards as discoverable capabilities)
 - **AGNTCY integration** (Linux Foundation IoA)
@@ -1020,7 +1133,8 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Spike: hand-craft a `ServerCard` for a real MCP server, exercise the MCP `initialize` → `tools/call` flow against it from a Python script.
 - Spike: call the official MCP Registry's `GET /v0.1/servers?search=filesystem` and map the response to a `ServerCard`.
 - Spike: call an ARD registry's `POST /search` and map the response.
-- **Exit criteria:** the spec's data model round-trips through all three sources without loss.
+- **Design review: OAuth-aware discovery (§17) data model.** Confirm the expanded `auth` schema, `OAuthFlowHandler` interface, and CIMD hosting plan are implementable against at least one real MCP server's OAuth flow and one authorization server that supports CIMD (or a CIMD-compatible mock).
+- **Exit criteria:** the spec's data model round-trips through all three sources without loss, AND the §17 design is validated as implementable (no implementation yet).
 
 ### Phase 1 — Python MVP (weeks 1–6)
 **Goal:** a working `pharos-discovery` Python package that an agent can embed to search the Pharos Registry, get approval, and connect to an HTTP/SSE MCP server.
@@ -1035,14 +1149,22 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Integration tests against a local mock registry + a real public MCP server
 - **Exit criteria:** a demo script that searches, approves, and calls a tool on a real remote MCP server, end-to-end.
 
-### Phase 2 — TypeScript + stdio + ARD (weeks 7–12)
+### Phase 2 — TypeScript + stdio + ARD + OAuth-aware discovery (weeks 7–12)
 - `@pharos/discovery` TypeScript package (parity with Python MVP)
 - stdio transport (subprocess launch, sandbox hooks)
 - ARD adapter (consume ARD registries; Pharos Registry exposes an ARD-compatible `/search`)
+- **OAuth-aware discovery (§17):**
+  - `OAuthFlowHandler` implementation (Python + TS) with CIMD, DCR, and API-key paths
+  - `GET /v1/servers/{id}/oauth` endpoint on the Pharos Registry (§6.7)
+  - One-time agent provider registration: `POST /v1/agents/register` on the Pharos Registry to host CIMD metadata at `https://registry.pharos.dev/v1/agents/{provider_id}/cimd`
+  - Expanded `auth` schema in `ServerCard` (Appendix A) populated by registry publishers
+  - OAuth scope approval integrated into the §7 consent gate (`approved_oauth_scopes` in `ApprovalToken`)
+  - Scope minimization, token storage (in-memory + optional OS keychain), refresh, revocation
+  - SSRF prevention on CIMD/metadata fetches (egress allowlist, redirect depth cap)
 - Sandboxing config (Docker/firejail)
 - Egress allowlist for HTTP transports
 - Host-agent integration guide + reference integration with one open-source agent (e.g. a Hermes Agent skill)
-- **Exit criteria:** a second agent runtime embeds the TS SDK and performs an end-to-end discovery-to-connection flow.
+- **Exit criteria:** a second agent runtime embeds the TS SDK and performs an end-to-end discovery-to-connection flow against an OAuth-protected MCP server using CIMD, with no per-server app registration.
 
 ### Phase 3 — Federation + A2A + AGNTCY (weeks 13–20)
 - Cross-registry federation (`auto` and `referrals` modes, max depth, referral following)
@@ -1074,7 +1196,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ServerCard",
   "type": "object",
-  "required": ["id", "display_name", "publisher", "version", "transport", "capabilities", "auth"],
+  "required": ["id", "display_name", "publisher", "version", "transport", "capabilities", "auth", "availability"],
   "properties": {
     "id": {"type": "string", "pattern": "^urn:pharos:"},
     "display_name": {"type": "string"},
@@ -1095,13 +1217,24 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
     "stdio_command": {"type": ["string", "null"]},
     "capabilities": {"type": "array", "items": {"type": "string"}},
     "tools_count": {"type": "integer"},
+    "availability": {"enum": ["mirrored", "referenced", "native"]},
     "auth": {
       "type": "object",
       "required": ["type"],
       "properties": {
         "type": {"enum": ["none", "api_key", "oauth", "mtls"]},
         "scopes": {"type": "array", "items": {"type": "string"}},
-        "auth_url": {"type": "string"}
+        "auth_url": {"type": "string"},
+        "auth_server_url": {"type": "string"},
+        "authorization_endpoint": {"type": "string"},
+        "token_endpoint": {"type": "string"},
+        "grant_types": {"type": "array", "items": {"type": "string"}},
+        "pkce_required": {"type": "boolean"},
+        "dcr_support": {"type": "boolean"},
+        "dcr_endpoint": {"type": ["string", "null"]},
+        "cimd_support": {"type": "boolean"},
+        "jwks_url": {"type": "string"},
+        "token_auth_method": {"type": "string"}
       }
     },
     "pricing": {
@@ -1209,6 +1342,90 @@ For implementers. Pharos Discovery handles this internally; it is documented her
 - **Claude MCP Connector** — https://platform.claude.com/docs/en/agents-and-tools/mcp-connector
 - **M365 Copilot dynamic tool discovery** — https://github.com/MicrosoftDocs/m365copilot-docs/blob/main/docs/plugin-dynamic-tool-discovery.md
 - **MCP Transports** — https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+- **MCP OAuth 2.1 & Client Registration** — https://blog.modelcontextprotocol.io/posts/client_registration/ (background on MCP's adoption of OAuth 2.1 and the Dynamic Client Registration problem)
+- **Client ID Metadata Documents (CIMD, SEP-991)** — clients host a metadata URL as their `client_id`; authorization servers fetch metadata at authorization time. No `/register` endpoint needed. Eliminates unbounded DB growth, client-expiry black hole, per-instance client ID proliferation, and DCR DoS.
+- **Software Statements (SEP-1032)** — signed JWTs for desktop client identity, layered on top of DCR or CIMD.
+- **Bluesky (AT Protocol) CIMD implementation** — reference implementation of client-hosted metadata documents for OAuth.
+
+---
+
+## 17. OAuth-Aware Discovery
+
+This section specifies Pharos Discovery's solution to the **MCP OAuth bootstrap problem**: the fact that agent providers (Claude, Cursor, etc.) currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server. This does not scale. Pharos Discovery solves it by making the SDK the single OAuth integration point: agent providers implement OAuth *once* (via the `OAuthFlowHandler`), and it works for *all* MCP servers automatically — with no per-server app registration.
+
+### 17.1 The problem
+
+MCP adopted OAuth 2.1 as its auth framework. Per the MCP team's own analysis (blog.modelcontextprotocol.io/posts/client_registration/), the standard OAuth Dynamic Client Registration (DCR) flow has four serious problems when applied to MCP at scale:
+
+1. **Unbounded DB growth on authorization servers.** Every agent instance that connects to a server triggers a `/register` call, creating a client record that lives forever. Across thousands of MCP servers and millions of agent installs, this is an unbounded storage cost borne by *server operators*.
+2. **Client expiry black hole.** DCR-registered clients have no natural expiry story. Authorization servers can't tell which clients are still active, so they keep them all.
+3. **Per-instance confusion.** The same agent app installed on two machines gets two different `client_id`s. Tokens, logs, and revocation all become per-instance, not per-app. There is no stable identity for "Claude Desktop" across installs.
+4. **DoS vulnerability on `/register`.** An open `/register` endpoint is trivially abuseable. A malicious client can flood it with registrations, exhausting the server's DB.
+
+The emerging fix is **Client ID Metadata Documents (CIMD, SEP-991)**: instead of calling `/register`, the client *hosts* a metadata document at a stable URL and uses that URL *as its `client_id`*. At authorization time, the server fetches the metadata from that URL. No registration endpoint is needed. Bluesky implements this pattern for the AT Protocol. **Software Statements (SEP-1032)** — signed JWTs for client identity — layer on top for desktop clients that can't easily host a URL.
+
+The remaining problem: for an agent provider to use CIMD, *someone* has to host the provider's metadata document at a stable, HTTPS-reachable, signed URL. Individual agent installs can't do this reliably (desktop apps don't have stable URLs). This is where Pharos comes in.
+
+### 17.2 The Pharos Discovery solution
+
+Pharos Discovery solves the OAuth bootstrap problem with three pieces:
+
+1. **The SDK's `OAuthFlowHandler` is the single OAuth integration point.** Agent providers implement (or use the SDK's default) `OAuthFlowHandler` once. It reads the OAuth configuration from the `ServerCard.auth` object (expanded in Appendix A) and executes the appropriate flow for each server — CIMD, DCR, or API-key — automatically. The provider never writes per-server OAuth code.
+2. **The Pharos Registry hosts each agent provider's CIMD metadata.** The provider registers *once* with the Pharos Registry (§17.3). The registry serves the provider's Client ID Metadata Document at a stable, signed URL: `https://registry.pharos.dev/v1/agents/{provider_id}/cimd`. This URL is the provider's OAuth `client_id` for *every* MCP server that supports CIMD. The provider never registers with individual MCP servers' authorization servers.
+3. **Discovery returns the complete OAuth config alongside server metadata.** When an agent discovers a server via Pharos, the `ServerCard.auth` object already contains `auth_server_url`, `token_endpoint`, `grant_types`, `scopes`, `pkce_required`, `dcr_support`, `cimd_support`, and `jwks_url`. The agent (via the handler) does not need to separately discover the auth setup — it is returned in the search result. The `GET /v1/servers/{id}/oauth` endpoint (§6.7) allows refreshing just the OAuth config when it rotates.
+
+**Net effect:** agent providers implement OAuth *once* (by embedding the SDK), register their client metadata with the Pharos Registry *once*, and every MCP server's authorization server can fetch and trust that metadata at authorization time. No per-server configuration. No per-server app registration. No per-instance client ID proliferation.
+
+### 17.3 One-time agent provider registration & CIMD hosting
+
+```
+Agent provider (e.g. "Cursor")
+   │
+   │  1. Register once with the Pharos Registry:
+   │     POST /v1/agents/register
+   │       { "provider_id": "cursor", "client_name": "Cursor",
+   │         "redirect_uris": [...], "jwks": {...},
+   │         "software_statement": "<signed JWT, SEP-1032>" }
+   ▼
+Pharos Registry
+   │
+   │  2. Verifies the software statement (signed JWT, SEP-1032).
+   │  3. Hosts the provider's CIMD at a stable, signed URL:
+   │     https://registry.pharos.dev/v1/agents/cursor/cimd
+   │  4. Returns that URL to the provider. It is the provider's
+   │     permanent OAuth client_id for every CIMD-supporting server.
+   ▼
+Every MCP server's authorization server (at authorization time)
+   │
+   │  5. Receives an authorization request with
+   │     client_id = "https://registry.pharos.dev/v1/agents/cursor/cimd"
+   │  6. Fetches the CIMD document from that URL.
+   │  7. Validates the document (signature, TLS, redirect_uri match).
+   │  8. Proceeds with the authorization code flow — no /register call.
+   ▼
+Cursor (via the SDK's OAuthFlowHandler) receives the token.
+```
+
+The provider registers *once*, ever. Every subsequent MCP server connection reuses the same `client_id` URL. If the provider rotates keys, they update the registry; the URL stays stable. If the provider ships a new version, the version is reflected in the CIMD document, not in a new registration.
+
+### 17.4 The `OAuthFlowHandler` flow selection
+
+When `pharos.connect(approval)` is called for a server with `auth.type == "oauth"`, the SDK's `OAuthFlowHandler.authorize()` inspects the `ServerCard.auth` config and `ApprovalToken.approved_oauth_scopes`, then selects a flow:
+
+| Server `auth` config | Flow | `client_id` source |
+|---|---|---|
+| `cimd_support == true` | **CIMD** (preferred) | The agent provider's Pharos-hosted CIMD URL (`https://registry.pharos.dev/v1/agents/{provider_id}/cimd`). No `/register` call. |
+| `dcr_support == true`, `cimd_support == false` | **DCR fallback** | Dynamically registered via `auth.dcr_endpoint`. Ephemeral `client_id`, discarded after session unless `duration=persistent`. Rate-limited (§10.5). |
+| `dcr_support == false`, `cimd_support == false`, static client configured | **Static client credentials** | Pre-registered `client_id` / `client_secret` from the host's credential store. |
+| `auth.type == "api_key"` | **API key prompt** | The handler surfaces a credential prompt to the user via the host's `credential_provider` callback. |
+
+**Scope minimization.** The handler requests *only* the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the server. If the authorization server grants a narrower set, the handler records the *actual* granted scopes in `OAuthResult.scope`, and the Connection Manager enforces tool calls against the granted set, not the requested set.
+
+**Token lifecycle.** The handler manages token storage (in-memory for `session`; OS keychain-encrypted for `persistent`), refresh (using `refresh_token` grant when available), and revocation (`revoke_token()` on `pharos.revoke()`). See §10.5 for security details.
+
+### 17.5 `availability` field and OAuth
+
+The `availability` field (§13.4) is orthogonal to auth but both contribute to the trust signal in the approval prompt. A `mirrored` server with `cimd_support: true` is the highest-trust combination: the server's package is guaranteed retrievable by the Pharos Registry, and the OAuth flow requires no per-server registration. A `referenced` server with only DCR support is the lowest-trust OAuth path: the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals so the user can make an informed consent decision.
 
 ---
 
