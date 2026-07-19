@@ -1,6 +1,6 @@
 # Pharos Discovery — Technical Specification
 
-**Version:** 0.2.0 (Draft)
+**Version:** 0.3.0 (Draft)
 **Status:** Pre-implementation
 **Date:** July 19, 2026
 **License:** MIT
@@ -49,21 +49,38 @@ This document specifies the architecture, the discovery protocol agents call, th
 
 ## 2. Vision: The "Next Google" Thesis
 
-> **MCP discovery is the next Google. Businesses will be found by agents, not by humans typing queries into search boxes.**
+> **MCP discovery may become the next Google. Businesses may be found by agents, not by humans typing queries into search boxes.**
 
-The web search economy was built on humans searching for documents. The agentic economy will be built on **agents searching for capabilities on behalf of humans**. A business that exposes its services as an MCP server is the agentic equivalent of a business with a website in 1998 — discoverable by a new class of automated client. A business that *isn't* discoverable by agents is invisible to the next generation of commerce.
+The web search economy was built on humans searching for documents. The agentic economy may be built on **agents searching for capabilities on behalf of humans**. A business that exposes its services as an MCP server is the agentic equivalent of a business with a website in 1998 — discoverable by a new class of automated client. A business that *isn't* discoverable by agents risks becoming invisible to the next generation of commerce. We phrase this as a possibility, not a prediction: the thesis may turn out to be wrong, or partially right, or right only for a subset of verticals. The architecture in this document does not depend on the thesis holding in full; it remains useful if discovery turns out to be a narrower, more regulated, or more vendor-mediated market than the open web was.
 
 For this economy to function, three things must exist:
 
 1. **A neutral discovery layer** that no single vendor controls. If Google's ARD becomes the de-facto standard, discovery is captured by one company — repeating the search-engine monopoly. If Anthropic's Claude Connectors win, discovery is captured by one agent vendor. Pharos Discovery is built to be the **open, vendor-neutral alternative** that keeps the agentic web open.
 2. **A way for businesses to publish** their MCP services once and be found by every agent — not ten times across ten walled gardens. The companion **Pharos Registry** project provides this; Pharos Discovery is the client side that agents embed.
-3. **A consent layer** so that agents don't silently connect to arbitrary services on the user's behalf. Discovery without consent is a surveillance and security hazard. Pharos Discovery bakes user approval into the protocol — it is a first-class flow, not an afterthought.
+3. **A consent layer** so that agents don't silently connect to arbitrary services on the user's behalf. Discovery without consent is a surveillance and security hazard. Pharos Discovery bakes user approval into the client SDK — it is a first-class flow, not an afterthought.
 
 We are deliberately **not adopting Google's ARD spec** as our north star. ARD is a strong technical proposal and we implement a compatibility adapter for it, but Pharos stays neutral — we want the agentic web to be multi-vendor, not a Google-led re-run of the open web's capture.
 
 **Dual positioning.** Pharos Discovery is:
 - **Neutral on ARD** — we implement an adapter (§11.4), not a commitment. ARD catalogs are federation peers.
 - **A complementary superset to the official MCP Registry.** We consume the official registry's `server.json` / `/v0.1/servers` entries unchanged and add three layers the official registry deliberately omits: semantic + structured discovery, a consent/approval gate, and OAuth via App Registration Inheritance (§17). We do not compete with the official registry for the canonical record of which servers exist; we make that record discoverable, approvable, and connectable.
+
+### 2.4 Failure modes and triggers to pivot
+
+The "next Google" framing is aspirational. The realistic outcomes form a spectrum, and the architecture should be robust to each:
+
+- **Dominant outcome** — Pharos becomes the de-facto discovery client across agents. This is the best case and is not assumed.
+- **Coexistence outcome** — Pharos coexists with ARD, AGNTCY, and vendor walled gardens as one federation peer among several. This is the base case the spec is designed for; the adapter layer (§11) and federation model (§6.5) are the load-bearing components here.
+- **Marginal outcome** — Pharos remains a niche client used by a handful of CLI/IDE agents. This is acceptable as long as the long-tail agents it serves find real value.
+
+**Explicit pivot triggers.** If any of the following occurs, the project should reassess its positioning rather than continue on autopilot:
+
+1. **The official MCP Registry adds semantic search + auth metadata + a consent UX natively.** At that point Pharos's marginal registry value collapses; the defensible assets become (a) the client SDK with consent baked in, (b) cross-registry federation, and (c) the OAuth/consent UX layer. The project should re-scope to those rather than compete with the official registry on search.
+2. **ARD reaches v1.0 with consent + OAuth layers.** Rather than maintain a parallel stack, Pharos should fold its client into an ARD reference implementation and upstream the consent/OAuth work.
+3. **A single vendor walled garden achieves clear dominance** (e.g. Claude Connectors or Copilot connectors cover >80% of agent-mediated discovery). Pharos should pivot to being the open-standards advocate and federation bridge rather than a competing catalog.
+4. **No agent provider integrates within 6 months of Phase 1 ship.** The adoption thesis is empirically wrong; re-evaluate whether the SDK solves a real integration pain or is a solution looking for a problem.
+
+The rest of this spec is written to be useful under any of these outcomes; the sections on consent, OAuth, and federation are independently valuable and do not require Pharos to "win" the discovery market.
 
 ---
 
@@ -86,7 +103,7 @@ The core problem: **a business must publish to all of these to be universally di
 
 - **One embeddable client, many registries.** Agents embed Pharos once and can search any compatible registry, including the Pharos Registry, the official MCP Registry (via adapter), ARD catalogs (via adapter), and walled gardens (via documented bridges).
 - **Semantic + structured search at the client.** Agents query in natural language ("I need to book a flight and file an expense report") and get ranked, evaluated results — without each agent vendor reimplementing retrieval.
-- **Consent as a protocol primitive.** Discovery returns enough metadata for the user to make an informed decision; the SDK enforces an approval gate before any connection is established.
+- **Consent as a client-side contract.** Discovery returns enough metadata for the user to make an informed decision; the SDK enforces an approval gate before any connection is established. This is a **client-side contract enforced for conformant SDK-using agents**, not a protocol-level invariant that binds non-SDK agents — see §10.7.1 for the out-of-SDK threat and the server-side enforcement path that would close it.
 - **Business discovery, not just tool discovery.** Pharos surfaces publisher identity, pricing, reviews, and capability manifests so businesses can be *found and chosen*, not just invoked.
 
 ---
@@ -94,7 +111,7 @@ The core problem: **a business must publish to all of these to be universally di
 ## 4. Design Principles
 
 1. **Provider-agnostic by construction.** The framework must work with any agent runtime and any registry that implements the Pharos Discovery API. No code path may assume a specific agent vendor.
-2. **Consent is non-negotiable.** Agents MUST NOT establish an MCP connection to a discovered service without an explicit user approval event. The SDK exposes no `connect_without_approval` escape hatch.
+2. **Consent is non-negotiable for conformant SDK-using agents.** Agents using the SDK MUST NOT establish an MCP connection to a discovered service without an explicit user approval event. The SDK exposes no `connect_without_approval` escape hatch. This is a **client-side contract**, not a protocol-level invariant: a non-SDK agent (or a modified agent that reads the `endpoint` from a `ServerCard` and connects directly) can bypass this gate, because the `ApprovalToken` is minted and checked by the SDK with no external verifier. See §10.7.1 for the out-of-SDK threat and the server-side enforcement path (presenting the `ApprovalToken` as a server-checked credential at MCP `initialize`) that would close the hole as a future protocol extension. Reworded: **no silent connections to novel servers** — pre-configured allow-lists (e.g. `headless_mode` with a pre-approved scope set, §7.5) MAY connect without a per-connection modal, but the connection is still logged and the allow-list is explicit.
 3. **Thin client, fat registry.** Pharos Discovery is a client library. Ranking, embeddings, indexing, and publisher verification live in the registry (the Pharos Registry or any compatible one). The client is concerned with querying, presenting, approving, and connecting.
 4. **Neutrality over allegiance.** We implement adapters for ARD, the official MCP Registry, and walled gardens, but we do not adopt any of them as canonical. The Pharos Discovery API is the canonical surface for agents.
 5. **Registry-agnostic via a documented API.** Any registry implementing the Pharos Discovery HTTP API (§6) is a valid backend. The Pharos Registry is the reference implementation, not a dependency.
@@ -446,7 +463,7 @@ Used by businesses to register their MCP service so it can be discovered. See §
 
 ## 7. User Approval Flow Specification
 
-The approval flow is the heart of Pharos Discovery's privacy and security model. **An agent must never connect to a discovered MCP server without an explicit user approval event.** This is enforced at the SDK level: the Connection Manager requires an `ApprovalToken` (§7.4) and refuses to proceed without one.
+The approval flow is the heart of Pharos Discovery's privacy and security model. **An agent using the SDK must never connect to a discovered MCP server without an explicit user approval event.** This is enforced at the SDK level for conformant SDK-using agents: the Connection Manager requires an `ApprovalToken` (§7.4) and refuses to proceed without one. This is a **client-side contract**, not a protocol-level invariant — a non-SDK or modified agent can bypass it by connecting directly; see §10.7.1.
 
 ### 7.1 The six-step discovery-to-connection flow
 
@@ -472,6 +489,36 @@ The approval flow is the heart of Pharos Discovery's privacy and security model.
 6. SDK performs MCP initialize + tools/list; agent reports tool usage
 ```
 
+### 7.1.1 Flow variants and edge cases
+
+The linear happy path above omits several cases every implementer will hit. The SDK MUST define behavior for each:
+
+- **Step 0 — capability-gap detection (host-supplied callback).** "The agent detects a capability gap" is the hardest part of agentic discovery and is **not** specified by the SDK — it is host-runtime logic. The SDK exposes a **host-supplied callback** `on_capability_gap(context: dict) -> CapabilityGap | None` that the host wires into its agent loop. The callback receives the current request context (user intent, available tools, prior failures) and returns a `CapabilityGap` describing the missing capability (a natural-language need plus optional structured filters) or `None` if no gap is detected. The SDK does not prescribe how the host detects the gap (LLM self-reflection, planning step, tool-failure feedback, etc.); it only standardizes the hand-off into the discovery flow.
+
+- **Step 2.5 — query construction.** The SDK provides a `QueryBuilder` that normalizes raw user intent into a `SearchQuery`. Hosts SHOULD strip obvious PII before sending `query.text` to the registry, or use `privacy_mode` / `query.embedding` (§10.8) to avoid sending plaintext intent. The SDK MUST NOT inject unredacted user PII into `query.text` automatically.
+
+- **Step 3.5 — selection rationale (mandatory).** When the agent picks a server from the ranked results, it MUST supply a `selection_rationale` field on the `ApprovalRequest` (§8.3) explaining *why* this server was chosen — e.g. "ranked #1 for `flight_search`; verified publisher; supports `bookings:write`." This is surfaced to the user in the approval prompt so the choice is auditable rather than a black-box "the agent picked rank 0." The SDK rejects `ApprovalRequest`s with an empty `selection_rationale` for any non-`headless_mode` flow.
+
+- **Step 3→4 failure — empty results.** If `pharos.search()` returns zero results, the SDK MUST surface a `NoServersFound` event (distinct from `RegistryUnavailable`, §13.5). The host MAY: (a) retry with a broader query (drop the most specific filter, broaden `capabilities`), (b) surface "no servers found for this need" to the user and stop, or (c) fall back to a configured static server list (§13.5 cold-start fallback). The SDK does not auto-retry indefinitely; a single broadened retry is the default, after which the host decides.
+
+- **Step 4.5 — multi-server plan approval.** A user request ("book a flight *and* file an expense report") may need two or more servers. The approval flow is per-server by default, but the SDK supports a **`PlanApproval`** type for batch plans:
+
+  ```python
+  class PlanApprovalRequest:
+      plan_summary: str              # "Book a flight with Acme Flights and file the expense via Acme Expenses"
+      steps: list[ApprovalRequest]   # one ApprovalRequest per server, in execution order
+      render_id: str
+
+  class PlanApprovalResponse:
+      approved: bool
+      per_step: list[ApprovalResponse]  # the user may approve some steps and deny others
+      deny_reason: str | None
+  ```
+
+  The host renders the plan as a single card listing all servers and their scopes; the user approves the plan (or a subset) in one consent act. A `PlanApprovalToken` (a batch of `ApprovalToken`s sharing a `plan_id`) is minted on approval. This avoids N modals for an N-server plan and is the primary mitigation for consent fatigue (§7.3).
+
+- **Step 6.5 — post-call audit.** Tool-usage reporting (§7.6) is enforced for conformant SDK-using agents via the `ToolUsageEvent` log. A non-SDK agent can suppress it; this is the same client-side-contract limitation as the approval gate (§10.7.1).
+
 ### 7.2 What the agent presents to the user
 
 The approval card MUST surface — at minimum — the following fields from the `ServerCard`. The SDK provides a default renderer; host agents MAY override it.
@@ -496,6 +543,14 @@ The approval card MUST surface — at minimum — the following fields from the 
 - Any `representative_queries` so the user can sanity-check the server's purpose
 - Whether the connection will persist for this session, this request, or indefinitely
 
+**Risk tier (SDK-computed, not vendor-asserted).** The SDK computes a `risk_tier` (`low` / `medium` / `high`) from `auth.scopes` + `publisher.verified` + `rating.count` + `availability` and displays it as a badge. `high` tier (e.g. unverified publisher requesting write scopes, or any server requesting `payments:write`-class scopes) requires an explicit "I understand the risk" click before the approve button is enabled. This is a SDK-side heuristic so vendors cannot game it.
+
+**Unreviewed vs. reviewed-and-mediocre.** When `rating.count == 0` the prompt MUST display "New / unreviewed — no track record yet" as a distinct state, not a numeric `0.0` score. A new malicious server looks the same as an unreviewed benign one; the wording makes the unknown-state explicit.
+
+**Pricing is vendor-claimed.** `pricing` fields MUST be displayed with a "vendor-claimed, not verified" caption unless the registry sets a `pricing_verified` flag (none today). The registry MAY sample-verify pricing in the future; until then the user is told the price is self-reported.
+
+**Brand-impersonation rejection (publish-time + display-time).** At publish time the registry rejects `display_name` / `publisher.name` strings that are confusingly similar to a well-known brand (Levenshtein distance ≤ 2 against a maintained brand list, case-insensitive) unless the publisher owns that brand's verified domain. At display time, `publisher.verified` is a **hard gate** for any name matching a brand: an unverified "Googgle OAuth" or "Stripe Payments" is rendered with a prominent "unverified — possible impersonation" warning and the approve button is disabled by default. The user's trust anchor is the **verified domain**, shown in the host chrome (§17.5), not the self-declared name.
+
 ### 7.3 Consent mechanics
 
 Approval is a **specific, scoped, revocable** event:
@@ -504,6 +559,10 @@ Approval is a **specific, scoped, revocable** event:
 - **Scoped** — the user sees the `auth.scopes` and `capabilities` being requested and can approve a subset. The SDK records the approved scope set in the `ApprovalToken`; the Connection Manager refuses tool calls outside the approved scopes. For OAuth servers, this applies *both* to MCP capability scopes *and* to OAuth scopes (§17.4) — the user may narrow either independently.
 - **Revocable** — the user can revoke approval at any time via `pharos.revoke(server_id)`. The SDK tears down the connection and invalidates the token.
 - **Duration-bound** — approval defaults to `session` scope. The user may choose `once` (single tool call) or `persistent` (remembered across sessions, encrypted locally). `persistent` requires a second confirmation.
+- **`trust_on_use` duration (consent-fatigue mitigation).** After one successful `tools/call` against a server meeting all of `verified=true`, `availability=mirrored`, `rating.count > 100`, subsequent connections to the *same* server within 7 days auto-approve at the originally approved scope set, with a **non-blocking** notification ("reconnected to Acme Flights — click to review") rather than a modal. This preserves transparency without the rubber-stamping that a 5th+ modal induces. The trust decays after 7 days or on any `report_server` event, whichever is first. The host MAY disable `trust_on_use` for high-risk scope classes (`payments:write`, `admin:*`).
+- **Plan approval (batch).** For multi-server plans, the `PlanApproval` flow (§7.1.1) lets the user approve a whole plan in one consent act instead of N per-server modals.
+
+**Consent fatigue budget.** The SDK tracks novel-server approvals per session. If the user approves more than 5 novel servers in a single session, the SDK emits a `ConsentFatigueWarning` to the host, suggesting a pause ("You've approved 6 new servers in this session — consider reviewing your consent store before approving more."). This is advisory, not blocking; it exists so the 6th modal is not reflexively clicked.
 
 ### 7.4 The `ApprovalToken`
 
@@ -533,7 +592,13 @@ The SDK exposes the approval flow as a **callback** so the host agent controls r
 
 1. **CLI / terminal agents** (Claude Code, Cursor, custom CLIs) — the SDK renders an inline text card and prompts `[y/N/scope:...]`. Default for `stdio` agents.
 2. **Chat / web agents** (ChatGPT, Claude.ai, Gemini web) — the SDK returns a JSON approval payload; the host renders a rich card with buttons. The host calls `pharos.resolve_approval(payload)` with the user's choice.
-3. **Voice / headless agents** — the SDK reads a short spoken summary and requires a verbal "yes, approve <server name>" confirmation. Headless pipelines may provide a pre-approved scope set via config (with an explicit `headless_mode=true` flag that is logged).
+3. **Voice / headless agents** — the SDK reads a short spoken summary and requires a verbal "yes, approve <server name>" confirmation. Headless pipelines (CI, batch, automated tests) MAY use `headless_mode=true`, which is a **scoped** bypass, not a blanket opt-out:
+   - `headless_mode` **requires** a pre-approved scope set and an explicit server allow-list supplied via config (e.g. `headless_allow_servers: ["urn:pharos:acme.com:travel:flight-booking"]` and `headless_allow_scopes: ["flight_search"]`). It is NOT "approve everything."
+   - The SDK **refuses novel servers** in headless mode — any server not on the configured allow-list surfaces a `HeadlessApprovalRequired` error and the connection is not made. There is no silent connection to a server the user has never seen.
+   - Every headless-mode connection is **logged prominently** (console warning + `on_tool_use` event tagged `headless=true`) so an operator auditing logs cannot miss that an automated approval occurred.
+   - `headless_mode` and `trust_on_use` (§7.3) are mutually exclusive — automated trust propagation is too dangerous in a pipeline context.
+
+   This tightens the definition so `headless_mode` is not the "consent bypass the spec claims not to have" — it is a pre-scoped, allow-listed, loudly-logged mode for automation, consistent with §4.2's "no silent connections to novel servers."
 
 ### 7.6 What the agent reports back
 
@@ -545,6 +610,15 @@ After a successful connection and tool call, the agent MUST report to the user:
 - Any errors or scope denials
 
 This is enforced via the SDK's `ToolUsageEvent` log, which the host agent surfaces in its output. Agents that suppress this log are non-conformant.
+
+### 7.7 Consent denial, re-negotiation, and re-prompting
+
+When the user denies an approval, the SDK captures a structured reason and supports re-prompting under tight rate limits. The denial path:
+
+- **Structured `deny_reason`.** `ApprovalResponse.deny_reason` (required when `approved=false`) is an enum: `untrusted_publisher` | `excessive_scopes` | `wrong_server` | `cost` | `other`. The agent uses this to learn — `untrusted_publisher` across many users down-ranks the publisher; `wrong_server` suggests re-searching; `excessive_scopes` suggests re-prompting with a reduced scope set; `cost` suggests looking for a `free`-tier alternative.
+- **`pharos.request_approval_next(current_server_id, ...)`.** A convenience that returns the next-ranked result from the most recent search without re-running the full search. Used when `deny_reason == wrong_server`. Returns `None` if there are no further results, at which point the host falls back to a fresh `pharos.search()` with a broadened query (§7.1.1).
+- **Scope re-negotiation.** If a `tools/call` fails with `SCOPE_NOT_APPROVED`, the SDK MAY surface a re-approval prompt requesting the specific missing scope, with the agent explaining why it is needed ("`flight_book` requires `payments:read` to confirm the card on file"). To avoid nagging, re-prompts are rate-limited to **at most 1 per server per session**. After one re-prompt, further `SCOPE_NOT_APPROVED` failures for that server surface as a non-blocking error and the agent must either proceed without the capability or pick a different server.
+- **Denial logging.** Denials are recorded in the consent store (§10.4) with the `deny_reason`, so a user's trust decisions are queryable.
 
 ---
 
@@ -562,7 +636,7 @@ from pharos_discovery import PharosClient, ApprovalRequest
 
 # Initialize with the default public Pharos Registry
 pharos = PharosClient(
-    registry_url="https://registry.pharos.dev",
+    registry_urls=["https://registry.pharos.dev"],
     agent_id="my-agent/0.1.0",
     # Optional: local consent store, blocklist, cache
     consent_store="~/.pharos/consent.json",
@@ -615,7 +689,7 @@ pharos.revoke(approval)  # invalidates the token
 import { PharosClient, ApprovalRequest } from "@pharos/discovery";
 
 const pharos = new PharosClient({
-  registryUrl: "https://registry.pharos.dev",
+  registryUrls: ["https://registry.pharos.dev"],
   agentId: "my-agent/0.1.0",
   consentStore: "~/.pharos/consent.json",
 });
@@ -664,24 +738,38 @@ pharos.revoke(approval);
 ```python
 # ServerCard (search result entry)
 class ServerCard:
-    id: str                       # urn:pharos:<publisher>:<ns>:<name>
+    id: str                       # urn:pharos:<fqdn>:<namespace>/<name> (Appendix B)
     display_name: str
     description: str
-    publisher: Publisher           # {id, name, verified, verification_method}
+    publisher: Publisher           # {id, name, verified, verification_method, contact?}
     version: str
     transport: list[str]           # ["stdio" | "http+sse" | "streamable-http"]
     endpoint: str | None           # URL for HTTP transports; None for stdio
     stdio_command: str | None      # e.g. "npx -y @acme/flights-mcp"
     capabilities: list[str]
     tools_count: int
+    tools_count_verified: bool     # registry-sampled verification (§13.2); false until verified
     auth: AuthSpec                 # expanded OAuth config; see §17 and Appendix A
-    availability: str              # "mirrored" | "referenced" | "native" (see §17.5)
+    availability: str              # "mirrored" | "referenced" | "native" (see §13.4)
     pricing: PricingSpec | None
+    pricing_verified: bool         # registry-verified pricing; false until verified (§7.2)
     rating: RatingSpec | None
     trust: TrustSpec | None
     representative_queries: list[str]
     pharos_score: float            # 0.0–1.0 relevance; NOT a trust rating
     source_registry: str
+    source_score: float | None     # original score from the source registry before normalization (§11.4)
+    # Lifecycle & metadata (H2)
+    published_at: str              # ISO8601 — when first published to a registry
+    updated_at: str                # ISO8601 — when the card was last modified
+    status: str                    # "active" | "deprecated" | "deleted" (§10.7)
+    successor_id: str | None       # canonical ID of the replacement server when status == "deprecated"
+    privacy_policy_url: str | None
+    terms_url: str | None
+    data_residency: list[str]      # region codes, e.g. ["US", "EU"]; empty if unknown
+    rate_limits: dict | None       # server's own rate limits, e.g. {"per_minute": 100, "per_day": 10000}
+    health_endpoint: str | None    # liveness URL the registry probes
+    protocol_versions: list[str]   # MCP protocol versions the server speaks, e.g. ["2025-03-26"]
 
 # ApprovalRequest (handed to the host's render callback)
 class ApprovalRequest:
@@ -689,8 +777,9 @@ class ApprovalRequest:
     purpose: str                   # why the agent is asking
     requested_scopes: list[str]
     requested_capabilities: list[str]
-    duration: str                  # "once" | "session" | "persistent"
+    duration: str                  # "once" | "session" | "persistent" | "trust_on_use"
     render_id: str                 # for correlating async UX
+    selection_rationale: str       # MANDATORY: why this server was chosen (§7.1.1)
 
 # ApprovalResponse (returned by the host's render callback)
 class ApprovalResponse:
@@ -698,6 +787,7 @@ class ApprovalResponse:
     approved_scopes: list[str]     # may be a subset of requested
     duration: str
     user_note: str | None
+    deny_reason: str | None        # required when approved=false (§7.7): untrusted_publisher | excessive_scopes | wrong_server | cost | other
 
 # ApprovalToken (issued by the SDK on approval; required by connect())
 class ApprovalToken:
@@ -725,25 +815,34 @@ class MCPClient:
     async def close() -> None: ...
 
 # OAuthFlowHandler — coordinates inline OAuth via App Registration Inheritance (§17).
-# Agent providers implement this ONCE; it works for every MCP server.
+# Agent providers implement this ONCE; it works for every MCP server. The SDK also
+# ships a DefaultOAuthFlowHandler (§8.6.1) that covers the common MCP-Apps and
+# server-brokered-redirect cases, so hosts only override if they need custom UX.
 # NOTE: Under App Registration Inheritance, the handler does NOT run a standard
 # OAuth redirect flow. It reads the ServerCard.auth config, presents the vendor's
 # consent defaults to the user, triggers the MCP server's inline OAuth UI (via
-# MCP Apps), waits for the MCP server to complete the OAuth flow server-side,
-# and receives a CONFIRMATION (not the token itself). The token stays with the
-# MCP server, which proxies tool calls.
+# MCP Apps) or the server-brokered redirect (§17.5.1) for non-MCP-Apps hosts,
+# waits for the MCP server to complete the OAuth flow server-side, and receives
+# a SIGNED CONFIRMATION (not the token itself). The token stays with the MCP
+# server, which proxies tool calls.
 class OAuthFlowHandler:
     async def authorize(
         self,
         server: ServerCard,
         approval: ApprovalToken,
+        auth_timeout: int = 120,    # seconds; on expiry, emits authorized=false error="timeout"
     ) -> OAuthResult: ...
-    async def refresh(self, server: ServerCard) -> OAuthResult: ...
-    def revoke_access(self, server_id: str) -> None: ...   # asks MCP server to revoke its server-side token
+    async def refresh_status(self, server: ServerCard) -> OAuthStatus: ...
+        # Renamed from refresh(). Polls the MCP server's OAuthStatus — does NOT
+        # refresh a token (the SDK never holds one). Returns whether the server's
+        # server-side auth is still valid / expired / revoked.
+    def revoke_access(self, server_id: str) -> RevocationResult: ...
+        # Best-effort. The MCP server MUST call endpoints.revocation within 60s
+        # and return a revocation_proof (signed assertion). See §17.4, §10.5.
     def status(self, server_id: str) -> OAuthStatus: ...    # is the MCP server's server-side auth still valid?
 
 # OAuthResult — returned by OAuthFlowHandler.authorize().
-# Under App Registration Inheritance this carries a CONFIRMATION, not a token.
+# Under App Registration Inheritance this carries a SIGNED CONFIRMATION, not a token.
 # The access_token / refresh_token fields are None when secret_handling == "server_side".
 class OAuthResult:
     authorized: bool              # True if the MCP server completed the OAuth flow server-side
@@ -752,9 +851,22 @@ class OAuthResult:
     expires_in: int | None
     refresh_token: str | None     # None when server-side
     scope: list[str]              # scopes actually granted (may be a subset of approved_oauth_scopes)
-    acquired_via: str             # "app_registration_inheritance" | "cimd" | "dcr" | "api_key" | "static"
+    acquired_via: str             # "app_registration_inheritance" | "cimd" | "dcr" | "api_key" | "static" | "server_brokered_redirect"
     auth_held_by: str             # "mcp_server" | "agent"  — under §17, always "mcp_server"
     confirmed_at: str             # ISO8601 timestamp of the MCP server's auth-completed confirmation
+    confirmation_jwt: str | None  # SIGNED IdP assertion attesting {user_sub, scope, exp} (§17.4 step 5);
+                                   # SDK MUST verify via endpoints.jwks before trusting authorized=true;
+                                   # None only for non-OAuth (api_key/static) paths
+    error: str | None             # "timeout" | "server_lost" | "cancelled" | "invalid_jwt" | "idp_error" | None
+    cancel_reason: str | None     # set when the user dismissed the iframe (auth_cancelled postMessage)
+
+# RevocationResult — returned by revoke_access().
+class RevocationResult:
+    revoked: bool                 # best-effort: the request was sent
+    revocation_confirmed: bool    # True only if the server returned a valid revocation_proof within 60s
+    revocation_proof: str | None  # signed assertion the server called endpoints.revocation, OR
+                                   # token-introspection showing active:false; verified via endpoints.jwks
+    fallback_revoke_url: str | None  # vendor's app-management URL surfaced to the user when unconfirmed (§10.5)
 ```
 
 ### 8.4 Embedding model
@@ -769,21 +881,60 @@ The SDK is designed to be embedded in any agent runtime, not run as a sidecar:
 
 ```python
 PharosClient(
-    registry_url="https://registry.pharos.dev",
+    registry_urls=[                # H7: ordered failover list (was registry_url: str)
+        "https://registry.pharos.dev",
+        "https://registry-eu.pharos.dev",
+    ],
     agent_id="my-agent/0.1.0",
     api_key=None,                   # for metered registries
     consent_store="~/.pharos/consent.json",
     blocklist_url="https://registry.pharos.dev/v1/blocklist",
+    blocklist_cache_ttl_seconds=60, # H9: was implicit 300s; 60s now
     cache_ttl_seconds=300,          # cache ServerCards locally
+    cache_conditional=True,         # H9: use ETag / If-None-Match / If-Modified-Since (§6.4)
+    events_endpoint="https://registry.pharos.dev/v1/events",  # H9: SSE push invalidation (§6.7)
     federation_mode="auto",         # auto | referrals | none
     max_referral_depth=2,
-    request_timeout_seconds=10,
+    # M2: split timeouts (was request_timeout_seconds=10)
+    search_timeout=10,              # per /v1/search request
+    get_timeout=10,                 # per /v1/servers/{id} request
+    connect_timeout=10,             # MCP initialize
+    oauth_timeout=120,              # inline OAuth UI (§17.5); was implicit
+    approval_timeout=300,           # host render callback; on expiry, approved=false reason="timeout"
+    initialize_timeout=10,          # H8: MCP initialize (same as connect_timeout by default)
+    tool_call_timeout=30,           # H8: per tools/call
+    heartbeat_interval=30,          # H8: HTTP/SSE keepalive; N/A for stdio
+    health_check_interval=60,       # H8: liveness probe cadence
     verify_signatures=True,         # verify publisher signatures (§10)
     allow_unverified=False,         # gate: refuse unverified publishers
-    headless_mode=False,            # for automated pipelines
+    headless_mode=False,            # for automated pipelines (§7.5 — scoped, not blanket)
+    headless_allow_servers=[],      # §7.5: explicit allow-list required when headless_mode=True
+    headless_allow_scopes=[],       # §7.5: pre-approved scope set
+    privacy_mode=False,             # §10.8: send only structured filters, no query.text
     on_tool_use=None,               # callback for tool-usage transparency
 )
 ```
+
+**Registry failover (H7).** When a request to `registry_urls[0]` returns 503/504 or times out, the SDK marks that registry unhealthy for 60s and tries `registry_urls[1]`, and so on. The live registry is cached. Health is re-probed after the 60s blackout. If all registries are unhealthy and there is no local cache, the SDK emits a `DiscoveryDegraded` event and the host MAY fall back to a configured static server list (analogous to `/etc/hosts` for MCP); that fallback bypasses search but preserves the approval gate (§7). The static list is supplied via `static_fallback_servers: list[ServerCard]` in config.
+
+### 8.6 Contract-first design (IDL)
+
+The Python and TypeScript SDKs are **generated from a single IDL**, not hand-written in parallel. The IDL is the source of truth; the SDKs are codegen output. This prevents the two surfaces from drifting (the v0.2 code samples already diverged — Python took `text` and `filter` as separate kwargs, TS took a single options object — and the spec had no mechanism to detect or prevent this).
+
+- **IDL choice.** [TypeSpec](https://typespec.io/) is the preferred IDL (first-class HTTP + JSON-RPC bindings, mature Python and TS emitters). A JSON Schema fallback is acceptable for Phase 0. The IDL defines: the `ServerCard` schema (Appendix A), the `POST /v1/search` request/response, `GET /v1/servers/{id}`, `POST /v1/approve`, `POST /v1/feedback/*`, the `ApprovalRequest` / `ApprovalResponse` / `ApprovalToken` / `OAuthResult` types, and the `OAuthFlowHandler` interface.
+- **Codegen.** Both `pharos-discovery` (Python) and `@pharos/discovery` (TS) are emitted from the IDL. Hand-written code is limited to transport adapters (anyio vs Node async) and platform shims (keychain, file paths). The public API surface is generated; only the implementation is hand-written.
+- **Conformance test suite (moved to Phase 1).** A conformance test suite — golden request/response fixtures, schema validation, and behavioral assertions — is built alongside the first SDK in Phase 1, not deferred to Phase 4. It runs against every SDK generated from the IDL. Two SDKs that both pass the conformance suite are interoperable by construction. This is far cheaper than retrofitting conformance across two already-diverged implementations.
+- **Breaking-change policy.** The IDL is versioned (`typespec` `service.version`). A minor bump adds fields with defaults; a major bump is a breaking change and requires a coordinated SDK release across both languages. The `X-Pharos-Version` header (§6.1) advertises the wire-protocol version the SDK speaks.
+
+### 8.6.1 DefaultOAuthFlowHandler
+
+The SDK ships a `DefaultOAuthFlowHandler` out-of-the-box so hosts do not implement the `OAuthFlowHandler` interface unless they need custom UX. The default handler covers:
+
+- **MCP Apps inline flow** (§17.5) for hosts that report `supports_mcp_apps: true` in the host-capability probe.
+- **Server-brokered redirect flow** (§17.5.1) for hosts with a system browser but no MCP Apps.
+- **API-key fallback** when the server supports it and the host supplies a `credential_provider`.
+
+Hosts override `OAuthFlowHandler` only to customize the iframe chrome, add a branded login screen, or route through a proprietary auth broker. The "implement once" framing is revised: **override only if needed; the default works for the common cases.**
 
 ---
 
@@ -803,6 +954,14 @@ Per the MCP specification, every connection proceeds:
 
 Pharos Discovery handles steps 1–3 internally and exposes the operational phase via `MCPClient` (§8.3).
 
+**Timeouts (H8).** The SDK applies bounded timeouts at every step so a dead or slow server cannot hang the agent:
+
+- `initialize_timeout` (default 10s) — covers steps 1–3. On expiry the connection attempt is aborted and a `ConnectionFailed(error="initialize_timeout")` event is emitted.
+- `tool_call_timeout` (default 30s) — per `tools/call`. Long-running tools MAY override per-call via `call_tool(name, args, timeout=...)`; the default guards against indefinite hangs.
+- `heartbeat_interval` (default 30s, HTTP/SSE only; N/A for stdio) — the SDK sends a JSON-RPC `ping` (or relies on the transport's keepalive) every interval and expects a `pong` within `initialize_timeout`. Missed pongs mark the connection dead.
+
+**Capability verification post-connect (H13).** After `tools/list` returns, the SDK MUST verify that the server's claimed `capabilities` (from the `ServerCard`) are backed by actual tools. The convention: a capability `flight_search` is satisfied by a tool named `flight_search`, OR by any tool whose `metadata.capability == "flight_search"`. Claimed capabilities with no backing tool emit a `CapabilityMismatch` warning and are downgraded in the card's `verified_capabilities` set; the approval prompt is re-rendered if still open. This prevents a server from advertising `payment_refund` to rank for searches and then not implementing it.
+
 ### 9.2 Transport: stdio
 
 For local MCP servers launched as subprocesses:
@@ -820,6 +979,8 @@ For remote MCP servers:
 - **HTTP+SSE** (legacy) — a dedicated SSE endpoint for server-to-client messages plus a POST endpoint for client-to-server.
 - The SDK negotiates automatically based on the `ServerCard.transport` and `endpoint` fields. No host-agent code required.
 - **Security**: all remote connections use TLS 1.2+. The SDK pins the publisher's public key when `trust.signature` is present and `verify_signatures=True`.
+- **Cert validation (H8).** Full chain validation is required; a missing intermediate, expired leaf, or hostname mismatch is a hard error and the connection is refused. Pinning failure (the pinned key does not match the leaf or SPKI chain presented at handshake) is also a hard error when `verify_signatures=True` — the SDK does NOT fall back to "regular" validation for a pinned server, because a pin mismatch is the signal that the publisher's key rotated (legitimately) or the connection is being intercepted (maliciously).
+- **Key pinning TTL and rotation (H9).** Pins are NOT held forever. The SDK re-fetches the publisher's `.well-known/pharos-pubkey.json` at most every 24h (configurable via `key_pin_ttl_seconds`, default 86400) and updates the pin. This allows legitimate key rotation (e.g. compromise response) without the pin becoming a self-inflicted denial of service. A pin that fails to refresh after TTL is quarantined — the server is not connectable until the publisher's key is re-validated (§10.8). Domain WHOIS changes trigger re-verification of the publisher's domain control.
 
 ### 9.4 Per-server authentication
 
@@ -827,7 +988,7 @@ Discovery returns the server's auth requirements in `ServerCard.auth`. The SDK d
 
 1. `auth.type == "none"` — connect directly.
 2. `auth.type == "api_key"` — the SDK calls the host's `credential_provider` callback (host-supplied) to fetch the key, then sets the appropriate header.
-3. `auth.type == "oauth"` — the SDK delegates to the `OAuthFlowHandler` (§17). Under **App Registration Inheritance**, the handler does NOT run a standard OAuth redirect flow. Instead it: (a) retrieves the OAuth config from `ServerCard.auth.app_registration`; (b) presents the vendor's `consent_defaults` to the user (overridable — the user may expand or reduce the scope set); (c) triggers the MCP server's inline OAuth UI via MCP Apps (the MCP server returns an HTML login segment at `auth.ui.resource_uri`, rendered in a sandboxed iframe in the chat); (d) waits for the MCP server to complete the OAuth flow server-side — the MCP server holds the `client_secret` and exchanges the authorization code for a token itself; (e) receives a **confirmation** that auth succeeded (not the token). The token never reaches the agent or the SDK; the MCP server proxies all subsequent tool calls, attaching its server-side token. The `OAuthResult` returned to the agent carries `authorized=true` and `auth_held_by="mcp_server"` with `access_token=None`.
+3. `auth.type == "oauth"` — the SDK delegates to the `OAuthFlowHandler` (§17). **Sequencing (H5):** `pharos.connect(approval)` calls `OAuthFlowHandler.authorize()` **first**, *before* MCP `initialize`. The handler: (a) retrieves the OAuth config from `ServerCard.auth.app_registration`; (b) presents the vendor's `consent_defaults` to the user (overridable — the user may expand or reduce the scope set); (c) triggers the MCP server's inline OAuth UI via MCP Apps (the MCP server returns an HTML login segment, delivered via an MCP Apps **tool call** (e.g. `tools/call name="_pharos_oauth_login"`) returning an HTML `Resource` per the MCP Apps spec — *not* a `resources/read`, despite the `ui://oauth/login` resource-uri naming), rendered in a sandboxed iframe in the chat; (d) waits for the MCP server to complete the OAuth flow server-side — the MCP server holds the `client_secret` and exchanges the authorization code for a token itself; (e) receives a **signed confirmation** (an IdP-issued JWT attesting `{user_sub, scope, exp}`, verifiable via `app_registration.endpoints.jwks`) that auth succeeded (not the token). The SDK MUST verify this JWT before trusting `authorized: true` (§17.4 step 5). The token never reaches the agent or the SDK; the MCP server proxies all subsequent tool calls, attaching its server-side token. Only **after** `authorize()` returns `authorized: true` does the SDK perform MCP `initialize`. The `OAuthResult` returned to the agent carries `authorized=true` and `auth_held_by="mcp_server"` with `access_token=None`.
 4. `auth.type == "mtls"` — the SDK uses a client certificate from the host's credential store.
 
 **The approval prompt (§7.2) MUST display the requested auth scopes before the user approves.** Connecting a server that requests `profile:read` is a different consent decision than connecting one that requests `profile:read` + `payments:write`.
@@ -837,6 +998,8 @@ Discovery returns the server's auth requirements in `ServerCard.auth`. The SDK d
 - The SDK maintains at most one live `MCPClient` per `server_id` per session. Repeated `connect()` calls with a valid, non-expired `ApprovalToken` return the cached client.
 - Connections are torn down on `client.close()`, on token expiry, on `pharos.revoke(token)`, and on process exit (best-effort).
 - The SDK never reconnects automatically after a teardown without a fresh approval event.
+- **Liveness monitoring (H8).** The SDK MUST detect a dead connection within `health_check_interval` (default 60s) and emit a `ConnectionLost(server_id, last_seen)` event. For `persistent` approvals, the SDK does NOT auto-reconnect (per the rule above) — instead it surfaces `ConnectionLost` to the host and requires a fresh approval to reconnect. A silent dead client held indefinitely is a failure mode; the host is told so it can re-prompt or fall back.
+- **Reconnect after `ConnectionLost`.** A fresh approval is required for `persistent`-duration servers just as for novel ones; the `trust_on_use` path (§7.3) MAY re-approve non-modally if the server still qualifies, otherwise the host re-runs the approval flow.
 
 ---
 
@@ -848,9 +1011,18 @@ Discovery introduces a new attack surface: an agent connects to arbitrary intern
 
 Every `ServerCard` carries a `publisher` object and an optional `trust` object. The SDK verifies:
 
-1. **Domain anchoring** — the publisher's claimed domain (extracted from the `urn:pharos:<publisher>:...` ID) must match the domain in the publisher's DID (`did:web:acme.com` → `acme.com`).
+1. **Domain anchoring** — the publisher's claimed domain (extracted from the `urn:pharos:<fqdn>:...` ID) must match the domain in the publisher's DID (`did:web:acme.com` → `acme.com`).
 2. **Signature** — if `trust.signature` is present, the SDK verifies it against the publisher's published public key (fetched from `https://<publisher>/.well-known/pharos-pubkey.json` or the registry's cached key). A failed signature check downgrades the card to `verified=false`.
-3. **Attestations** — `trust.attestations` (e.g. `SOC2-Type2`, `HIPAA-Audit`) are displayed to the user but NOT treated as proof; they are claims the publisher makes, linked to URIs. The registry may independently verify attestations and mark them `registry_verified`.
+3. **Attestations** — `trust.attestations` are objects of the form `{type, uri, verified, verifier, verified_at}` (H13 — was an array of strings; the old shape could not carry the `registry_verified` flag §10.1 mentioned). They are displayed to the user but NOT treated as proof; they are claims the publisher makes, linked to URIs. The registry MAY independently verify an attestation and set `verified=true` with a `verifier` identity and `verified_at` timestamp; unverified attestations display as "vendor-claimed."
+
+**`publisher.verified` distinguishes two levels (M5).** `verified` is not a single boolean meaning "safe." It has two distinct senses, displayed as different badges so users do not infer more trust than is warranted:
+
+- `verification_method: "domain_control"` — the publisher proved control of the domain (DNS challenge or `did:web`). This is the baseline; it proves *who* is publishing, not *that they are trustworthy*. A malicious actor who buys `acme-travel-deals.com` gets `domain_control` verified.
+- `verification_method: "identity"` — the publisher additionally proved organizational identity (LEI lookup, KYC, business registry). This is a stronger bar and displays as a distinct badge. `verified=true` with only `domain_control` MUST NOT be rendered as "trusted"; only `identity` verification carries that implication.
+
+Neither badge means "safe to connect"; they mean "we know who this is" at two levels of confidence.
+
+**`client_id` binding to verified publisher (H14).** At registry-publish time, `auth.app_registration.client_id` is bound to the publisher's verified domain. A server publishing `client_id: "acme-mcp-flights-prod"` MUST have `publisher.id: did:web:acme.com`, and the registry MUST verify that the `client_id` was first registered by the same publisher. Reusing another publisher's `client_id` is a publish-time rejection. This prevents an attacker from copying Acme's `client_id` to lend credibility to a phishing inline-OAuth form (§17.5, §10.5).
 
 **Default policy**: `verify_signatures=True`, `allow_unverified=False`. Hosts that want to allow unverified servers (e.g. local development) must explicitly set `allow_unverified=True`, which is logged.
 
@@ -864,7 +1036,7 @@ Pharos Discovery does not impose a specific sandbox, but it provides hooks for h
 
 ### 10.3 Malicious-server defense
 
-- **Local blocklist** — the SDK fetches and caches a registry-provided blocklist of known-malicious server IDs. Connections to listed servers are refused before any network call.
+- **Local blocklist** — the SDK fetches and caches a registry-provided blocklist of known-malicious server IDs. Connections to listed servers are refused before any network call. The blocklist cache TTL is **60 seconds** (H9 — was implicitly 300s; a malicious server listed 4 minutes ago is still connectable under the old TTL). The SDK SHOULD subscribe to `/v1/events` (§6.7) for push invalidation so a freshly-listed malicious server is blocked within seconds, not minutes.
 - **Behavioral logging** — every `tools/call` is logged locally (with arguments, by default redacted for sensitive params). Anomalously large argument payloads, repeated calls to the same tool, or calls to tools not declared in `tools/list` trigger warnings surfaced via `on_tool_use`.
 - **Report pipeline** — `pharos.report_server(server_id, reason)` submits a report to the registry and adds the server to the local blocklist for the session.
 
@@ -887,6 +1059,12 @@ OAuth under App Registration Inheritance has a fundamentally smaller attack surf
 - **Scope minimization.** The `OAuthFlowHandler` passes to the MCP server only the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the vendor. If the authorization server grants a narrower set than requested, the MCP server reports the *actual* granted scopes back to the agent, and the Connection Manager enforces tool calls against those, not the requested set.
 - **DCR hygiene (legacy fallback only).** App Registration Inheritance is the preferred path; DCR is a fallback for vendors who did not pre-register an app. When DCR is used, the MCP server (not the agent) generates a fresh PKCE verifier per flow, discards the registered `client_id` after the session unless the user opts into `persistent` duration, and rate-limits DCR calls (max 1 per server per 5 minutes) to avoid the unbounded-DB-growth problem that motivated CIMD.
 - **Token leak prevention.** Because tokens are server-side, the agent has no token to leak. The `on_tool_use` callback receives redacted auth headers. `OAuthResult` objects are not serializable into logs by default and carry no secret material.
+- **Revocation proof (H16).** `OAuthFlowHandler.revoke_access()` is best-effort as a request, but the MCP server MUST return a `revocation_proof` — a signed assertion that it called `endpoints.revocation` with the token, or a token-introspection (RFC 7662) response showing `active: false`. The SDK verifies the proof against `endpoints.jwks`. If no proof arrives within 60s, the server is marked `revocation_unconfirmed` and the SDK surfaces a warning to the user: "Acme Flights may still have access to your account. Revoke directly at `<vendor app-management URL>`." The `ServerCard` exposes `endpoints.revocation` and the vendor's app-management URL (in `app_registration.endpoints.revocation` and a new `app_management_url` field) so the user can revoke at the IdP directly when the MCP server is unresponsive or malicious. This is added to the §10.7 threat model as "Revocation not honored."
+- **Server-side exfiltration (C7).** The agent never sees the token, but the MCP server holds it and can misuse it. A malicious MCP server can call the vendor's API with the user's token for *any* purpose within the granted scope — not just the agent's requested tool call — and can exfiltrate the resulting data to a third-party endpoint. The SDK's `egress_allowlist` (§10.2) only covers *agent* egress, not *MCP server* egress. Mitigations (all partial — server-side abuse is fundamentally out of the SDK's control and consent is the only leverage):
+  - The inline OAuth UI (§17.5) SHOULD display: "This server will be able to call `<vendor API>` on your behalf for any purpose within the approved scopes." The over-broad risk is made explicit to the user before consent.
+  - Vendors SHOULD use their IdP's fine-grained scopes (e.g. `bookings:write:flight_only` rather than `bookings:write`), and the SDK SHOULD surface scope granularity in the approval prompt so the user can see the difference.
+  - For `mirrored`/`native` servers, the Pharos Registry MAY run static analysis on the server's tarball to detect suspicious egress endpoints and flag them in the card.
+  - This is acknowledged as a residual risk that consent cannot fully close; it is listed in the §10.7 threat model.
 
 ### 10.6 Security for business adoption
 
@@ -916,6 +1094,41 @@ Businesses (MCP providers like Salesforce, Stripe, SAP) will not expose their se
 | Per-instance client ID proliferation | Vendor pre-registers one app via App Registration Inheritance; all installs of the MCP server inherit the same `client_id` |
 | Malicious agent triggers OAuth | Pharos CIMD verifies agent provider identity first; vendors MAY allow-list providers and refuse unverified agents |
 | DCR endpoint DoS / DB growth (legacy fallback) | DCR is a fallback path only; MCP server rate-limits DCR; ephemeral client IDs; App Registration Inheritance avoids `/register` entirely |
+| Server-side exfiltration (C7) | Token held by MCP server; server can call vendor API for any in-scope purpose and exfiltrate. Mitigations partial: explicit "any purpose within scopes" consent text, fine-grained scopes, registry static analysis of mirrored servers. Acknowledged as residual risk the SDK cannot close. |
+| Revocation not honored (H16) | `revocation_proof` required within 60s; on failure, `revocation_unconfirmed` + user warning with vendor app-management URL. |
+| Registry mints fake agent identity (H15) | CIMD documents are signed by the agent provider (not the registry); registry serves opaque signed blobs; vendors verify provider signature against pinned provider key from `.well-known/agent-provider-keys`, not registry data. |
+| Inline OAuth phishing (C5) | Host (not server) renders non-spoofable chrome: publisher's verified domain, OAuth endpoints, password-mismatch warning. Iframe navigates to IdP's real authorize URL. Brand-similarity rejection at publish time. |
+| Non-SDK agent bypasses consent (C1, out-of-SDK) | See §10.7.1. SDK enforcement is a client-side contract, not a wire-level primitive. Server-side enforcement of `ApprovalToken` is a future protocol extension. |
+
+### 10.7.1 Out-of-SDK threats and the limits of consent enforcement
+
+The approval gate (§7) and the `approved_scopes` check (§4.2) are enforced **by the SDK, on the client side**. They are a contract the SDK holds with conformant SDK-using agents, not a wire-level primitive the MCP protocol enforces. This has consequences the spec must state plainly:
+
+- **Non-SDK agents bypass consent.** An agent that speaks MCP directly — without using the Pharos SDK — can call `initialize` and `tools/call` with no approval token, and a conformant MCP server will respond. The SDK cannot prevent this; nothing in the MCP protocol requires an `ApprovalToken`. Calling §7 "enforced" without this caveat overstates the guarantee.
+- **What the SDK enforces.** For conformant SDK-using agents, the approval gate is non-bypassable: there is no `pharos.connect()` code path that reaches `MCPClient.initialize()` without a valid `ApprovalToken`, and no `tools/call` path that reaches the transport without an `approved_scopes` check. This is a strong client-side guarantee, analogous to a browser's same-origin policy — enforced by the client, not the server.
+- **Future goal: server-side enforcement (requires protocol extension).** A future MCP protocol extension could make `ApprovalToken` a server-checked credential presented at `initialize`, so that a non-SDK agent connecting without a valid token is refused by the server itself. This would convert the client-side contract into a wire-level primitive. The Pharos spec tracks this as a future goal and will contribute the extension upstream (§5.5); until then, the threat model treats non-SDK bypass as out of the SDK's control.
+- **Reporting non-conformance.** Agents that ship without the Pharos SDK but claim Pharos compatibility are non-conformant; the conformance test suite (§8.6) is the arbiter. The spec does not pretend to enforce against agents that never import it.
+
+### 10.8 Query privacy
+
+Every `pharos.search(query)` sends the user's natural-language query to a registry. Queries reveal intent ("flights to Tokyo for two travelers" may reveal a trip and a party size) and, in aggregate, can fingerprint a user. The spec treats query text as potentially sensitive.
+
+- **One-time disclosure.** The SDK MUST warn the user, once per install (not per search), that search queries are sent to the registry and may be logged for ranking/abuse detection. The warning is non-blocking after the first acknowledgment but is surfaced in the help/`--privacy` output.
+- **`privacy_mode` (opt-in).** When `privacy_mode=True` (§8.5), the SDK sends only structured filter fields (`query.capabilities`, `query.transport`, `query.availability`, `query.pricing_tier`) and omits `query.text`. This produces lower-recall results but leaks no free-text intent. The SDK labels `privacy_mode` results as "filtered-only" in the approval UX.
+- **`query.embedding` alternative to `query.text`.** `SearchQuery` (§6.3) gains a `query.embedding: list[float]` field. When set, the SDK generates the embedding **locally** (using the bundled embedding model from §8.4) and sends only the vector, not the text. The registry SHOULD support this via `blinded_search`: it performs nearest-neighbor search against the vector index without ever seeing the raw text. This is stronger than `privacy_mode` (which drops text entirely and relies on filters) — `blinded_search` preserves semantic recall while hiding the text.
+- **Registry logging constraints.** The registry MUST NOT log `query.text` at user level. Aggregate, anonymized query logging is permitted for ranking and abuse detection (§13.6) but MUST be hashed and bucketed so individual queries are not reconstructable. `query.text` MUST NOT appear in any per-user analytics, retention, or shared-with-third-parties pipeline.
+- **`/v1/privacy` policy endpoint.** The registry exposes `GET /v1/privacy` returning a machine-readable policy document: what query fields are logged, retention period, whether `blinded_search` is supported, the data residency of query logs, and a human-readable URL. The SDK fetches this on first search and surfaces it in the privacy disclosure. This is the registry-side counterpart to the SDK's `privacy_mode`.
+
+This reconciles the §13.6 "discovery as SEO" framing (which assumes queries are observable and rankable) with user privacy: ranking signals come from *aggregate, anonymized* query volume and post-connection success signals (§13.6 H12), not from per-user query text.
+
+### 10.8 Key rotation and pin freshness
+
+Publisher keys pinned by the SDK (§9.3) are re-validated on a TTL, not held forever:
+
+- **TTL.** The SDK re-fetches `https://<publisher>/.well-known/pharos-pubkey.json` at most every `key_pin_ttl_seconds` (default 86400 = 24h). A successful re-fetch updates the pin; a failed re-fetch after TTL quarantines the server (connection refused) until re-validation succeeds.
+- **WHOIS change triggers re-verification.** A change in the domain's WHOIS registrant or nameservers triggers immediate re-verification of the publisher's `domain_control` (§10.1, M5), independent of TTL. A domain transferred to a new registrant is treated as a new publisher; the old `identity` verification does not carry over.
+- **Stale-card quarantine.** A `ServerCard` whose publisher key fails to refresh after TTL is marked `stale` in the local cache — it is not surfaced in search results and not connectable — until the key is re-validated or the card is updated by the registry. This prevents a compromised-then-rotated publisher key from being trusted indefinitely, and prevents a lapsed publisher domain from being silently trusted.
+- **Quarantine UX.** The SDK surfaces a non-blocking `PublisherKeyStale(server_id)` event so the host can explain why a previously-available server is unavailable.
 
 ---
 
@@ -928,6 +1141,10 @@ Pharos Discovery is registry-agnostic via adapters. Each adapter implements the 
 ```python
 class RegistryAdapter:
     name: str                              # "pharos" | "mcp-official" | "ard" | "claude-connectors"
+    capabilities: set[str]                 # H3: what this adapter supports — subset of
+                                           # {"semantic_search", "filter_search", "reviews",
+                                           #  "pricing", "federation", "publish", "report",
+                                           #  "blinded_search", "push_events", "key_pinning"}
     async def search(query: SearchQuery) -> list[ServerCard]: ...
     async def get(server_id: str) -> ServerCard: ...
     async def publish(card: ServerCard) -> str: ...
@@ -935,6 +1152,8 @@ class RegistryAdapter:
     def to_canonical(native: dict) -> ServerCard: ...
     def from_canonical(card: ServerCard) -> dict: ...
 ```
+
+The `capabilities` set lets the SDK degrade gracefully — e.g. an adapter that does not advertise `semantic_search` gets substring-only behavior from the SDK (no local embedding re-rank), and one without `pricing` returns `pricing=None` without the SDK having to probe.
 
 ### 11.2 Native: Pharos Registry
 
@@ -944,7 +1163,7 @@ The reference adapter. No translation; speaks the §6 API natively. Supports fed
 
 Translates between the canonical `ServerCard` and the official registry's `/v0.1/servers` schema.
 
-- `GET /v0.1/servers?search=<text>` → the adapter maps the substring search to the canonical `query.text` and performs **client-side semantic re-ranking** (using a small local embedding model or the host's LLM) since the official registry explicitly does not provide semantic search.
+- `GET /v0.1/servers?search=<text>` → the adapter maps the substring search to the canonical `query.text` and performs **client-side semantic re-ranking** using a small local embedding model. The reference model is `all-MiniLM-L6-v2` (~22 MB ONNX, 384-dim, CPU-friendly, MIT-licensed) shipped with the SDK; the adapter MAY substitute an equivalent ~22 MB ONNX model but MUST document the substitution. Re-ranking is a **plugin** — hosts that do not ship the embedding model fall back to **substring-only** ranking (exact substring match on `display_name` and `description`), which is clearly labeled "non-semantic" in the approval UX. The phrase "or the host's LLM" is removed: routing discovery ranking through an opaque third-party LLM is a privacy and determinism regression the spec does not sanction.
 - `GET /v0.1/servers/{name}/versions/{version}` → maps to `GET /v1/servers/{id}`.
 - Missing fields (pricing, reviews, ratings) are returned as `None`; the SDK degrades gracefully and labels such results as "limited metadata" in the approval UX.
 - Publisher verification uses the official registry's namespace-based auth (GitHub OAuth for `io.github.*`, DNS for domain namespaces) mapped to the `publisher.verified` field.
@@ -954,7 +1173,7 @@ Translates between the canonical `ServerCard` and the official registry's `/v0.1
 Translates between canonical `ServerCard`s and ARD catalog entries (`application/mcp-server-card+json`).
 
 - ARD `POST /search` (per §7.2 of the ARD spec) → the adapter sends the ARD query shape and maps results back, converting `urn:air:<publisher>:<ns>:<name>` identifiers to `urn:pharos:...` canonical IDs (preserving the original via a `source_urn` field).
-- ARD's `score` (0–100) is normalized to `pharos_score` (0.0–1.0). As in ARD, this is a relevance metric, not a trust rating.
+- ARD's `score` (0–100) is preserved as `source_score` on each `ServerCard` (§8.3) and is NOT normalized into a synthetic `pharos_score`. Cross-registry comparison of heterogeneous scores is **illegal by spec** — comparing an ARD `score` to a Pharos `pharos_score` is meaningless because they are produced by different ranking functions. The SDK presents results from a single adapter in **rank order** (the order the source registry returned) and labels the source. When multiple adapters are queried in `federation_mode="auto"`, results from each source are presented in their own rank-ordered group, not merged into a single false-precision leaderboard. `pharos_score` is set to `None` for ARD-sourced results; `source_score` carries the original 0–100 value for display.
 - ARD `trustManifest` (identity, attestations, provenance) maps directly to the canonical `trust` and `publisher` objects.
 - ARD federation (`auto`/`referrals`/`none`) passes through unchanged — Pharos and ARD share the same federation model by design.
 - ARD's `representativeQueries` field maps to `representative_queries`.
@@ -967,20 +1186,26 @@ AGNTCY (Linux Foundation Internet of Agents) provides discovery, identity, messa
 
 ### 11.6 A2A adapter (planned)
 
-Agent2Agent (A2A) publishes `AgentCard` JSON documents at `/.well-known/agent-card.json` describing an agent's `name`, `description`, `version`, `url`, `skills`, `defaultInputModes`, `defaultOutputModes`, and `authentication`. The A2A adapter:
+Agent2Agent (A2A) publishes `AgentCard` JSON documents at `/.well-known/agent-card.json` describing an agent's `name`, `description`, `version`, `url`, `skills`, `defaultInputModes`, `defaultOutputModes`, and `authentication`.
 
-- Crawls/queries A2A agent cards and maps each `skill` to a canonical `capability`.
-- Surfaces A2A agents as discoverable resources, with the approval flow noting that the connection is to an A2A agent (JSON-RPC 2.0 over HTTP) rather than an MCP server.
-- This is the bridge that makes Pharos Discovery a **unified discovery layer for both MCP tools and A2A agents**, not just MCP.
+**Scope decision (H3): discovery-only.** The A2A adapter is **discovery-only**. The SDK fetches and maps the `AgentCard` to a canonical `ServerCard` (each A2A `skill` → a canonical `capability`), surfaces it in search results, and presents the approval flow noting that the target is an A2A agent (JSON-RPC 2.0 over HTTP) rather than an MCP server. On approval, the SDK **returns the `AgentCard` to the host and does not connect** — the host (or the host's A2A client) performs the A2A transport connection itself. This avoids the spec having to define a full A2A transport (§9.6) in v1; if full A2A transport becomes a requirement, it will be added as a separate §9.6 in a future revision rather than half-defined here. Picking discovery-only keeps the adapter surface small and avoids an ambiguous "SDK connects to A2A but only partially" state.
 
 ### 11.7 Walled-garden bridges
 
 For vendor registries that do not expose a public search API (Claude Connectors marketplace, MS Copilot connector store):
 
-- Bridges are **read-only** and **best-effort**. They scrape or use vendor-provided listing APIs where terms permit.
+- Bridges require a **documented vendor API** (an official listing/search endpoint, an export feed, or a partnership data grant). **Scraping is out of scope** — scraping vendor storefronts is fragile, often violates ToS, and produces a maintenance burden that scales with the vendor's HTML churn. A bridge without a documented API is not shipped.
 - Results are labeled `"source": "claude-connectors"` (etc.) and marked `limited_metadata=true`.
-- The SDK does not attempt to bypass authentication or terms of service. If a vendor's ToS forbids programmatic listing, that bridge is not shipped.
+- The SDK does not attempt to bypass authentication or terms of service.
 - The long-term bet is that vendors adopt open discovery (ARD or Pharos) and bridges become unnecessary. Until then, bridges extend coverage without being a dependency.
+
+### 11.8 Coexistence with vendor-native connectors (H18)
+
+A host may already have a vendor-native connector for a server Pharos would discover — e.g. the host ships a first-party Slack connector while Pharos also surfaces a Slack MCP server. Two connectors to the same backend is a real failure mode (double-billing, conflicting auth, confusing UX). The spec resolves it:
+
+- **`consent_store` is the source of truth for Pharos-managed connections.** The SDK's consent store (§10.4) tracks every server connected *via Pharos*. A connection established through a vendor-native connector is NOT in the Pharos consent store and is not tracked, blocked, or revoked by Pharos.
+- **`pharos.detect_native_connector(server_id) -> bool`.** The SDK exposes an API the host calls before offering a Pharos-discovered server. The host implements the check (it knows its own native connectors); the SDK provides the hook. If a native connector exists for the same `server_id` (or the same vendor backend, matched by `publisher.id`), the SDK **defers to the native connector**: the Pharos approval prompt is suppressed and the host routes the tool call through its native path. The SDK surfaces a `NativeConnectorPreferred(server_id)` event so the user understands why a discovered server was not connected.
+- **No silent shadow.** The SDK does not connect a Pharos-managed server alongside a native connector for the same backend. If the user explicitly requests the Pharos path (e.g. to use a different scope set), the host must surface a disambiguation prompt; the SDK does not pick for them.
 
 ---
 
@@ -993,21 +1218,21 @@ For vendor registries that do not expose a public search API (Claude Connectors 
 | Provider-agnostic | ✅ (core goal) | ✅ (spec is neutral) | ✅ | ✅ | ❌ Claude only | ❌ M365 only | ✅ | ✅ |
 | Embeddable client | ✅ Python + TS | ❌ (spec only) | Partial | ❌ (protocol) | ❌ | ❌ | ❌ | ❌ (server-side) |
 | Semantic search | Via registry | Via registry | Via registry | N/A | ❌ | ❌ | ❌ (substring only) | ✅ FAISS |
-| User approval gate | ✅ enforced in SDK | ❌ (out of scope) | ❌ | ❌ | Vendor-managed | Vendor-managed (DLP) | ❌ | ❌ |
+| User approval gate | ✅ enforced for conformant SDK-using agents (§10.7.1) | ❌ (out of scope) | ❌ | ❌ | Vendor-managed | Vendor-managed (DLP) | ❌ | ❌ |
 | Consent logging | ✅ local + optional registry | ❌ | ❌ | ❌ | Vendor-managed | Vendor-managed | ❌ | ❌ |
 | Publisher verification | ✅ signatures + attestations | ✅ trustManifest | ✅ identity layer | ✅ Agent Card | Vendor-curated | Vendor-curated | Namespace auth | Configured |
 | Federation | ✅ auto/referrals/none | ✅ same model | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Business discovery (publish-once) | ✅ via Pharos Registry | ✅ via `ai-catalog.json` | ✅ | ❌ | ❌ | ❌ | ✅ (publish to registry) | ✅ |
 | Pricing/reviews metadata | ✅ first-class | Via Schema.org ext | ❌ | ❌ | Vendor-specific | ❌ | ❌ | ❌ |
 | Transport handling (stdio + HTTP/SSE) | ✅ | ❌ (pre-invocation) | ❌ | ❌ | ✅ (Claude-managed) | ✅ (Copilot-managed) | ❌ | ✅ (gateway) |
-| Inline OAuth via MCP Apps (no chat-leaving redirect) | ✅ via App Registration Inheritance + MCP Apps (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
+| Inline OAuth via MCP Apps (no chat-leaving redirect) | ✅ inline on MCP-Apps hosts; server-brokered redirect elsewhere (§17.5); agent never handles tokens in either mode | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
 | OAuth brokering (no per-server app registration by user/agent) | ✅ via App Registration Inheritance — vendor pre-registers, MCP server inherits (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
 | Status | Pre-implementation | v0.9 draft | Active | v1.x | Shipping | Shipping | Shipping | Shipping |
 
 **Key differentiators of Pharos Discovery:**
 
 1. **It is a client, not a spec or a server.** ARD is a specification (someone else implements it); the official MCP Registry is a server (someone else queries it); mcp-gateway-registry is server infra. Pharos Discovery is the **embeddable client** that agents actually import.
-2. **Consent is in the protocol, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass.
+2. **Consent is in the client, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass *for conformant SDK-using agents* (§10.7.1) — this is a client-side contract, not a wire-level protocol primitive. Non-SDK agents can bypass it; server-side enforcement of `ApprovalToken` is a future protocol extension the spec tracks but does not claim to provide today.
 3. **Neutrality by design.** ARD is Google-led; AGNTCY is Cisco/Linux Foundation; Claude Connectors is Anthropic. Pharos is positioned as the neutral middle — implementing adapters for all of them, canonicalizing none.
 4. **Business metadata is first-class.** Pricing, reviews, and publisher identity are core fields, not Schema.org extensions. This reflects the "next Google" thesis: businesses are being discovered, not just tools.
 5. **OAuth via App Registration Inheritance solves the MCP auth bootstrap problem — without the agent ever handling a token.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server, and each requiring a per-server app registration or a DCR dance. This does not scale. Pharos Discovery's model (§17) has two levels: (a) agent providers register *once* with the Pharos Registry to establish a verified CIMD identity, and (b) **MCP server vendors pre-register an OAuth app with their IdP and bundle that registration into `pharos.json`** — so when an agent installs the MCP server, it *inherits* the app registration. No user creates a new app registration. The MCP server (not the agent) then runs the OAuth flow server-side, holding the `client_secret` and the resulting token, and proxies tool calls. The login UI is rendered **inline in the chat** via the MCP Apps extension (sandboxed iframe, JSON-RPC over `postMessage`) — the user never leaves the chat. The agent and SDK never see the token or the secret. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side and require leaving the chat for login.
