@@ -1,6 +1,6 @@
 # Pharos Discovery — Technical Specification
 
-**Version:** 0.1.0 (Draft)
+**Version:** 0.2.0 (Draft)
 **Status:** Pre-implementation
 **Date:** July 19, 2026
 **License:** MIT
@@ -26,7 +26,7 @@
 14. [MVP Scope vs. Future Features](#14-mvp-scope-vs-future-features)
 15. [Development Roadmap](#15-development-roadmap)
 16. [Appendices](#16-appendices)
-17. [OAuth-Aware Discovery](#17-oauth-aware-discovery)
+17. [OAuth via App Registration Inheritance](#17-oauth-via-app-registration-inheritance)
 
 ---
 
@@ -38,7 +38,7 @@ Today, agent providers are each building their own walled-garden discovery chann
 
 Pharos Discovery replaces this fragmentation with **one thin, open, embeddable layer** that any agent can import and any compatible registry can serve. It is:
 
-- **Provider-neutral** — not aligned with ARD, AGNTCY, or any single vendor's discovery vision; capable of federating across all of them. We are a **complementary superset to the official MCP Registry**: we read `server.json` and registry entries, and add discovery, consent, and OAuth brokering on top.
+- **Provider-neutral** — not aligned with ARD, AGNTCY, or any single vendor's discovery vision; capable of federating across all of them. We are a **complementary superset to the official MCP Registry**: we read `server.json` and registry entries, and add discovery, consent, and OAuth via App Registration Inheritance (§17) on top.
 - **Consent-first** — agents **never** connect to a discovered service without explicit user approval. No silent connections, ever.
 - **Registry-agnostic** — ships with first-class support for the **Pharos Registry** (sister project, built in Rust) but speaks a documented HTTP API that any compliant registry can implement. Bridges to the official MCP Registry, ARD catalogs, and walled gardens are provided as adapters.
 - **Thin and embeddable** — a Python and TypeScript client library, not a server. Agents embed it; registries serve it. (The Pharos Registry is a separate Rust project; the discovery SDKs just speak HTTP to the registry API, so the SDK language choice is independent of the registry implementation language.)
@@ -63,7 +63,7 @@ We are deliberately **not adopting Google's ARD spec** as our north star. ARD is
 
 **Dual positioning.** Pharos Discovery is:
 - **Neutral on ARD** — we implement an adapter (§11.4), not a commitment. ARD catalogs are federation peers.
-- **A complementary superset to the official MCP Registry.** We consume the official registry's `server.json` / `/v0.1/servers` entries unchanged and add three layers the official registry deliberately omits: semantic + structured discovery, a consent/approval gate, and OAuth brokering (§17). We do not compete with the official registry for the canonical record of which servers exist; we make that record discoverable, approvable, and connectable.
+- **A complementary superset to the official MCP Registry.** We consume the official registry's `server.json` / `/v0.1/servers` entries unchanged and add three layers the official registry deliberately omits: semantic + structured discovery, a consent/approval gate, and OAuth via App Registration Inheritance (§17). We do not compete with the official registry for the canonical record of which servers exist; we make that record discoverable, approvable, and connectable.
 
 ---
 
@@ -265,15 +265,28 @@ The primary discovery endpoint. Accepts a natural-language query and optional st
       "tools_count": 7,
       "auth": {
         "type": "oauth",
-        "scopes": ["bookings:write", "profile:read"],
-        "auth_url": "https://acme.com/oauth/authorize",
-        "auth_server_url": "https://auth.acme.com",
-        "token_endpoint": "https://auth.acme.com/oauth/token",
-        "grant_types": ["authorization_code", "refresh_token"],
-        "pkce_required": true,
-        "dcr_support": false,
-        "cimd_support": true,
-        "jwks_url": "https://auth.acme.com/.well-known/jwks.json"
+        "secret_handling": "server_side",
+        "app_registration": {
+          "client_id": "acme-mcp-flights-prod",
+          "auth_server_url": "https://auth.acme.com",
+          "grant_types": ["authorization_code", "refresh_token"],
+          "scopes": [
+            {"name": "bookings:write", "description": "Create and modify bookings"},
+            {"name": "profile:read", "description": "Read profile data"}
+          ],
+          "consent_defaults": ["bookings:write", "profile:read"],
+          "redirect_uri_pattern": "https://mcp.acme.com/oauth/callback",
+          "endpoints": {
+            "authorization": "https://auth.acme.com/oauth/authorize",
+            "token": "https://auth.acme.com/oauth/token",
+            "revocation": "https://auth.acme.com/oauth/revoke",
+            "jwks": "https://auth.acme.com/.well-known/jwks.json"
+          }
+        },
+        "ui": {
+          "resource_uri": "ui://oauth/login",
+          "csp": "default-src 'self'; script-src 'self'; frame-ancestors 'self'"
+        }
       },
       "availability": "mirrored",
       "pricing": {
@@ -368,7 +381,7 @@ The registry returns an `audit_id`. This is **opt-in per host agent** — privac
 
 ### 6.7 `GET /v1/servers/{id}/oauth` — OAuth metadata (Phase 2)
 
-Returns the full OAuth/authorization configuration for a server, used by the SDK's `OAuthFlowHandler` (§17) to execute an OAuth flow without the agent separately discovering the auth setup. This endpoint is an optimization — the same fields are already embedded in the `ServerCard.auth` object (§6.3) — but it allows a client to refresh just the OAuth config (which may rotate, e.g. `jwks_url` key rolls) without re-fetching the whole card.
+Returns the full OAuth/authorization configuration for a server, used by the SDK's `OAuthFlowHandler` (§17) to present the vendor's consent defaults and trigger the MCP server's inline OAuth UI (via MCP Apps). This endpoint is an optimization — the same fields are already embedded in the `ServerCard.auth` object (§6.3) — but it allows a client to refresh just the OAuth config (which may rotate, e.g. `endpoints.jwks` key rolls) without re-fetching the whole card.
 
 **Response:**
 
@@ -377,17 +390,28 @@ Returns the full OAuth/authorization configuration for a server, used by the SDK
   "server_id": "urn:pharos:acme.com:travel:flight-booking",
   "auth": {
     "type": "oauth",
-    "auth_server_url": "https://auth.acme.com",
-    "authorization_endpoint": "https://auth.acme.com/oauth/authorize",
-    "token_endpoint": "https://auth.acme.com/oauth/token",
-    "grant_types": ["authorization_code", "refresh_token"],
-    "scopes": [{"name": "bookings:write", "description": "Create and modify bookings"}, {"name": "profile:read", "description": "Read profile data"}],
-    "pkce_required": true,
-    "dcr_support": false,
-    "dcr_endpoint": null,
-    "cimd_support": true,
-    "jwks_url": "https://auth.acme.com/.well-known/jwks.json",
-    "token_auth_method": "client_secret_basic"
+    "secret_handling": "server_side",
+    "app_registration": {
+      "client_id": "acme-mcp-flights-prod",
+      "auth_server_url": "https://auth.acme.com",
+      "grant_types": ["authorization_code", "refresh_token"],
+      "scopes": [
+        {"name": "bookings:write", "description": "Create and modify bookings"},
+        {"name": "profile:read", "description": "Read profile data"}
+      ],
+      "consent_defaults": ["bookings:write", "profile:read"],
+      "redirect_uri_pattern": "https://mcp.acme.com/oauth/callback",
+      "endpoints": {
+        "authorization": "https://auth.acme.com/oauth/authorize",
+        "token": "https://auth.acme.com/oauth/token",
+        "revocation": "https://auth.acme.com/oauth/revoke",
+        "jwks": "https://auth.acme.com/.well-known/jwks.json"
+      }
+    },
+    "ui": {
+      "resource_uri": "ui://oauth/login",
+      "csp": "default-src 'self'; script-src 'self'; frame-ancestors 'self'"
+    }
   },
   "pharos_cimd_url": "https://registry.pharos.dev/v1/agents/{agent_provider_id}/cimd",
   "fetched_at": "2026-07-19T08:42:11Z",
@@ -395,7 +419,7 @@ Returns the full OAuth/authorization configuration for a server, used by the SDK
 }
 ```
 
-The `pharos_cimd_url` field is the stable URL where the agent provider's Client ID Metadata Document (CIMD, §17.3) is hosted by the Pharos Registry. When a server's authorization server supports CIMD, the SDK uses this URL as the OAuth `client_id` — no per-server registration required.
+The `pharos_cimd_url` field is the stable URL where the agent provider's Client ID Metadata Document (CIMD, §17.3) is hosted by the Pharos Registry. The CIMD establishes the *agent provider's* verified identity (used for agent authentication to the registry and for vendor-side agent allow-listing); it is **not** the `client_id` used against the MCP server's authorization server. Under App Registration Inheritance, the `client_id` for the per-server OAuth flow is the vendor's pre-registered `app_registration.client_id`, which the MCP server inherits and uses server-side.
 
 ### 6.8 `POST /v1/feedback` — reviews & reports
 
@@ -459,7 +483,7 @@ The approval card MUST surface — at minimum — the following fields from the 
 - `description` — what the server does, in plain language
 - `capabilities` — the concrete capabilities the agent intends to use (not necessarily all of them)
 - `auth.type` and `auth.scopes` — what permissions the server is requesting
-- **OAuth scope approval (when `auth.type == "oauth"`).** The approval prompt MUST enumerate the OAuth scopes being requested alongside the MCP capability scopes, in plain language. The user approves *two* things in a single consent act: (a) the connection to the server, and (b) the OAuth scopes the server's authorization server will be asked to grant. The SDK records the approved OAuth scope set in the `ApprovalToken.approved_oauth_scopes` field and passes only those scopes to the `OAuthFlowHandler` (§17). The handler MUST NOT request scopes the user did not approve. If the user narrows the OAuth scope set, the handler performs scope minimization (§17.4) before starting the flow.
+- **OAuth scope approval (when `auth.type == "oauth"`).** The approval prompt MUST enumerate the OAuth scopes being requested alongside the MCP capability scopes, in plain language. The user approves *two* things in a single consent act: (a) the connection to the server, and (b) the OAuth scopes that the MCP server will broker on the user's behalf. **Consent defaults come from the vendor** (`auth.app_registration.consent_defaults`) and are presented pre-checked; the user MAY expand or reduce the scope set before approving. The SDK records the final approved OAuth scope set in the `ApprovalToken.approved_oauth_scopes` field and passes only those scopes to the `OAuthFlowHandler` (§17). The handler MUST NOT request scopes the user did not approve. If the user narrows the OAuth scope set, the handler performs scope minimization (§17.4) before triggering the MCP server's inline OAuth UI. **Under App Registration Inheritance, the user never creates an OAuth app registration** — the vendor pre-registered the app and bundled it in `pharos.json`; the MCP server inherits that registration and brokers the flow server-side (§17).
 - `pricing.model` and `pricing.price_usd` — what it will cost, if anything
 - `trust.attestations` — compliance claims (SOC2, GDPR, etc.), shown as badges
 - `rating.score` and `rating.count` — community signal
@@ -700,28 +724,37 @@ class MCPClient:
     async def list_prompts() -> list[Prompt]: ...
     async def close() -> None: ...
 
-# OAuthFlowHandler — executes the OAuth flow for a discovered server (§17).
+# OAuthFlowHandler — coordinates inline OAuth via App Registration Inheritance (§17).
 # Agent providers implement this ONCE; it works for every MCP server.
+# NOTE: Under App Registration Inheritance, the handler does NOT run a standard
+# OAuth redirect flow. It reads the ServerCard.auth config, presents the vendor's
+# consent defaults to the user, triggers the MCP server's inline OAuth UI (via
+# MCP Apps), waits for the MCP server to complete the OAuth flow server-side,
+# and receives a CONFIRMATION (not the token itself). The token stays with the
+# MCP server, which proxies tool calls.
 class OAuthFlowHandler:
     async def authorize(
         self,
         server: ServerCard,
         approval: ApprovalToken,
-        redirect_uri: str,
     ) -> OAuthResult: ...
-    async def refresh(self, server: ServerCard, refresh_token: str) -> OAuthResult: ...
-    def store_token(self, server_id: str, token: dict) -> None: ...
-    def load_token(self, server_id: str) -> dict | None: ...
-    def revoke_token(self, server_id: str) -> None: ...
+    async def refresh(self, server: ServerCard) -> OAuthResult: ...
+    def revoke_access(self, server_id: str) -> None: ...   # asks MCP server to revoke its server-side token
+    def status(self, server_id: str) -> OAuthStatus: ...    # is the MCP server's server-side auth still valid?
 
-# OAuthResult — returned by OAuthFlowHandler.authorize()
+# OAuthResult — returned by OAuthFlowHandler.authorize().
+# Under App Registration Inheritance this carries a CONFIRMATION, not a token.
+# The access_token / refresh_token fields are None when secret_handling == "server_side".
 class OAuthResult:
-    access_token: str
-    token_type: str                # "Bearer"
+    authorized: bool              # True if the MCP server completed the OAuth flow server-side
+    access_token: str | None      # None when secret_handling == "server_side" (token stays in MCP server)
+    token_type: str | None        # "Bearer" when token returned; None when server-side
     expires_in: int | None
-    refresh_token: str | None
-    scope: list[str]               # scopes actually granted (may be a subset of requested)
-    acquired_via: str              # "cimd" | "dcr" | "api_key" | "static"
+    refresh_token: str | None     # None when server-side
+    scope: list[str]              # scopes actually granted (may be a subset of approved_oauth_scopes)
+    acquired_via: str             # "app_registration_inheritance" | "cimd" | "dcr" | "api_key" | "static"
+    auth_held_by: str             # "mcp_server" | "agent"  — under §17, always "mcp_server"
+    confirmed_at: str             # ISO8601 timestamp of the MCP server's auth-completed confirmation
 ```
 
 ### 8.4 Embedding model
@@ -794,7 +827,7 @@ Discovery returns the server's auth requirements in `ServerCard.auth`. The SDK d
 
 1. `auth.type == "none"` — connect directly.
 2. `auth.type == "api_key"` — the SDK calls the host's `credential_provider` callback (host-supplied) to fetch the key, then sets the appropriate header.
-3. `auth.type == "oauth"` — the SDK delegates to the `OAuthFlowHandler` (§17). Based on the expanded `auth` config in the `ServerCard`, the handler selects the appropriate flow: CIMD (using the agent provider's Pharos-hosted metadata URL as `client_id`), DCR (dynamic registration against `auth.dcr_endpoint`), or a static/client-credentials path. The user completes authorization in the host's UX. The resulting token is held in memory for the session only (never written to disk unless `duration=persistent` and the user explicitly opts in). Token refresh, scope minimization, and revocation are handled by the handler.
+3. `auth.type == "oauth"` — the SDK delegates to the `OAuthFlowHandler` (§17). Under **App Registration Inheritance**, the handler does NOT run a standard OAuth redirect flow. Instead it: (a) retrieves the OAuth config from `ServerCard.auth.app_registration`; (b) presents the vendor's `consent_defaults` to the user (overridable — the user may expand or reduce the scope set); (c) triggers the MCP server's inline OAuth UI via MCP Apps (the MCP server returns an HTML login segment at `auth.ui.resource_uri`, rendered in a sandboxed iframe in the chat); (d) waits for the MCP server to complete the OAuth flow server-side — the MCP server holds the `client_secret` and exchanges the authorization code for a token itself; (e) receives a **confirmation** that auth succeeded (not the token). The token never reaches the agent or the SDK; the MCP server proxies all subsequent tool calls, attaching its server-side token. The `OAuthResult` returned to the agent carries `authorized=true` and `auth_held_by="mcp_server"` with `access_token=None`.
 4. `auth.type == "mtls"` — the SDK uses a client certificate from the host's credential store.
 
 **The approval prompt (§7.2) MUST display the requested auth scopes before the user approves.** Connecting a server that requests `profile:read` is a different consent decision than connecting one that requests `profile:read` + `payments:write`.
@@ -843,16 +876,29 @@ Pharos Discovery does not impose a specific sandbox, but it provides hooks for h
 
 ### 10.5 OAuth security (Phase 2, see §17)
 
-OAuth brokering introduces its own attack surface. The SDK mitigates:
+OAuth under App Registration Inheritance has a fundamentally smaller attack surface than a redirect-flow model because the agent and SDK **never handle tokens or secrets**. The MCP server brokers everything server-side. The SDK mitigates the residual surface:
 
-- **SSRF prevention when fetching CIMD metadata.** When a server's authorization server fetches the agent's Client ID Metadata Document (§17.3), or when the SDK fetches a server's OAuth metadata, the SDK MUST NOT issue requests to internal/loopback/link-local addresses. The `OAuthFlowHandler` validates the fetched URL against an egress allowlist (the same `egress_allowlist` used for §10.2) before any HTTP call. Redirect chains are followed with a max depth of 3 and each hop is re-validated.
+- **Secret isolation (key security property).** The vendor's `client_secret` is NEVER present in the registry, the agent, or the SDK. It lives only in the MCP server's server-side configuration, bundled via `pharos.json` at build time and never serialized into a `ServerCard`. The `ServerCard.auth` object carries the `app_registration` metadata (`client_id`, endpoints, scopes, consent defaults) but MUST NOT carry `client_secret`. The agent never sees the secret; the SDK never sees the secret; the registry never sees the secret. Compromise of the agent or SDK cannot leak OAuth credentials.
+- **Token isolation.** Because the MCP server runs the OAuth flow server-side and proxies tool calls, the access token and refresh token never reach the agent runtime. There is no in-memory token store in the SDK to attack, no OS keychain entry to exfiltrate, and no token in logs. The `OAuthResult` returned to the agent is a boolean confirmation plus the granted scope set — never the token. Revocation is a request to the MCP server (`OAuthFlowHandler.revoke_access`), which tears down its server-side session.
+- **Inline OAuth UI security (MCP Apps).** The inline login form is rendered in a **sandboxed iframe** per the MCP Apps extension spec. All communication between the host agent and the iframe is **JSON-RPC over `postMessage`** with an explicit origin check. The `auth.ui.csp` field in the `ServerCard` declares the vendor's Content Security Policy; hosts SHOULD enforce it and MAY block any inline UI whose effective CSP is more permissive than declared, or that attempts network access outside `auth.app_registration.endpoints`. Hosts MAY refuse to render inline OAuth UI at all (falling back to a "connect in vendor's own app" prompt) for high-security deployments.
+- **Agent identity verification before OAuth.** Before any OAuth flow begins, Pharos CIMD (§17.3) establishes the *agent provider's* verified identity. Vendors MAY configure their MCP server to accept OAuth flows only from specific agent providers (an allow-list checked against the CIMD-verified provider ID), and MAY revoke access for a provider globally. This means a malicious agent cannot trigger an OAuth flow against a vendor's IdP without first presenting a verifiable provider identity.
+- **SSRF prevention when fetching CIMD metadata.** When the MCP server (or, in legacy paths, the SDK) fetches an agent's Client ID Metadata Document (§17.3), the fetcher MUST NOT issue requests to internal/loopback/link-local addresses. The SDK validates fetched URLs against an egress allowlist (the same `egress_allowlist` used for §10.2) before any HTTP call. Redirect chains are followed with a max depth of 3 and each hop is re-validated.
 - **CIMD metadata integrity.** The Pharos Registry serves CIMD documents over HTTPS with a stable, signed URL. The SDK MUST verify the TLS certificate chain and pin the registry's public key when `verify_signatures=True`. CIMD documents are cached locally with a short TTL (default 1 hour); stale cache is rejected if the registry signals key rotation.
-- **Token storage.** Access tokens live in memory only for `session` duration. For `persistent` duration, tokens are encrypted at rest with a key derived from the host OS keychain (SecretService / Keychain / DPAPI) — never plaintext on disk. Refresh tokens, when issued, are stored with the same protections and revoked via `OAuthFlowHandler.revoke_token()` on `pharos.revoke()`.
-- **Scope minimization.** The `OAuthFlowHandler` requests only the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the server. If the authorization server returns a narrower scope set than requested, the SDK records the *actual* granted scopes and the Connection Manager enforces against those, not the requested set.
-- **DCR hygiene.** When falling back to Dynamic Client Registration (§17.2), the SDK generates a fresh PKCE verifier per flow, discards the registered `client_id` after the session unless the user opts into `persistent` duration, and rate-limits DCR calls (max 1 per server per 5 minutes) to avoid contributing to the unbounded-DB-growth problem that motivated CIMD.
-- **Token leak prevention.** Tokens are never logged. The `on_tool_use` callback receives redacted auth headers. `OAuthResult` objects are not serializable into logs by default.
+- **Scope minimization.** The `OAuthFlowHandler` passes to the MCP server only the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the vendor. If the authorization server grants a narrower set than requested, the MCP server reports the *actual* granted scopes back to the agent, and the Connection Manager enforces tool calls against those, not the requested set.
+- **DCR hygiene (legacy fallback only).** App Registration Inheritance is the preferred path; DCR is a fallback for vendors who did not pre-register an app. When DCR is used, the MCP server (not the agent) generates a fresh PKCE verifier per flow, discards the registered `client_id` after the session unless the user opts into `persistent` duration, and rate-limits DCR calls (max 1 per server per 5 minutes) to avoid the unbounded-DB-growth problem that motivated CIMD.
+- **Token leak prevention.** Because tokens are server-side, the agent has no token to leak. The `on_tool_use` callback receives redacted auth headers. `OAuthResult` objects are not serializable into logs by default and carry no secret material.
 
-### 10.6 Threat model (summary)
+### 10.6 Security for business adoption
+
+Businesses (MCP providers like Salesforce, Stripe, SAP) will not expose their services via Pharos unless it is safe. The following properties are designed for enterprise adoption:
+
+- **Secret isolation.** `client_secret` never in registry, agent, or SDK — always server-side in the MCP server (§10.5). This is the single most important property for business trust: a business can publish a ServerCard without exposing any credential material.
+- **Audit trail.** Every discovery, approval, connection, OAuth authorization, and tool call is logged. Local logs (SDK-side) are append-only and signed; registry-side audit (opt-in, §6.6) records approval events with `user_id_hash` only. Vendors receive connection and tool-call events from their MCP server.
+- **Agent identity verification.** Pharos CIMD (§17.3) establishes verified agent provider identity *before* any OAuth flow begins. A vendor's MCP server can refuse to start an OAuth flow for an unverified or non-allow-listed agent provider.
+- **Vendor control.** Vendors set `consent_defaults` (the pre-checked OAuth scopes), MAY require specific agent providers via an allow-list, MAY scope `redirect_uri_pattern` to their own MCP server, and CAN revoke a provider's access globally without a client-side update. Vendors retain full control of their IdP app registration.
+- **Inline OAuth security.** MCP Apps sandboxes the login UI in iframes with JSON-RPC-over-`postMessage` communication and a declared CSP. Hosts can block suspicious UI, and high-security deployments can refuse inline OAuth entirely and fall back to the vendor's native app.
+
+### 10.7 Threat model (summary)
 
 | Threat | Mitigation |
 |---|---|
@@ -863,11 +909,13 @@ OAuth brokering introduces its own attack surface. The SDK mitigates:
 | Exfiltration via tool args | Local egress allowlist + tool-call logging + redaction |
 | Compromised registry | Signatures verified against publisher's own published keys, not the registry's |
 | Stale/revoked servers | Registry `status` field (`active`/`deprecated`/`deleted`); SDK re-checks before connect |
-| OAuth scope creep | Scopes shown in approval prompt; only approved scopes passed to OAuth flow |
+| OAuth scope creep | Scopes shown in approval prompt; vendor `consent_defaults` pre-checked but user may reduce; only approved scopes passed to MCP server |
 | OAuth SSRF via CIMD/metadata fetch | Egress allowlist enforced on all OAuth metadata fetches; redirect depth capped at 3 |
-| OAuth token theft | In-memory only for session; OS keychain encryption for persistent; never logged |
-| Per-instance client ID proliferation | CIMD hosted by Pharos Registry — one stable `client_id` per agent provider, not per install |
-| DCR endpoint DoS / DB growth | Rate-limited DCR fallback; ephemeral client IDs; CIMD preferred path avoids `/register` entirely |
+| OAuth token theft | Tokens stay server-side in the MCP server; agent/SDK never receive the token; nothing to exfiltrate |
+| OAuth `client_secret` leak | Secret is never in registry, agent, or SDK — only in the MCP server's server-side config; `ServerCard.auth` MUST NOT carry `client_secret` |
+| Per-instance client ID proliferation | Vendor pre-registers one app via App Registration Inheritance; all installs of the MCP server inherit the same `client_id` |
+| Malicious agent triggers OAuth | Pharos CIMD verifies agent provider identity first; vendors MAY allow-list providers and refuse unverified agents |
+| DCR endpoint DoS / DB growth (legacy fallback) | DCR is a fallback path only; MCP server rate-limits DCR; ephemeral client IDs; App Registration Inheritance avoids `/register` entirely |
 
 ---
 
@@ -952,7 +1000,8 @@ For vendor registries that do not expose a public search API (Claude Connectors 
 | Business discovery (publish-once) | ✅ via Pharos Registry | ✅ via `ai-catalog.json` | ✅ | ❌ | ❌ | ❌ | ✅ (publish to registry) | ✅ |
 | Pricing/reviews metadata | ✅ first-class | Via Schema.org ext | ❌ | ❌ | Vendor-specific | ❌ | ❌ | ❌ |
 | Transport handling (stdio + HTTP/SSE) | ✅ | ❌ (pre-invocation) | ❌ | ❌ | ✅ (Claude-managed) | ✅ (Copilot-managed) | ❌ | ✅ (gateway) |
-| OAuth brokering (one-time agent provider registration) | ✅ via CIMD hosting + `OAuthFlowHandler` (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
+| Inline OAuth via MCP Apps (no chat-leaving redirect) | ✅ via App Registration Inheritance + MCP Apps (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
+| OAuth brokering (no per-server app registration by user/agent) | ✅ via App Registration Inheritance — vendor pre-registers, MCP server inherits (§17) | ❌ | ❌ | ❌ | Per-server, Anthropic-managed | Per-server, MS-managed | ❌ | ❌ |
 | Status | Pre-implementation | v0.9 draft | Active | v1.x | Shipping | Shipping | Shipping | Shipping |
 
 **Key differentiators of Pharos Discovery:**
@@ -961,7 +1010,7 @@ For vendor registries that do not expose a public search API (Claude Connectors 
 2. **Consent is in the protocol, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass.
 3. **Neutrality by design.** ARD is Google-led; AGNTCY is Cisco/Linux Foundation; Claude Connectors is Anthropic. Pharos is positioned as the neutral middle — implementing adapters for all of them, canonicalizing none.
 4. **Business metadata is first-class.** Pricing, reviews, and publisher identity are core fields, not Schema.org extensions. This reflects the "next Google" thesis: businesses are being discovered, not just tools.
-5. **OAuth brokering solves the MCP auth bootstrap problem.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server. This does not scale. Pharos Discovery's `OAuthFlowHandler` (§17) lets agent providers implement OAuth *once* and have it work for all MCP servers — via one-time registration with the Pharos Registry, which hosts the provider's Client ID Metadata Document (CIMD) at a stable URL. No per-server app registration. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side.
+5. **OAuth via App Registration Inheritance solves the MCP auth bootstrap problem — without the agent ever handling a token.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server, and each requiring a per-server app registration or a DCR dance. This does not scale. Pharos Discovery's model (§17) has two levels: (a) agent providers register *once* with the Pharos Registry to establish a verified CIMD identity, and (b) **MCP server vendors pre-register an OAuth app with their IdP and bundle that registration into `pharos.json`** — so when an agent installs the MCP server, it *inherits* the app registration. No user creates a new app registration. The MCP server (not the agent) then runs the OAuth flow server-side, holding the `client_secret` and the resulting token, and proxies tool calls. The login UI is rendered **inline in the chat** via the MCP Apps extension (sandboxed iframe, JSON-RPC over `postMessage`) — the user never leaves the chat. The agent and SDK never see the token or the secret. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side and require leaving the chat for login.
 
 ---
 
@@ -1014,15 +1063,28 @@ User gets the capability they needed; business got found by an agent.
   "capabilities": ["flight_search", "flight_book", "itinerary_manage"],
   "auth": {
     "type": "oauth",
-    "scopes": ["bookings:write", "profile:read"],
-    "auth_url": "https://acme.com/oauth/authorize",
-    "auth_server_url": "https://auth.acme.com",
-    "token_endpoint": "https://auth.acme.com/oauth/token",
-    "grant_types": ["authorization_code", "refresh_token"],
-    "pkce_required": true,
-    "dcr_support": false,
-    "cimd_support": true,
-    "jwks_url": "https://auth.acme.com/.well-known/jwks.json"
+    "secret_handling": "server_side",
+    "app_registration": {
+      "client_id": "acme-mcp-flights-prod",
+      "auth_server_url": "https://auth.acme.com",
+      "grant_types": ["authorization_code", "refresh_token"],
+      "scopes": [
+        {"name": "bookings:write", "description": "Create and modify bookings"},
+        {"name": "profile:read", "description": "Read profile data"}
+      ],
+      "consent_defaults": ["bookings:write", "profile:read"],
+      "redirect_uri_pattern": "https://mcp.acme.com/oauth/callback",
+      "endpoints": {
+        "authorization": "https://auth.acme.com/oauth/authorize",
+        "token": "https://auth.acme.com/oauth/token",
+        "revocation": "https://auth.acme.com/oauth/revoke",
+        "jwks": "https://auth.acme.com/.well-known/jwks.json"
+      }
+    },
+    "ui": {
+      "resource_uri": "ui://oauth/login",
+      "csp": "default-src 'self'; script-src 'self'; frame-ancestors 'self'"
+    }
   },
   "availability": "mirrored",
   "pricing": {
@@ -1071,7 +1133,24 @@ The `ServerCard.availability` field (Appendix A) captures this:
 
 The SDK surfaces `availability` in the approval prompt so the user can see whether they're connecting to a mirrored, guaranteed-available server or one that may disappear with upstream changes. The filter `availability` (array) is supported in `POST /v1/search` (§6.3.1).
 
-### 13.5 Discovery as the new SEO
+**Highest-trust combination.** A `mirrored` server whose `auth` includes an `app_registration` block (vendor pre-registered OAuth, §17) is the highest-trust combination Pharos surfaces: the server's package is guaranteed retrievable by the Pharos Registry, and the OAuth flow requires no per-server app registration by the user or agent — the vendor pre-registered, the MCP server inherits, and the `client_secret` never leaves the server side. A `referenced` server with only DCR support (legacy fallback) is the lowest-trust OAuth path: the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals so the user can make an informed consent decision.
+
+### 13.5 Rate limiting (registry-side)
+
+The Pharos Registry (sister project) implements npm/PyPI-style rate limiting designed to keep discovery free and open while protecting the service from abuse:
+
+- **Reads (search, `GET /v1/servers/{id}`, OAuth metadata) — generous and CDN-cached.** Unauthenticated read traffic is served from the CDN edge wherever possible and subject to generous per-IP limits. The SDK SHOULD cache `ServerCard` responses locally (`cache_ttl_seconds`, default 300s) to minimize repeat reads.
+- **Search — generous limits.** Search is the primary read path and gets the most generous limits, with burst tolerance. Abuse is mitigated via the CDN + per-IP token bucket, not by gating legitimate agent traffic.
+- **Publishes — authenticated, fair-use.** `POST /v1/publish` and `POST /v1/agents/register` require authentication and are subject to fair-use per-publisher limits to prevent registry spam.
+- **Feedback (reviews/reports) — authenticated, lower limits** to prevent review bombing.
+
+**SDK behavior on `429 RATE_LIMITED`.** The Discovery SDK MUST handle `429` responses gracefully:
+
+1. Honor the `Retry-After` header when present; otherwise use exponential backoff with full jitter (initial 500ms, factor 2, cap 30s, max 4 retries).
+2. On repeated `429` for the same query, fall back to **cached results** from the local `ServerCard` cache (`cache_ttl_seconds`) and surface a `registry_degraded` flag to the host agent so the user can be told results may be stale.
+3. NEVER fail a discovery flow silently — if both the registry and the cache are exhausted, raise a `RegistryUnavailable` error to the host rather than returning empty results as if none exist.
+
+### 13.6 Discovery as the new SEO
 
 Pharos Discovery treats `representative_queries` as the agentic analog of SEO keywords. Businesses that author high-quality representative queries get ranked higher for relevant natural-language agent searches. The registry uses these (plus the description and capabilities) to build semantic embeddings. Businesses that omit them will be under-discovered — the agentic equivalent of a page with no `<title>`.
 
@@ -1100,7 +1179,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - stdio transport (added in Phase 2)
 - TypeScript SDK (Phase 2)
 - ARD adapter (Phase 2)
-- **OAuth-aware discovery / `OAuthFlowHandler` / CIMD hosting (Phase 2 — §17).** The expanded `auth` schema, the OAuth metadata endpoint (§6.7), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at `auth.auth_url`, in-memory token).
+- **OAuth via App Registration Inheritance / `OAuthFlowHandler` / MCP Apps inline OAuth (Phase 2 — §17).** The expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the OAuth metadata endpoint (§6.7), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at a vendor-provided `auth_url`, in-memory token).
 - Federation / referrals (Phase 3)
 - A2A and AGNTCY adapters (Phase 3)
 - Reviews and pricing surfaces beyond display (Phase 3)
@@ -1111,7 +1190,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 ### 14.2 Future features (post-MVP)
 
 - **Sandbox execution** for stdio servers (Docker/firejail/nsjail wrappers)
-- **OAuth-aware discovery** (§17): `OAuthFlowHandler`, CIMD hosting via Pharos Registry, DCR fallback, scope minimization, one-time agent provider registration
+- **OAuth via App Registration Inheritance** (§17): `OAuthFlowHandler` coordinating MCP Apps inline OAuth, CIMD hosting via Pharos Registry (for agent provider identity), vendor app-registration inheritance via `pharos.json`, scope minimization, one-time agent provider registration, MCP Apps sandboxed-iframe integration
 - **Cross-registry federation** with automatic referral following
 - **A2A agent discovery** (treating A2A Agent Cards as discoverable capabilities)
 - **AGNTCY integration** (Linux Foundation IoA)
@@ -1133,7 +1212,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Spike: hand-craft a `ServerCard` for a real MCP server, exercise the MCP `initialize` → `tools/call` flow against it from a Python script.
 - Spike: call the official MCP Registry's `GET /v0.1/servers?search=filesystem` and map the response to a `ServerCard`.
 - Spike: call an ARD registry's `POST /search` and map the response.
-- **Design review: OAuth-aware discovery (§17) data model.** Confirm the expanded `auth` schema, `OAuthFlowHandler` interface, and CIMD hosting plan are implementable against at least one real MCP server's OAuth flow and one authorization server that supports CIMD (or a CIMD-compatible mock).
+- **Design review: OAuth via App Registration Inheritance (§17) data model.** Confirm the expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the `OAuthFlowHandler` interface (which coordinates rather than runs a redirect flow), the CIMD hosting plan for agent provider identity, and the MCP Apps inline-OAuth integration are implementable against at least one real MCP server that bundles an OAuth app registration in its `pharos.json` and supports the MCP Apps `ui://oauth/login` resource.
 - **Exit criteria:** the spec's data model round-trips through all three sources without loss, AND the §17 design is validated as implementable (no implementation yet).
 
 ### Phase 1 — Python MVP (weeks 1–6)
@@ -1149,22 +1228,24 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Integration tests against a local mock registry + a real public MCP server
 - **Exit criteria:** a demo script that searches, approves, and calls a tool on a real remote MCP server, end-to-end.
 
-### Phase 2 — TypeScript + stdio + ARD + OAuth-aware discovery (weeks 7–12)
+### Phase 2 — TypeScript + stdio + ARD + OAuth via App Registration Inheritance (weeks 7–12)
 - `@pharos/discovery` TypeScript package (parity with Python MVP)
 - stdio transport (subprocess launch, sandbox hooks)
 - ARD adapter (consume ARD registries; Pharos Registry exposes an ARD-compatible `/search`)
-- **OAuth-aware discovery (§17):**
-  - `OAuthFlowHandler` implementation (Python + TS) with CIMD, DCR, and API-key paths
+- **OAuth via App Registration Inheritance (§17):**
+  - `OAuthFlowHandler` implementation (Python + TS) coordinating the inline-OAuth flow: retrieve `app_registration` from the `ServerCard`, present vendor `consent_defaults` (user-overridable), trigger the MCP server's inline OAuth UI via MCP Apps, wait for server-side auth confirmation
   - `GET /v1/servers/{id}/oauth` endpoint on the Pharos Registry (§6.7)
-  - One-time agent provider registration: `POST /v1/agents/register` on the Pharos Registry to host CIMD metadata at `https://registry.pharos.dev/v1/agents/{provider_id}/cimd`
-  - Expanded `auth` schema in `ServerCard` (Appendix A) populated by registry publishers
-  - OAuth scope approval integrated into the §7 consent gate (`approved_oauth_scopes` in `ApprovalToken`)
-  - Scope minimization, token storage (in-memory + optional OS keychain), refresh, revocation
+  - One-time agent provider registration: `POST /v1/agents/register` on the Pharos Registry to host CIMD metadata at `https://registry.pharos.dev/v1/agents/{provider_id}/cimd` (establishes verified agent provider identity; NOT the per-server `client_id`)
+  - Expanded `auth` schema in `ServerCard` (Appendix A) populated by registry publishers from vendor `pharos.json`
+  - MCP Apps inline OAuth UI: sandboxed-iframe rendering of `ui://oauth/login`, JSON-RPC over `postMessage`, CSP enforcement
+  - OAuth scope approval integrated into the §7 consent gate (`approved_oauth_scopes` in `ApprovalToken`); consent defaults pre-checked, user may expand or reduce
+  - Scope minimization (only `approved_oauth_scopes` passed to the MCP server), server-side token revocation (`OAuthFlowHandler.revoke_access`)
   - SSRF prevention on CIMD/metadata fetches (egress allowlist, redirect depth cap)
+  - `429 RATE_LIMITED` handling: exponential backoff with full jitter + fallback to cached `ServerCard` results (§13.5)
 - Sandboxing config (Docker/firejail)
 - Egress allowlist for HTTP transports
 - Host-agent integration guide + reference integration with one open-source agent (e.g. a Hermes Agent skill)
-- **Exit criteria:** a second agent runtime embeds the TS SDK and performs an end-to-end discovery-to-connection flow against an OAuth-protected MCP server using CIMD, with no per-server app registration.
+- **Exit criteria:** a second agent runtime embeds the TS SDK and performs an end-to-end discovery-to-connection flow against an OAuth-protected MCP server using App Registration Inheritance and MCP Apps inline OAuth — the agent never handles a token, the user never leaves the chat, and no per-server app registration is created by the user or agent.
 
 ### Phase 3 — Federation + A2A + AGNTCY (weeks 13–20)
 - Cross-registry federation (`auto` and `referrals` modes, max depth, referral following)
@@ -1223,17 +1304,56 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
       "required": ["type"],
       "properties": {
         "type": {"enum": ["none", "api_key", "oauth", "mtls"]},
-        "scopes": {"type": "array", "items": {"type": "string"}},
-        "auth_url": {"type": "string"},
-        "auth_server_url": {"type": "string"},
-        "authorization_endpoint": {"type": "string"},
-        "token_endpoint": {"type": "string"},
-        "grant_types": {"type": "array", "items": {"type": "string"}},
+        "secret_handling": {"enum": ["server_side", "agent_side"]},
+        "app_registration": {
+          "type": "object",
+          "description": "Vendor pre-registered OAuth app, bundled in pharos.json and inherited by the MCP server. Required when type == oauth and secret_handling == server_side.",
+          "properties": {
+            "client_id": {"type": "string"},
+            "auth_server_url": {"type": "string"},
+            "grant_types": {"type": "array", "items": {"type": "string"}},
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "description": {"type": "string"}
+                }
+              }
+            },
+            "consent_defaults": {"type": "array", "items": {"type": "string"}, "description": "OAuth scopes pre-checked in the approval prompt; the user may expand or reduce."},
+            "redirect_uri_pattern": {"type": "string"},
+            "endpoints": {
+              "type": "object",
+              "properties": {
+                "authorization": {"type": "string"},
+                "token": {"type": "string"},
+                "revocation": {"type": "string"},
+                "jwks": {"type": "string"}
+              }
+            }
+          }
+        },
+        "ui": {
+          "type": "object",
+          "description": "MCP Apps inline OAuth UI descriptor (§17.6). The MCP server returns an HTML login segment at resource_uri, rendered in a sandboxed iframe in the chat.",
+          "properties": {
+            "resource_uri": {"type": "string", "description": "e.g. ui://oauth/login"},
+            "csp": {"type": "string", "description": "Content Security Policy the host SHOULD enforce on the inline iframe."}
+          }
+        },
+        "scopes": {"type": "array", "items": {"type": "string"}, "description": "Flat scope list for non-OAuth or legacy auth types; OAuth servers use app_registration.scopes instead."},
+        "auth_url": {"type": "string", "description": "Legacy: authorization URL for the Phase 1 simple OAuth flow (§9.4). Deprecated in favor of app_registration.endpoints.authorization."},
+        "auth_server_url": {"type": "string", "description": "Legacy top-level copy; prefer app_registration.auth_server_url."},
+        "authorization_endpoint": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.authorization."},
+        "token_endpoint": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.token."},
+        "grant_types": {"type": "array", "items": {"type": "string"}, "description": "Legacy top-level copy; prefer app_registration.grant_types."},
         "pkce_required": {"type": "boolean"},
-        "dcr_support": {"type": "boolean"},
+        "dcr_support": {"type": "boolean", "description": "Legacy fallback: true only when the vendor did NOT pre-register an app and DCR is required."},
         "dcr_endpoint": {"type": ["string", "null"]},
-        "cimd_support": {"type": "boolean"},
-        "jwks_url": {"type": "string"},
+        "cimd_support": {"type": "boolean", "description": "Whether the server's authorization server supports Client ID Metadata Documents for agent identity verification (§17.3). Independent of app_registration, which governs the per-server OAuth client."},
+        "jwks_url": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.jwks."},
         "token_auth_method": {"type": "string"}
       }
     },
@@ -1342,6 +1462,7 @@ For implementers. Pharos Discovery handles this internally; it is documented her
 - **Claude MCP Connector** — https://platform.claude.com/docs/en/agents-and-tools/mcp-connector
 - **M365 Copilot dynamic tool discovery** — https://github.com/MicrosoftDocs/m365copilot-docs/blob/main/docs/plugin-dynamic-tool-discovery.md
 - **MCP Transports** — https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+- **MCP Apps (extension)** — https://modelcontextprotocol.io/extensions/apps/overview (the first official MCP extension; tools return interactive HTML rendered in-chat via sandboxed iframes; used by Pharos for inline OAuth login forms; supported by Claude, ChatGPT, VS Code, Goose, and more)
 - **MCP OAuth 2.1 & Client Registration** — https://blog.modelcontextprotocol.io/posts/client_registration/ (background on MCP's adoption of OAuth 2.1 and the Dynamic Client Registration problem)
 - **Client ID Metadata Documents (CIMD, SEP-991)** — clients host a metadata URL as their `client_id`; authorization servers fetch metadata at authorization time. No `/register` endpoint needed. Eliminates unbounded DB growth, client-expiry black hole, per-instance client ID proliferation, and DCR DoS.
 - **Software Statements (SEP-1032)** — signed JWTs for desktop client identity, layered on top of DCR or CIMD.
@@ -1349,11 +1470,13 @@ For implementers. Pharos Discovery handles this internally; it is documented her
 
 ---
 
-## 17. OAuth-Aware Discovery
+## 17. OAuth via App Registration Inheritance
 
-This section specifies Pharos Discovery's solution to the **MCP OAuth bootstrap problem**: the fact that agent providers (Claude, Cursor, etc.) currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server. This does not scale. Pharos Discovery solves it by making the SDK the single OAuth integration point: agent providers implement OAuth *once* (via the `OAuthFlowHandler`), and it works for *all* MCP servers automatically — with no per-server app registration.
+This section specifies Pharos Discovery's solution to the **MCP OAuth bootstrap problem**: the fact that agent providers (Claude, Cursor, etc.) currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server, and each historically requiring a per-server app registration or an unbounded Dynamic Client Registration (DCR) dance. This does not scale.
 
-### 17.1 The problem
+Pharos Discovery's model — **App Registration Inheritance** combined with **MCP Apps inline OAuth** — is a fundamentally different approach. The agent and SDK **never handle OAuth tokens or `client_secret`s**. The MCP server brokers the entire OAuth flow server-side, and the user authenticates **inline in the chat** via the MCP Apps extension — they never leave the conversation to log in.
+
+### 17.1 The problem (and why the redirect-flow model is wrong for agents)
 
 MCP adopted OAuth 2.1 as its auth framework. Per the MCP team's own analysis (blog.modelcontextprotocol.io/posts/client_registration/), the standard OAuth Dynamic Client Registration (DCR) flow has four serious problems when applied to MCP at scale:
 
@@ -1362,21 +1485,63 @@ MCP adopted OAuth 2.1 as its auth framework. Per the MCP team's own analysis (bl
 3. **Per-instance confusion.** The same agent app installed on two machines gets two different `client_id`s. Tokens, logs, and revocation all become per-instance, not per-app. There is no stable identity for "Claude Desktop" across installs.
 4. **DoS vulnerability on `/register`.** An open `/register` endpoint is trivially abuseable. A malicious client can flood it with registrations, exhausting the server's DB.
 
-The emerging fix is **Client ID Metadata Documents (CIMD, SEP-991)**: instead of calling `/register`, the client *hosts* a metadata document at a stable URL and uses that URL *as its `client_id`*. At authorization time, the server fetches the metadata from that URL. No registration endpoint is needed. Bluesky implements this pattern for the AT Protocol. **Software Statements (SEP-1032)** — signed JWTs for client identity — layer on top for desktop clients that can't easily host a URL.
+On top of the DCR problems, the **standard OAuth redirect flow is a poor fit for agentic discovery** for two more reasons:
 
-The remaining problem: for an agent provider to use CIMD, *someone* has to host the provider's metadata document at a stable, HTTPS-reachable, signed URL. Individual agent installs can't do this reliably (desktop apps don't have stable URLs). This is where Pharos comes in.
+5. **The agent shouldn't handle tokens.** An agent runtime that holds OAuth access tokens and `client_secret`s is a high-value target. A compromised agent leaks every connected service's credentials. The standard model concentrates secret material in the least-defensible part of the stack.
+6. **Leaving the chat to log in breaks the agentic UX.** A user who asks an agent to "book a flight" should not be bounced to a browser tab, asked to log in to a third party, and then return to the chat. Discovery-to-action should be one continuous flow.
 
-### 17.2 The Pharos Discovery solution
+App Registration Inheritance solves (1)–(4) by eliminating per-instance registration entirely: the vendor pre-registers *one* app, and every install of the MCP server inherits it. Moving the OAuth flow server-side into the MCP server solves (5). MCP Apps inline OAuth solves (6).
 
-Pharos Discovery solves the OAuth bootstrap problem with three pieces:
+### 17.2 Two levels of registration
 
-1. **The SDK's `OAuthFlowHandler` is the single OAuth integration point.** Agent providers implement (or use the SDK's default) `OAuthFlowHandler` once. It reads the OAuth configuration from the `ServerCard.auth` object (expanded in Appendix A) and executes the appropriate flow for each server — CIMD, DCR, or API-key — automatically. The provider never writes per-server OAuth code.
-2. **The Pharos Registry hosts each agent provider's CIMD metadata.** The provider registers *once* with the Pharos Registry (§17.3). The registry serves the provider's Client ID Metadata Document at a stable, signed URL: `https://registry.pharos.dev/v1/agents/{provider_id}/cimd`. This URL is the provider's OAuth `client_id` for *every* MCP server that supports CIMD. The provider never registers with individual MCP servers' authorization servers.
-3. **Discovery returns the complete OAuth config alongside server metadata.** When an agent discovers a server via Pharos, the `ServerCard.auth` object already contains `auth_server_url`, `token_endpoint`, `grant_types`, `scopes`, `pkce_required`, `dcr_support`, `cimd_support`, and `jwks_url`. The agent (via the handler) does not need to separately discover the auth setup — it is returned in the search result. The `GET /v1/servers/{id}/oauth` endpoint (§6.7) allows refreshing just the OAuth config when it rotates.
+App Registration Inheritance is a **two-level** model.
 
-**Net effect:** agent providers implement OAuth *once* (by embedding the SDK), register their client metadata with the Pharos Registry *once*, and every MCP server's authorization server can fetch and trust that metadata at authorization time. No per-server configuration. No per-server app registration. No per-instance client ID proliferation.
+**Level 1 — Agent Provider Registration (CIMD).** Agent providers (OpenAI, Anthropic, Cursor, etc.) register *once* with the Pharos Registry. The registry verifies the provider's identity and hosts the provider's Client ID Metadata Document (CIMD) at a stable, signed URL. This establishes the **agent provider's verified identity** — used for agent authentication to the registry and for vendor-side agent allow-listing (§17.3). It is *not* the `client_id` used against each MCP server's authorization server.
 
-### 17.3 One-time agent provider registration & CIMD hosting
+**Level 2 — Vendor App Registration Inheritance.** MCP server vendors (e.g. Salesforce, Stripe, Acme) pre-register an OAuth app with their own Identity Provider (IdP) and **bundle that registration into their `pharos.json`**. The bundled registration includes `client_id`, `auth_server_url`, `grant_types`, `scopes`, `consent_defaults`, `redirect_uri_pattern`, and `endpoints` — but **never `client_secret`** (the secret stays server-side in the MCP server's own configuration, not in `pharos.json` and not in the `ServerCard`). When an agent installs or enables the MCP server, the MCP server **inherits** the vendor's app registration. No user creates a new app registration. No agent calls `/register`.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  LEVEL 1 — Agent Provider Registration (once per provider, ever)     │
+│                                                                      │
+│  OpenAI / Cursor / Anthropic / ...                                   │
+│      │                                                               │
+│      │  POST /v1/agents/register  (to Pharos Registry)               │
+│      │  → registry hosts CIMD at                                      │
+│      │    https://registry.pharos.dev/v1/agents/{provider_id}/cimd   │
+│      │  → establishes VERIFIED AGENT PROVIDER IDENTITY               │
+│      ▼                                                               │
+│  Used for: agent auth to registry, vendor allow-list checks          │
+│  NOT used as: the per-server OAuth client_id                         │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  LEVEL 2 — Vendor App Registration Inheritance (once per MCP server) │
+│                                                                      │
+│  Vendor (e.g. Acme)                                                  │
+│      │                                                               │
+│      │  1. Registers an OAuth app with their IdP (auth.acme.com)     │
+│      │     → gets client_id + client_secret from IdP                 │
+│      │  2. Bundles the app registration into pharos.json:            │
+│      │       auth.app_registration = { client_id, endpoints,         │
+│      │         scopes, consent_defaults, redirect_uri_pattern, ... } │
+│      │     (client_secret stays in the MCP server's server-side      │
+│      │      config — NEVER in pharos.json, NEVER in the ServerCard)  │
+│      │  3. Publishes ServerCard to Pharos Registry                   │
+│      ▼                                                               │
+│  Agent (any provider) discovers the server via Pharos search         │
+│      │                                                               │
+│      │  → ServerCard.auth.app_registration carries the inherited     │
+│      │    app registration metadata                                  │
+│      │  → MCP server INHERITS the vendor's client_id                 │
+│      │  → MCP server holds the client_secret server-side             │
+│      │  → No user/agent ever creates a new app registration          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Net effect.** Agent providers register once for identity. Vendors register once per MCP server with their own IdP. Every agent install inherits the vendor's app registration. No per-instance client IDs. No `/register` calls. No `client_secret` in the registry, agent, or SDK.
+
+### 17.3 Agent provider registration & CIMD hosting (Level 1)
 
 ```
 Agent provider (e.g. "Cursor")
@@ -1392,41 +1557,121 @@ Pharos Registry
    │  2. Verifies the software statement (signed JWT, SEP-1032).
    │  3. Hosts the provider's CIMD at a stable, signed URL:
    │     https://registry.pharos.dev/v1/agents/cursor/cimd
-   │  4. Returns that URL to the provider. It is the provider's
-   │     permanent OAuth client_id for every CIMD-supporting server.
+   │  4. Returns that URL to the provider.
    ▼
-Every MCP server's authorization server (at authorization time)
+Vendor MCP servers (at OAuth time, server-side)
    │
-   │  5. Receives an authorization request with
-   │     client_id = "https://registry.pharos.dev/v1/agents/cursor/cimd"
-   │  6. Fetches the CIMD document from that URL.
-   │  7. Validates the document (signature, TLS, redirect_uri match).
-   │  8. Proceeds with the authorization code flow — no /register call.
+   │  5. MCP server receives an OAuth request that includes the
+   │     agent provider's CIMD URL (passed by the SDK).
+   │  6. MCP server fetches the CIMD document from that URL to
+   │     VERIFY the agent provider's identity.
+   │  7. If the vendor allow-lists this provider, the MCP server
+   │     proceeds with the OAuth flow using ITS OWN (inherited)
+   │     client_id — NOT the CIMD URL.
    ▼
-Cursor (via the SDK's OAuthFlowHandler) receives the token.
+User logs in inline (MCP Apps); MCP server exchanges the
+authorization code for a token SERVER-SIDE and keeps it.
 ```
 
-The provider registers *once*, ever. Every subsequent MCP server connection reuses the same `client_id` URL. If the provider rotates keys, they update the registry; the URL stays stable. If the provider ships a new version, the version is reflected in the CIMD document, not in a new registration.
+**Important distinction from the prior spec.** Under the old model, the CIMD URL *was* the `client_id` used against every MCP server's authorization server. Under App Registration Inheritance, the CIMD URL is used **only for agent provider identity verification**. The `client_id` used against the vendor's IdP is the vendor's own pre-registered `app_registration.client_id`, inherited by the MCP server. This keeps the OAuth client relationship between the vendor and their IdP — where it belongs — while still giving the vendor a verified agent identity to allow-list.
 
-### 17.4 The `OAuthFlowHandler` flow selection
+The provider registers *once*, ever. If the provider rotates keys, they update the registry; the URL stays stable. If the provider ships a new version, the version is reflected in the CIMD document, not in a new registration.
 
-When `pharos.connect(approval)` is called for a server with `auth.type == "oauth"`, the SDK's `OAuthFlowHandler.authorize()` inspects the `ServerCard.auth` config and `ApprovalToken.approved_oauth_scopes`, then selects a flow:
+### 17.4 The `OAuthFlowHandler` — coordinates, does not run a redirect flow
 
-| Server `auth` config | Flow | `client_id` source |
+Under App Registration Inheritance, the `OAuthFlowHandler` **no longer runs a standard OAuth redirect flow**. It coordinates. The five-step flow:
+
+```
+1. Agent discovers server via Pharos search
+   → ServerCard.auth includes app_registration + ui config
+
+2. SDK's OAuthFlowHandler presents consent defaults to the user
+   → vendor's consent_defaults pre-checked in the approval prompt
+   → user MAY expand or reduce the OAuth scope set
+   → SDK records approved_oauth_scopes in the ApprovalToken
+
+3. Agent installs / enables the MCP server (MCP initialize)
+
+4. OAuthFlowHandler triggers the MCP server's inline OAuth UI
+   → SDK calls the MCP server requesting the ui://oauth/login resource
+   → MCP server returns an MCP Apps HTML segment (a login form)
+   → host renders it INLINE in the chat via a sandboxed iframe
+   → user enters credentials in the inline UI
+   → MCP server handles the OAuth flow SERVER-SIDE:
+       • uses its inherited client_id
+       • holds the client_secret (never sent to agent/SDK)
+       • exchanges the authorization code for a token itself
+       • stores the token server-side
+
+5. MCP server sends the agent an auth-completed CONFIRMATION
+   → NOT the token — just { authorized: true, scope: [...] }
+   → token stays with the MCP server, which proxies all tool calls
+```
+
+**The handler's flow selection.** When `pharos.connect(approval)` is called for a server with `auth.type == "oauth"`, the `OAuthFlowHandler.authorize()` inspects the `ServerCard.auth` config:
+
+| Server `auth` config | Flow | `client_id` source | Token holder |
+|---|---|---|---|
+| `app_registration` present, `secret_handling == "server_side"` | **App Registration Inheritance** (preferred) | Vendor's pre-registered `app_registration.client_id`, inherited by the MCP server. No `/register` call. | MCP server |
+| `app_registration` absent, `dcr_support == true` | **DCR fallback** (legacy) | Dynamically registered via `auth.dcr_endpoint` by the MCP server. Ephemeral `client_id`. Rate-limited (§10.5). | MCP server (preferred) or agent (legacy) |
+| `app_registration` absent, `dcr_support == false`, static client configured | **Static client credentials** (legacy) | Pre-registered `client_id` / `client_secret` from the host's credential store. | Agent |
+| `auth.type == "api_key"` | **API key prompt** | The handler surfaces a credential prompt to the user via the host's `credential_provider` callback. | Agent |
+
+**Scope minimization.** The handler passes to the MCP server *only* the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the vendor. The MCP server requests only those scopes from its IdP. If the IdP grants a narrower set, the MCP server reports the *actual* granted scopes back to the agent in the confirmation, and the Connection Manager enforces tool calls against the granted set, not the requested set.
+
+**Token lifecycle.** Under App Registration Inheritance the token lifecycle is managed **entirely by the MCP server**, not the SDK. The SDK tracks only an `OAuthStatus` (auth valid / expired / revoked). Refresh, when supported, is performed server-side by the MCP server using its stored `refresh_token`. Revocation is a request from the SDK to the MCP server (`OAuthFlowHandler.revoke_access()`), which tears down its server-side session and invalidates its token with the IdP. See §10.5 for security details.
+
+### 17.5 MCP Apps integration — inline OAuth UI
+
+**MCP Apps** is the first official MCP extension (live January 2026; reference: https://modelcontextprotocol.io/extensions/apps/overview). It allows MCP tools to return interactive HTML that renders **inline in the chat** via sandboxed iframes. Pharos uses MCP Apps for inline OAuth login forms — the user never leaves the chat to authenticate.
+
+**How it works in the Pharos flow:**
+
+1. The `ServerCard.auth.ui` object declares an inline-OAuth resource (conventionally `ui://oauth/login`) and a Content Security Policy.
+2. After the user approves the connection and the OAuth scope set (§7.2), the SDK requests the `ui://oauth/login` resource from the MCP server.
+3. The MCP server returns an MCP Apps HTML segment — a login form bound to its own IdP (using its inherited `client_id` and server-side `client_secret`).
+4. The host agent renders the HTML segment in a **sandboxed iframe** inside the chat. The iframe has no access to the host's DOM, cookies, or storage.
+5. All communication between the host and the iframe is **JSON-RPC 2.0 over `postMessage`** with an explicit origin check. The iframe posts login events (e.g. `auth_started`, `auth_completed`, `auth_error`) to the host; the host posts user choices (e.g. selected account) to the iframe.
+6. The user enters credentials directly in the inline UI. The form posts to the MCP server (not the host), which performs the OAuth authorization-code exchange **server-side**.
+7. On success, the MCP server posts an `auth_completed` JSON-RPC message to the host. The host closes the iframe and the SDK records `OAuthResult.authorized = true`. The token never leaves the MCP server.
+
+**Sandboxed-iframe security properties:**
+
+- The iframe is served with a `sandbox` attribute that withholds same-origin access; the host's cookies, localStorage, and DOM are inaccessible to the inline UI.
+- The `auth.ui.csp` field declares the vendor's Content Security Policy. Hosts SHOULD enforce it and MAY block any inline UI whose effective CSP is more permissive than declared, or that attempts network access outside `auth.app_registration.endpoints`.
+- Hosts MAY refuse to render inline OAuth UI at all (falling back to a "connect in the vendor's own app" prompt) for high-security deployments.
+- Hosts MAY block suspicious UI (e.g. login forms that attempt to exfiltrate credentials to a non-declared endpoint) and report the server via `POST /v1/feedback/report`.
+
+**Host support.** MCP Apps is supported by Claude, ChatGPT, VS Code, Goose, and more. Hosts that do not yet support MCP Apps fall back to the legacy redirect flow (Phase 1 behavior, §9.4) or refuse OAuth-protected servers.
+
+### 17.6 `availability` field, trust, and OAuth
+
+The `availability` field (§13.4) is orthogonal to auth but both contribute to the trust signal in the approval prompt. The **highest-trust combination** Pharos surfaces is:
+
+> A `mirrored` server whose `auth` includes an `app_registration` block (vendor pre-registered OAuth, §17.2).
+
+Why this is the highest-trust combination:
+- The server's package is guaranteed retrievable by the Pharos Registry (mirrored).
+- The OAuth flow requires no per-server app registration by the user or agent — the vendor pre-registered, the MCP server inherits.
+- The `client_secret` never leaves the MCP server's server-side config (secret isolation, §10.5).
+- The user authenticates inline in the chat (MCP Apps) — no redirect to a third-party tab.
+- The agent provider's identity is CIMD-verified before the flow starts, and the vendor MAY allow-list providers.
+
+The lowest-trust OAuth path is a `referenced` server with only DCR support (legacy fallback): the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals in the approval prompt so the user can make an informed consent decision.
+
+### 17.7 Why this beats the redirect-flow model
+
+| Property | Redirect-flow model (old spec / per-server OAuth) | App Registration Inheritance + MCP Apps (new spec) |
 |---|---|---|
-| `cimd_support == true` | **CIMD** (preferred) | The agent provider's Pharos-hosted CIMD URL (`https://registry.pharos.dev/v1/agents/{provider_id}/cimd`). No `/register` call. |
-| `dcr_support == true`, `cimd_support == false` | **DCR fallback** | Dynamically registered via `auth.dcr_endpoint`. Ephemeral `client_id`, discarded after session unless `duration=persistent`. Rate-limited (§10.5). |
-| `dcr_support == false`, `cimd_support == false`, static client configured | **Static client credentials** | Pre-registered `client_id` / `client_secret` from the host's credential store. |
-| `auth.type == "api_key"` | **API key prompt** | The handler surfaces a credential prompt to the user via the host's `credential_provider` callback. |
-
-**Scope minimization.** The handler requests *only* the scopes in `ApprovalToken.approved_oauth_scopes` — never the full set advertised by the server. If the authorization server grants a narrower set, the handler records the *actual* granted scopes in `OAuthResult.scope`, and the Connection Manager enforces tool calls against the granted set, not the requested set.
-
-**Token lifecycle.** The handler manages token storage (in-memory for `session`; OS keychain-encrypted for `persistent`), refresh (using `refresh_token` grant when available), and revocation (`revoke_token()` on `pharos.revoke()`). See §10.5 for security details.
-
-### 17.5 `availability` field and OAuth
-
-The `availability` field (§13.4) is orthogonal to auth but both contribute to the trust signal in the approval prompt. A `mirrored` server with `cimd_support: true` is the highest-trust combination: the server's package is guaranteed retrievable by the Pharos Registry, and the OAuth flow requires no per-server registration. A `referenced` server with only DCR support is the lowest-trust OAuth path: the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals so the user can make an informed consent decision.
+| Per-server app registration by user/agent | Required (or DCR) | None — vendor pre-registers; MCP server inherits |
+| `client_secret` exposure | Lives in agent or is DCR-registered | Never in registry, agent, or SDK — server-side only |
+| OAuth token exposure | Lives in agent runtime (in-memory or keychain) | Never reaches agent — MCP server proxies tool calls |
+| User UX | Redirect to browser tab; return to chat | Inline in chat via sandboxed iframe; never leave |
+| Agent provider identity | Per-instance client IDs | CIMD-verified provider identity, allow-listable by vendor |
+| Compromised agent leaks | All connected services' OAuth tokens | Nothing — agent holds no tokens |
+| Vendor control | Limited (per-server client managed by agent) | Full — vendor owns the app registration, consent defaults, and provider allow-list |
+| DCR DB growth on IdPs | Unbounded | Zero (no DCR in the preferred path) |
 
 ---
 
-**End of SPEC.md — Pharos Discovery v0.1.0 (Draft)**
+**End of SPEC.md — Pharos Discovery v0.2.0 (Draft)**
