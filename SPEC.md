@@ -1,0 +1,1215 @@
+# Pharos Discovery — Technical Specification
+
+**Version:** 0.1.0 (Draft)
+**Status:** Pre-implementation
+**Date:** July 19, 2026
+**License:** MIT
+**Repository:** https://github.com/Wpnx330/pharos-discovery
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Vision: The "Next Google" Thesis](#2-vision-the-next-google-thesis)
+3. [Problem Statement: The Fragmented Landscape](#3-problem-statement-the-fragmented-landscape)
+4. [Design Principles](#4-design-principles)
+5. [Architecture Overview](#5-architecture-overview)
+6. [The Discovery Protocol](#6-the-discovery-protocol)
+7. [User Approval Flow Specification](#7-user-approval-flow-specification)
+8. [Agent SDK Design](#8-agent-sdk-design)
+9. [Transport Handling](#9-transport-handling)
+10. [Security Model](#10-security-model)
+11. [Compatibility Layer](#11-compatibility-layer)
+12. [Comparison With Existing Approaches](#12-comparison-with-existing-approaches)
+13. [Business Discovery: Getting Found by Agents](#13-business-discovery-getting-found-by-agents)
+14. [MVP Scope vs. Future Features](#14-mvp-scope-vs-future-features)
+15. [Development Roadmap](#15-development-roadmap)
+16. [Appendices](#16-appendices)
+
+---
+
+## 1. Executive Summary
+
+Pharos Discovery is a **provider-agnostic, embeddable client framework** that lets any AI agent — Claude, GPT, DeepSeek, Gemini, xAI, Zap, or a custom build — discover, evaluate, and connect to MCP (Model Context Protocol) services at runtime.
+
+Today, agent providers are each building their own walled-garden discovery channels: Anthropic ships **Claude Connectors**, Microsoft ships **dynamic tool discovery** for M365 Copilot, and Google/Microsoft/Hugging Face have proposed the **ARD (Agentic Resource Discovery)** spec. Meanwhile the official **MCP Registry** exists as a thin community catalog with only case-insensitive substring search. The result is a fragmented landscape where a business that wants its MCP service to be discoverable by agents must publish to half a dozen incompatible directories, and agents must hard-code integrations with each.
+
+Pharos Discovery replaces this fragmentation with **one thin, open, embeddable layer** that any agent can import and any compatible registry can serve. It is:
+
+- **Provider-neutral** — not aligned with ARD, AGNTCY, or any single vendor's discovery vision; capable of federating across all of them.
+- **Consent-first** — agents **never** connect to a discovered service without explicit user approval. No silent connections, ever.
+- **Registry-agnostic** — ships with first-class support for the **Pharos Registry** (sister project) but speaks a documented HTTP API that any compliant registry can implement. Bridges to the official MCP Registry, ARD catalogs, and walled gardens are provided as adapters.
+- **Thin and embeddable** — a Python and TypeScript client library, not a server. Agents embed it; registries serve it.
+
+This document specifies the architecture, the discovery protocol agents call, the user-approval UX contract, the SDK surface, transport handling for stdio and HTTP/SSE MCP servers, the security model, the compatibility layer, and a phased roadmap.
+
+---
+
+## 2. Vision: The "Next Google" Thesis
+
+> **MCP discovery is the next Google. Businesses will be found by agents, not by humans typing queries into search boxes.**
+
+The web search economy was built on humans searching for documents. The agentic economy will be built on **agents searching for capabilities on behalf of humans**. A business that exposes its services as an MCP server is the agentic equivalent of a business with a website in 1998 — discoverable by a new class of automated client. A business that *isn't* discoverable by agents is invisible to the next generation of commerce.
+
+For this economy to function, three things must exist:
+
+1. **A neutral discovery layer** that no single vendor controls. If Google's ARD becomes the de-facto standard, discovery is captured by one company — repeating the search-engine monopoly. If Anthropic's Claude Connectors win, discovery is captured by one agent vendor. Pharos Discovery is built to be the **open, vendor-neutral alternative** that keeps the agentic web open.
+2. **A way for businesses to publish** their MCP services once and be found by every agent — not ten times across ten walled gardens. The companion **Pharos Registry** project provides this; Pharos Discovery is the client side that agents embed.
+3. **A consent layer** so that agents don't silently connect to arbitrary services on the user's behalf. Discovery without consent is a surveillance and security hazard. Pharos Discovery bakes user approval into the protocol — it is a first-class flow, not an afterthought.
+
+We are deliberately **not adopting Google's ARD spec** as our north star. ARD is a strong technical proposal and we implement a compatibility adapter for it, but Pharos stays neutral — we want the agentic web to be multi-vendor, not a Google-led re-run of the open web's capture.
+
+---
+
+## 3. Problem Statement: The Fragmented Landscape
+
+### 3.1 How agents discover MCP servers today
+
+| Channel | Who owns it | How discovery works | Limitation |
+|---|---|---|---|
+| **Claude Connectors** | Anthropic | Remote MCP servers connected via the Messages API `connectors` parameter or admin-configured connectors. Anthropic curates a marketplace. | Walled garden; only Claude; only servers Anthropic permits. |
+| **M365 Copilot dynamic tool discovery** | Microsoft | Declarative agents in Copilot resolve MCP server tools at runtime via a plugin manifest; tools are kept current without republishing the agent. Connector framework provides DLP zoning and managed auth. | Microsoft-ecosystem only; governed by M365 DLP policy. |
+| **Cursor / IDE MCP config** | Cursor, others | Users manually add MCP servers to a JSON config file (`~/.cursor/mcp.json` or project `.mcp.json`). No runtime discovery. | Manual; no search; no business discovery. |
+| **Official MCP Registry** | MCP community (Anthropic-hosted) | `GET /v0.1/servers` with a **case-insensitive substring `search` on server names** only. Registry explicitly states: "This is intentionally simple. For more advanced searching, use a subregistry." | No semantic search; no tool-level search; no auth/pricing metadata surfaced in the list API. |
+| **mcp-gateway-registry (agentic-community)** | Open source (AWS-backed) | FAISS + sentence-transformer semantic search at `/api/search/semantic` over registered MCP servers, tools, and A2A agents. Sub-100ms similarity queries. | Server-side infra, not an embeddable client; gateway + registry control-plane model. |
+| **ARD catalogs** | Google, Microsoft, Hugging Face | Publishers host `/.well-known/ai-catalog.json`; registries crawl and expose `POST /search` with semantic text + structured filters. v0.9 draft. | Proposal-stage; tied to ARD's URN identifier scheme and ai-catalog data model. |
+
+The core problem: **a business must publish to all of these to be universally discoverable, and an agent must integrate with all of these to be universally capable.** This does not scale.
+
+### 3.2 The gaps Pharos Discovery closes
+
+- **One embeddable client, many registries.** Agents embed Pharos once and can search any compatible registry, including the Pharos Registry, the official MCP Registry (via adapter), ARD catalogs (via adapter), and walled gardens (via documented bridges).
+- **Semantic + structured search at the client.** Agents query in natural language ("I need to book a flight and file an expense report") and get ranked, evaluated results — without each agent vendor reimplementing retrieval.
+- **Consent as a protocol primitive.** Discovery returns enough metadata for the user to make an informed decision; the SDK enforces an approval gate before any connection is established.
+- **Business discovery, not just tool discovery.** Pharos surfaces publisher identity, pricing, reviews, and capability manifests so businesses can be *found and chosen*, not just invoked.
+
+---
+
+## 4. Design Principles
+
+1. **Provider-agnostic by construction.** The framework must work with any agent runtime and any registry that implements the Pharos Discovery API. No code path may assume a specific agent vendor.
+2. **Consent is non-negotiable.** Agents MUST NOT establish an MCP connection to a discovered service without an explicit user approval event. The SDK exposes no `connect_without_approval` escape hatch.
+3. **Thin client, fat registry.** Pharos Discovery is a client library. Ranking, embeddings, indexing, and publisher verification live in the registry (the Pharos Registry or any compatible one). The client is concerned with querying, presenting, approving, and connecting.
+4. **Neutrality over allegiance.** We implement adapters for ARD, the official MCP Registry, and walled gardens, but we do not adopt any of them as canonical. The Pharos Discovery API is the canonical surface for agents.
+5. **Registry-agnostic via a documented API.** Any registry implementing the Pharos Discovery HTTP API (§6) is a valid backend. The Pharos Registry is the reference implementation, not a dependency.
+6. **Transport-agnostic MCP.** After discovery, the client connects to stdio and HTTP/SSE MCP servers using the MCP protocol's standard lifecycle. The discovery layer does not reinvent connection.
+7. **Transparency by default.** Tool usage, connection events, and consent decisions are logged and surfaced to the user. Agents cannot silently use discovered services.
+8. **Minimal dependencies.** The Python and TypeScript SDKs target a small dependency surface so they can be embedded in constrained agent runtimes (browser, edge, embedded LLM hosts).
+
+---
+
+## 5. Architecture Overview
+
+### 5.1 Components
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                         AI AGENT RUNTIME                           │
+│  (Claude / GPT / DeepSeek / Gemini / xAI / Zap / custom)           │
+│                                                                    │
+│   ┌──────────────────────────────────────────────────────────────┐ │
+│   │                 Pharos Discovery SDK                         │ │
+│   │  (Python `pharos-discovery` / TS `@pharos/discovery`)        │ │
+│   │                                                              │ │
+│   │  ┌────────────┐  ┌──────────────┐  ┌────────────────────┐   │ │
+│   │  │  Search     │  │  Approval     │  │  Connection        │   │ │
+│   │  │  Client     │  │  Engine       │  │  Manager           │   │ │
+│   │  │             │→ │  (consent     │→ │  (MCP lifecycle)   │   │ │
+│   │  │  query,     │  │   gate, UX    │  │  stdio + HTTP/SSE  │   │ │
+│   │  │  rank,      │  │   callbacks)  │  │  initialize,       │   │ │
+│   │  │  evaluate)  │  │              │  │  tools/list, call   │   │ │
+│   │  └─────┬──────┘  └──────────────┘  └─────────┬──────────┘   │ │
+│   │        │                                   │               │ │
+│   │  ┌─────▼───────────────────────────────────▼──────────┐    │ │
+│   │  │            Registry Adapter Layer                  │    │ │
+│   │  │  PharosRegistry │ MCPRegistry │ ARD │ WalledGarden │    │ │
+│   │  └────────────────────────────────────────────────────┘    │ │
+│   └──────────────────────────────────────────────────────────────┘ │
+│                              │                                     │
+└──────────────────────────────┼─────────────────────────────────────┘
+                               │ HTTPS
+                               ▼
+        ┌──────────────────────────────────────────────────┐
+        │            PHAROS REGISTRY (reference)            │
+        │  (sister project — or any compatible registry)    │
+        │                                                  │
+        │   ┌───────────┐  ┌──────────┐  ┌──────────────┐ │
+        │   │  Search   │  │ Publisher│  │ Trust/Verify  │ │
+        │   │  Index    │  │ API      │  │ (pub keys,    │ │
+        │   │ (semantic │  │ (publish,│  │  attestations)│ │
+        │   │  + filter)│  │  review) │  │               │ │
+        │   └───────────┘  └──────────┘  └──────────────┘ │
+        └──────────────────────────────────────────────────┘
+                               │
+                               ▼
+        ┌──────────────────────────────────────────────────┐
+        │          DISCOVERED MCP SERVERS                  │
+        │   (stdio subprocesses + remote HTTP/SSE)         │
+        └──────────────────────────────────────────────────┘
+```
+
+### 5.2 The four layers of the SDK
+
+1. **Search Client** — builds queries (natural language text + structured filters), calls the registry, returns ranked `ServerCard` results with full metadata.
+2. **Approval Engine** — takes ranked results, renders a user-facing approval prompt (callback-based so the host agent can style it), records the consent decision, and emits a signed `ApprovalToken` that the Connection Manager requires.
+3. **Connection Manager** — takes an approved `ServerCard`, selects the transport (stdio / HTTP+SSE / streamable HTTP), performs the MCP `initialize` handshake, caches the live `Client` object, and exposes `tools/list` and `tools/call` to the agent.
+4. **Registry Adapter Layer** — translates between the canonical Pharos Discovery API (§6) and the wire formats of specific registries: the Pharos Registry (native), the official MCP Registry (`/v0.1/servers`), ARD registries (`POST /search` with ai-catalog entries), and walled-garden bridges (vendor-specific, documented per adapter).
+
+### 5.3 What lives where
+
+| Concern | Lives in Pharos Discovery (client) | Lives in the registry |
+|---|---|---|
+| Natural-language query construction | ✅ | |
+| Semantic ranking / embeddings | | ✅ |
+| Structured filtering | ✅ (query side) | ✅ (evaluation) |
+| Publisher verification (signatures, attestations) | ✅ (verification) | ✅ (issuance) |
+| User approval UX | ✅ | |
+| Consent logging | ✅ (local) + ✅ (registry audit, optional) | |
+| MCP `initialize` handshake | ✅ | |
+| Transport selection (stdio vs HTTP/SSE) | ✅ | |
+| `tools/list`, `tools/call` | ✅ | |
+| Business publishing workflow | | ✅ |
+| Reviews, pricing metadata storage | | ✅ |
+| Malicious-server blocklists | ✅ (consumer) | ✅ (source) |
+
+---
+
+## 6. The Discovery Protocol
+
+The Pharos Discovery API is the canonical HTTP surface that agents call through the SDK. Any registry implementing these endpoints is a valid backend. The reference implementation is the Pharos Registry; adapters translate to/from the official MCP Registry and ARD.
+
+### 6.1 Base URL & versioning
+
+- The registry base URL is configurable per-client (`PharosClient(registry_url=...)`).
+- All endpoints are prefixed `/v1/`. The SDK negotiates version via the `X-Pharos-Version` header.
+- Content type: `application/json` for request/response bodies.
+
+### 6.2 Authentication
+
+The discovery API supports three auth modes, selected by the registry:
+
+- **Anonymous** — public read-only search (default for the public Pharos Registry).
+- **API key** — `Authorization: Bearer <key>`, for rate-limited or metered access.
+- **OAuth 2.0 / OIDC** — for enterprise registries with per-user identity (enables per-user consent audit).
+
+Auth is **only** for the discovery API. Authentication to a *discovered MCP server* is handled by the MCP server itself (see §9.4).
+
+### 6.3 `POST /v1/search` — search for MCP servers
+
+The primary discovery endpoint. Accepts a natural-language query and optional structured filters, returns ranked `ServerCard` results.
+
+**Request:**
+
+```json
+{
+  "query": {
+    "text": "I need to book a flight to Tokyo and file the expense report",
+    "filter": {
+      "transport": ["stdio", "http+sse", "streamable-http"],
+      "auth_required": ["none", "oauth"],
+      "publisher_verified": true,
+      "min_rating": 4.0,
+      "tags": ["travel", "expense"],
+      "capabilities": ["flight_search", "expense_filing"]
+    }
+  },
+  "ranking": {
+    "mode": "relevance",
+    "diversify_by_publisher": true
+  },
+  "pagination": {
+    "limit": 10,
+    "cursor": null
+  },
+  "federation": "auto"
+}
+```
+
+**Field reference:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `query.text` | string | yes | Natural-language description of the need. Used for semantic ranking. |
+| `query.filter` | object | no | Structured constraints (see §6.3.1). |
+| `ranking.mode` | enum | no | `relevance` (default), `popularity`, `verified_first`, `newest`. |
+| `ranking.diversify_by_publisher` | bool | no | If true, collapse near-duplicate servers from the same publisher. Default `true`. |
+| `pagination.limit` | int | no | Max results per page (default 10, max 50). |
+| `pagination.cursor` | string | no | Opaque cursor for pagination. |
+| `federation` | enum | no | `auto` (default), `referrals`, `none`. See §6.5. |
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "id": "urn:pharos:acme.com:travel:flight-booking",
+      "display_name": "Acme Flight Booking",
+      "description": "Search and book flights across 400+ airlines with live pricing.",
+      "publisher": {
+        "id": "did:web:acme.com",
+        "name": "Acme Corp",
+        "verified": true,
+        "verification_method": "dns+signature"
+      },
+      "version": "2.1.0",
+      "transport": ["http+sse"],
+      "endpoint": "https://mcp.acme.com/flights/sse",
+      "capabilities": ["flight_search", "flight_book", "itinerary_manage"],
+      "tools_count": 7,
+      "auth": {
+        "type": "oauth",
+        "scopes": ["bookings:write", "profile:read"],
+        "auth_url": "https://acme.com/oauth/authorize"
+      },
+      "pricing": {
+        "model": "per_call",
+        "price_usd": 0.002,
+        "free_tier": "100 calls/month"
+      },
+      "rating": {
+        "score": 4.6,
+        "count": 1284
+      },
+      "trust": {
+        "signature": "eyJ...",
+        "attestations": ["SOC2-Type2", "GDPR"]
+      },
+      "representative_queries": [
+        "book a one-way flight from NYC to Tokyo",
+        "find the cheapest flight next Friday"
+      ],
+      "pharos_score": 0.94,
+      "source_registry": "https://registry.pharos.dev"
+    }
+  ],
+  "referrals": [],
+  "pagination": {
+    "next_cursor": "eyJ...",
+    "has_more": true
+  }
+}
+```
+
+**`pharos_score`** is a 0.0–1.0 relevance score. Like ARD's `score`, it is **strictly an informational relevance metric** and MUST NOT be interpreted as a trust, safety, or compliance rating. Trust is evaluated independently via the `trust` and `publisher.verified` fields (see §10).
+
+#### 6.3.1 Filter keys
+
+Filters compose with AND across keys and OR within a key. Field paths are dot-separated for nested fields (e.g. `trust.attestations`). Registries SHOULD support the standard fields below; support for arbitrary `metadata.*` paths is registry-defined.
+
+| Filter key | Type | Matches |
+|---|---|---|
+| `transport` | array | Any of `stdio`, `http+sse`, `streamable-http` |
+| `publisher_verified` | bool | Publisher signature verification status |
+| `publisher.id` | array | Publisher identifiers (DID, domain) |
+| `auth_required` | array | Any of `none`, `api_key`, `oauth`, `mtls` |
+| `min_rating` | number | Servers with rating ≥ value |
+| `tags` | array | Any tag matches |
+| `capabilities` | array | Any capability matches |
+| `trust.attestations` | array | Any attestation type matches |
+| `pricing.model` | array | Any of `free`, `per_call`, `subscription`, `revenue_share` |
+| `metadata.*` | array | Custom publisher metadata |
+
+If a registry does not support a requested filter path, it returns `400` with `UNSUPPORTED_FILTER`. The SDK falls back to client-side filtering on the returned results where possible.
+
+### 6.4 `GET /v1/servers/{id}` — get a single server card
+
+Fetches the full `ServerCard` for a known ID (e.g. after the user selects from search results, or to refresh metadata before connection).
+
+**Path param:** `id` — URL-encoded `urn:pharos:...` identifier.
+
+**Query params:**
+- `include_tools` (bool, default `false`) — include the full `tools/list` output if the registry has cached it.
+- `include_reviews` (bool, default `false`) — include a sample of reviews.
+
+**Response:** a single `ServerCard` object (same shape as a search result entry), optionally enriched.
+
+### 6.5 Federation
+
+Registries MAY federate. The client controls federation via the `federation` parameter:
+
+- **`auto`** — the registry queries upstream registries, merges, and returns a unified ranked set. Client sees one result list.
+- **`referrals`** — the registry returns its own results plus a `referrals` array of other registries the client may query. The SDK MAY follow referrals automatically (with a max depth, default 2) or surface them to the host agent.
+- **`none`** — search only the registry's own index.
+
+This mirrors ARD's federation model (§7.2 of the ARD spec) for compatibility. The difference: Pharos Discovery treats ARD registries, the official MCP Registry, and walled-garden bridges as **federation peers**, not as a canonical hierarchy.
+
+### 6.6 `POST /v1/approve` — record consent (optional, registry-side)
+
+When the host agent's approval UX completes, the SDK emits a local `ApprovalToken` (§7.4). Optionally, the SDK also POSTs the consent event to the registry for audit:
+
+```json
+{
+  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "user_id_hash": "sha256:...",
+  "agent_id": "claude-code/1.2.3",
+  "approved_at": "2026-07-19T08:42:11Z",
+  "approved_scopes": ["flight_search", "flight_book"],
+  "approval_duration": "session"
+}
+```
+
+The registry returns an `audit_id`. This is **opt-in per host agent** — privacy-preserving agents may keep consent purely local. The SDK supports both modes.
+
+### 6.7 `POST /v1/feedback` — reviews & reports
+
+- `POST /v1/feedback/review` — submit a star rating + text review for a server.
+- `POST /v1/feedback/report` — report a malicious or misbehaving server (feeds the registry's trust system and the SDK's local blocklist).
+
+### 6.8 `POST /v1/publish` — business discovery (publisher-side)
+
+Used by businesses to register their MCP service so it can be discovered. See §13.
+
+### 6.9 Error codes
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 400 | `INVALID_ARGUMENT` | Malformed query or unsupported filter |
+| 401 | `UNAUTHENTICATED` | Missing or invalid credentials |
+| 403 | `PERMISSION_DENIED` | Authenticated but not allowed |
+| 404 | `NOT_FOUND` | Unknown server ID |
+| 429 | `RATE_LIMITED` | Too many requests |
+| 503 | `REGISTRY_UNAVAILABLE` | Registry down; SDK should retry or fail over |
+| 504 | `UPSTREAM_TIMEOUT` | Federated upstream timed out |
+
+---
+
+## 7. User Approval Flow Specification
+
+The approval flow is the heart of Pharos Discovery's privacy and security model. **An agent must never connect to a discovered MCP server without an explicit user approval event.** This is enforced at the SDK level: the Connection Manager requires an `ApprovalToken` (§7.4) and refuses to proceed without one.
+
+### 7.1 The six-step discovery-to-connection flow
+
+```
+ User request
+      │
+      ▼
+1. Agent detects a capability gap
+      │
+      ▼
+2. Agent calls pharos.search(text=...)
+      │
+      ▼
+3. SDK returns ranked ServerCards with full metadata
+      │
+      ▼
+4. Agent renders approval card to user (via host UX callback)
+      │
+      ▼
+5. User approves (or rejects / picks a different server)
+      │
+      ▼
+6. SDK performs MCP initialize + tools/list; agent reports tool usage
+```
+
+### 7.2 What the agent presents to the user
+
+The approval card MUST surface — at minimum — the following fields from the `ServerCard`. The SDK provides a default renderer; host agents MAY override it.
+
+**Required on every approval prompt:**
+
+- `display_name` and `publisher.name`
+- `publisher.verified` — a visible "verified" badge or "unverified — connect with caution" warning
+- `description` — what the server does, in plain language
+- `capabilities` — the concrete capabilities the agent intends to use (not necessarily all of them)
+- `auth.type` and `auth.scopes` — what permissions the server is requesting
+- `pricing.model` and `pricing.price_usd` — what it will cost, if anything
+- `trust.attestations` — compliance claims (SOC2, GDPR, etc.), shown as badges
+- `rating.score` and `rating.count` — community signal
+- The specific user request that triggered the discovery (so the user understands *why* the agent is asking)
+
+**Recommended:**
+
+- A link to the server's `documentationUrl`
+- The last-known `version` and `updated_at`
+- Any `representative_queries` so the user can sanity-check the server's purpose
+- Whether the connection will persist for this session, this request, or indefinitely
+
+### 7.3 Consent mechanics
+
+Approval is a **specific, scoped, revocable** event:
+
+- **Specific** — the user approves *one* server for *one* stated purpose, not "all future discovery."
+- **Scoped** — the user sees the `auth.scopes` and `capabilities` being requested and can approve a subset. The SDK records the approved scope set in the `ApprovalToken`; the Connection Manager refuses tool calls outside the approved scopes.
+- **Revocable** — the user can revoke approval at any time via `pharos.revoke(server_id)`. The SDK tears down the connection and invalidates the token.
+- **Duration-bound** — approval defaults to `session` scope. The user may choose `once` (single tool call) or `persistent` (remembered across sessions, encrypted locally). `persistent` requires a second confirmation.
+
+### 7.4 The `ApprovalToken`
+
+On approval, the SDK mints a local, signed `ApprovalToken`:
+
+```json
+{
+  "token_id": "uuid",
+  "server_id": "urn:pharos:acme.com:travel:flight-booking",
+  "approved_scopes": ["flight_search", "flight_book"],
+  "approved_capabilities": ["flight_search", "flight_book"],
+  "duration": "session",
+  "approved_at": "2026-07-19T08:42:11Z",
+  "expires_at": "2026-07-19T10:42:11Z",
+  "user_id_hash": "sha256:...",
+  "agent_id": "claude-code/1.2.3",
+  "signature": "ed25519:..."
+}
+```
+
+The Connection Manager requires this token before `initialize`. Tool calls outside `approved_scopes` are rejected with `SCOPE_NOT_APPROVED`.
+
+### 7.5 UX patterns
+
+The SDK exposes the approval flow as a **callback** so the host agent controls rendering. Three reference patterns are supported:
+
+1. **CLI / terminal agents** (Claude Code, Cursor, custom CLIs) — the SDK renders an inline text card and prompts `[y/N/scope:...]`. Default for `stdio` agents.
+2. **Chat / web agents** (ChatGPT, Claude.ai, Gemini web) — the SDK returns a JSON approval payload; the host renders a rich card with buttons. The host calls `pharos.resolve_approval(payload)` with the user's choice.
+3. **Voice / headless agents** — the SDK reads a short spoken summary and requires a verbal "yes, approve <server name>" confirmation. Headless pipelines may provide a pre-approved scope set via config (with an explicit `headless_mode=true` flag that is logged).
+
+### 7.6 What the agent reports back
+
+After a successful connection and tool call, the agent MUST report to the user:
+
+- Which server was connected
+- Which tool(s) were called and with what arguments (tool-usage transparency)
+- The result summary
+- Any errors or scope denials
+
+This is enforced via the SDK's `ToolUsageEvent` log, which the host agent surfaces in its output. Agents that suppress this log are non-conformant.
+
+---
+
+## 8. Agent SDK Design
+
+Pharos Discovery ships as two first-party libraries, with identical surfaces:
+
+- **Python**: `pharos-discovery` (PyPI) — Python 3.10+
+- **TypeScript**: `@pharos/discovery` (npm) — Node 20+, browser-compatible build
+
+### 8.1 Python surface
+
+```python
+from pharos_discovery import PharosClient, ApprovalRequest
+
+# Initialize with the default public Pharos Registry
+pharos = PharosClient(
+    registry_url="https://registry.pharos.dev",
+    agent_id="my-agent/0.1.0",
+    # Optional: local consent store, blocklist, cache
+    consent_store="~/.pharos/consent.json",
+)
+
+# 1. Search
+results = pharos.search(
+    text="I need to book a flight to Tokyo and file the expense report",
+    filter={
+        "transport": ["http+sse"],
+        "publisher_verified": True,
+        "min_rating": 4.0,
+    },
+    limit=5,
+)
+
+# 2. Evaluate (host-agent logic, outside the SDK)
+best = results[0]  # agent ranks by pharos_score + its own reasoning
+
+# 3. Request approval (callback-based UX)
+approval = pharos.request_approval(
+    server=best,
+    purpose="Book a flight to Tokyo for the user's July 25 trip",
+    requested_scopes=["flight_search", "flight_book"],
+    requested_capabilities=["flight_search", "flight_book"],
+    duration="session",
+    # The host provides the renderer:
+    render=present_to_user,  # async def present_to_user(req: ApprovalRequest) -> ApprovalResponse
+)
+if not approval.approved:
+    return  # user said no
+
+# 4. Connect (requires the ApprovalToken)
+client = pharos.connect(approval)  # performs MCP initialize + capabilities negotiation
+
+# 5. Use
+tools = await client.list_tools()
+result = await client.call_tool("flight_search", {
+    "origin": "NYC", "destination": "TYO", "date": "2026-07-25"
+})
+
+# 6. Disconnect (and optionally revoke)
+await client.close()
+pharos.revoke(approval)  # invalidates the token
+```
+
+### 8.2 TypeScript surface
+
+```typescript
+import { PharosClient, ApprovalRequest } from "@pharos/discovery";
+
+const pharos = new PharosClient({
+  registryUrl: "https://registry.pharos.dev",
+  agentId: "my-agent/0.1.0",
+  consentStore: "~/.pharos/consent.json",
+});
+
+// 1. Search
+const results = await pharos.search({
+  text: "I need to book a flight to Tokyo and file the expense report",
+  filter: {
+    transport: ["http+sse"],
+    publisherVerified: true,
+    minRating: 4.0,
+  },
+  limit: 5,
+});
+
+// 2. Evaluate
+const best = results[0];
+
+// 3. Request approval
+const approval = await pharos.requestApproval({
+  server: best,
+  purpose: "Book a flight to Tokyo for the user's July 25 trip",
+  requestedScopes: ["flight_search", "flight_book"],
+  requestedCapabilities: ["flight_search", "flight_book"],
+  duration: "session",
+  render: presentToUser,  // (req: ApprovalRequest) => Promise<ApprovalResponse>
+});
+if (!approval.approved) return;
+
+// 4. Connect
+const client = await pharos.connect(approval);
+
+// 5. Use
+const tools = await client.listTools();
+const result = await client.callTool("flight_search", {
+  origin: "NYC", destination: "TYO", date: "2026-07-25",
+});
+
+// 6. Disconnect
+await client.close();
+pharos.revoke(approval);
+```
+
+### 8.3 Core types
+
+```python
+# ServerCard (search result entry)
+class ServerCard:
+    id: str                       # urn:pharos:<publisher>:<ns>:<name>
+    display_name: str
+    description: str
+    publisher: Publisher           # {id, name, verified, verification_method}
+    version: str
+    transport: list[str]           # ["stdio" | "http+sse" | "streamable-http"]
+    endpoint: str | None           # URL for HTTP transports; None for stdio
+    stdio_command: str | None      # e.g. "npx -y @acme/flights-mcp"
+    capabilities: list[str]
+    tools_count: int
+    auth: AuthSpec                 # {type, scopes, auth_url}
+    pricing: PricingSpec | None
+    rating: RatingSpec | None
+    trust: TrustSpec | None
+    representative_queries: list[str]
+    pharos_score: float            # 0.0–1.0 relevance; NOT a trust rating
+    source_registry: str
+
+# ApprovalRequest (handed to the host's render callback)
+class ApprovalRequest:
+    server: ServerCard
+    purpose: str                   # why the agent is asking
+    requested_scopes: list[str]
+    requested_capabilities: list[str]
+    duration: str                  # "once" | "session" | "persistent"
+    render_id: str                 # for correlating async UX
+
+# ApprovalResponse (returned by the host's render callback)
+class ApprovalResponse:
+    approved: bool
+    approved_scopes: list[str]     # may be a subset of requested
+    duration: str
+    user_note: str | None
+
+# ApprovalToken (issued by the SDK on approval; required by connect())
+class ApprovalToken:
+    token_id: str
+    server_id: str
+    approved_scopes: list[str]
+    approved_capabilities: list[str]
+    duration: str
+    approved_at: str
+    expires_at: str
+    signature: str                 # ed25519 over the token body
+
+# MCPClient (returned by connect())
+class MCPClient:
+    server: ServerCard
+    approval: ApprovalToken
+    protocol_version: str
+    server_capabilities: dict       # from initialize response
+    async def list_tools() -> list[Tool]: ...
+    async def call_tool(name: str, args: dict) -> ToolResult: ...
+    async def list_resources() -> list[Resource]: ...
+    async def read_resource(uri: str) -> str: ...
+    async def list_prompts() -> list[Prompt]: ...
+    async def close() -> None: ...
+```
+
+### 8.4 Embedding model
+
+The SDK is designed to be embedded in any agent runtime, not run as a sidecar:
+
+- **Python**: importable as a library; async-first (anyio); no hard dependency on a specific LLM client library. Works with the Anthropic SDK, OpenAI SDK, raw HTTP, or a custom agent loop.
+- **TypeScript**: ESM + CJS dual build; works in Node 20+ and modern browsers; no DOM dependency (the approval UX is host-supplied).
+- **No daemon required.** The SDK is a library. There is no `pharosd` process. The only network calls are to the registry and to discovered MCP servers.
+
+### 8.5 Configuration
+
+```python
+PharosClient(
+    registry_url="https://registry.pharos.dev",
+    agent_id="my-agent/0.1.0",
+    api_key=None,                   # for metered registries
+    consent_store="~/.pharos/consent.json",
+    blocklist_url="https://registry.pharos.dev/v1/blocklist",
+    cache_ttl_seconds=300,          # cache ServerCards locally
+    federation_mode="auto",         # auto | referrals | none
+    max_referral_depth=2,
+    request_timeout_seconds=10,
+    verify_signatures=True,         # verify publisher signatures (§10)
+    allow_unverified=False,         # gate: refuse unverified publishers
+    headless_mode=False,            # for automated pipelines
+    on_tool_use=None,               # callback for tool-usage transparency
+)
+```
+
+---
+
+## 9. Transport Handling
+
+After approval, the Connection Manager establishes a live MCP session with the discovered server. Pharos Discovery supports all standard MCP transports and handles the lifecycle itself; it does not reinvent the MCP wire protocol.
+
+### 9.1 The MCP connection lifecycle
+
+Per the MCP specification, every connection proceeds:
+
+1. **Client sends `initialize`** with its `protocolVersion`, `capabilities`, and `clientInfo`.
+2. **Server responds** with its chosen `protocolVersion`, `capabilities`, `serverInfo`, and optional `instructions`.
+3. **Client sends `notifications/initialized`** — the handshake is complete.
+4. **Operational phase** — `tools/list`, `tools/call`, `resources/read`, `resources/list`, `prompts/list`, `prompts/get`, etc., over JSON-RPC 2.0.
+5. **Shutdown** — transport-specific teardown.
+
+Pharos Discovery handles steps 1–3 internally and exposes the operational phase via `MCPClient` (§8.3).
+
+### 9.2 Transport: stdio
+
+For local MCP servers launched as subprocesses:
+
+- The `ServerCard.stdio_command` field carries the launch command (e.g. `npx -y @acme/filesystem-mcp /Users/chris`).
+- The SDK spawns the subprocess, writes JSON-RPC 2.0 messages to its stdin (newline-delimited), and reads responses from stdout.
+- **Security**: stdio servers run with the user's privileges. The SDK logs every `tools/call` and enforces the `approved_scopes` from the `ApprovalToken`. The approval prompt MUST clearly state that a stdio server executes locally with the user's permissions.
+- Stdio is the highest-trust transport *if* the publisher is verified and the command is audited; it is the highest-risk transport otherwise. The SDK's default `allow_stdio=True` can be disabled by privacy-conscious hosts.
+
+### 9.3 Transport: Streamable HTTP and HTTP+SSE
+
+For remote MCP servers:
+
+- **Streamable HTTP** (MCP's recommended HTTP transport, 2025-03-26 spec) — a single endpoint accepting POST requests with JSON-RPC bodies; the server may respond inline or upgrade to SSE for streaming.
+- **HTTP+SSE** (legacy) — a dedicated SSE endpoint for server-to-client messages plus a POST endpoint for client-to-server.
+- The SDK negotiates automatically based on the `ServerCard.transport` and `endpoint` fields. No host-agent code required.
+- **Security**: all remote connections use TLS 1.2+. The SDK pins the publisher's public key when `trust.signature` is present and `verify_signatures=True`.
+
+### 9.4 Per-server authentication
+
+Discovery returns the server's auth requirements in `ServerCard.auth`. The SDK does **not** store credentials. Auth flow:
+
+1. `auth.type == "none"` — connect directly.
+2. `auth.type == "api_key"` — the SDK calls the host's `credential_provider` callback (host-supplied) to fetch the key, then sets the appropriate header.
+3. `auth.type == "oauth"` — the SDK launches the OAuth flow at `auth.auth_url` with the requested scopes. The user completes it in the host's UX. The resulting token is held in memory for the session only (never written to disk unless `duration=persistent` and the user explicitly opts in).
+4. `auth.type == "mtls"` — the SDK uses a client certificate from the host's credential store.
+
+**The approval prompt (§7.2) MUST display the requested auth scopes before the user approves.** Connecting a server that requests `profile:read` is a different consent decision than connecting one that requests `profile:read` + `payments:write`.
+
+### 9.5 Connection pooling & lifecycle
+
+- The SDK maintains at most one live `MCPClient` per `server_id` per session. Repeated `connect()` calls with a valid, non-expired `ApprovalToken` return the cached client.
+- Connections are torn down on `client.close()`, on token expiry, on `pharos.revoke(token)`, and on process exit (best-effort).
+- The SDK never reconnects automatically after a teardown without a fresh approval event.
+
+---
+
+## 10. Security Model
+
+Discovery introduces a new attack surface: an agent connects to arbitrary internet services based on registry results. Pharos Discovery treats this as a first-class security problem.
+
+### 10.1 Publisher verification
+
+Every `ServerCard` carries a `publisher` object and an optional `trust` object. The SDK verifies:
+
+1. **Domain anchoring** — the publisher's claimed domain (extracted from the `urn:pharos:<publisher>:...` ID) must match the domain in the publisher's DID (`did:web:acme.com` → `acme.com`).
+2. **Signature** — if `trust.signature` is present, the SDK verifies it against the publisher's published public key (fetched from `https://<publisher>/.well-known/pharos-pubkey.json` or the registry's cached key). A failed signature check downgrades the card to `verified=false`.
+3. **Attestations** — `trust.attestations` (e.g. `SOC2-Type2`, `HIPAA-Audit`) are displayed to the user but NOT treated as proof; they are claims the publisher makes, linked to URIs. The registry may independently verify attestations and mark them `registry_verified`.
+
+**Default policy**: `verify_signatures=True`, `allow_unverified=False`. Hosts that want to allow unverified servers (e.g. local development) must explicitly set `allow_unverified=True`, which is logged.
+
+### 10.2 Sandboxing
+
+Pharos Discovery does not impose a specific sandbox, but it provides hooks for host-imposed isolation:
+
+- **stdio servers** — the SDK accepts a `sandbox` config: `{"mode": "none" | "docker" | "firejail" | "nsjail" | "custom", "command": ...}`. When set, the stdio command is wrapped in the chosen sandbox before execution.
+- **HTTP servers** — the SDK supports an `egress_allowlist` to restrict which hosts the agent may connect to (defense against SSRF-style abuse of discovered endpoints).
+- **Tool-call scope enforcement** — the Connection Manager rejects `tools/call` for tools outside `approved_capabilities` and for auth scopes outside `approved_scopes`.
+
+### 10.3 Malicious-server defense
+
+- **Local blocklist** — the SDK fetches and caches a registry-provided blocklist of known-malicious server IDs. Connections to listed servers are refused before any network call.
+- **Behavioral logging** — every `tools/call` is logged locally (with arguments, by default redacted for sensitive params). Anomalously large argument payloads, repeated calls to the same tool, or calls to tools not declared in `tools/list` trigger warnings surfaced via `on_tool_use`.
+- **Report pipeline** — `pharos.report_server(server_id, reason)` submits a report to the registry and adds the server to the local blocklist for the session.
+
+### 10.4 User consent logging
+
+- Every approval, rejection, and revocation is recorded in the local consent store with a timestamp, the server ID, the approved scopes, and the `agent_id`.
+- The store is append-only and signed with a local key so tampering is detectable.
+- Hosts may opt to mirror consent events to the registry (`POST /v1/approve`, §6.6) for cross-device audit, with `user_id_hash` only (never raw user IDs).
+
+### 10.5 Threat model (summary)
+
+| Threat | Mitigation |
+|---|---|
+| Malicious server listed in registry | Publisher signature verification + blocklist + user approval gate |
+| Typosquatting publisher names | Domain-anchored URN IDs + `publisher_verified` badge in UX |
+| Agent silently connects | Approval gate is enforced in SDK; no bypass API |
+| Tool calls outside consent | `approved_scopes` enforced in Connection Manager |
+| Exfiltration via tool args | Local egress allowlist + tool-call logging + redaction |
+| Compromised registry | Signatures verified against publisher's own published keys, not the registry's |
+| Stale/revoked servers | Registry `status` field (`active`/`deprecated`/`deleted`); SDK re-checks before connect |
+| OAuth scope creep | Scopes shown in approval prompt; only approved scopes passed to OAuth flow |
+
+---
+
+## 11. Compatibility Layer
+
+Pharos Discovery is registry-agnostic via adapters. Each adapter implements the canonical `ServerCard` schema (§8.3) and the search/approval contract, translating to and from the native registry API.
+
+### 11.1 Adapter interface
+
+```python
+class RegistryAdapter:
+    name: str                              # "pharos" | "mcp-official" | "ard" | "claude-connectors"
+    async def search(query: SearchQuery) -> list[ServerCard]: ...
+    async def get(server_id: str) -> ServerCard: ...
+    async def publish(card: ServerCard) -> str: ...
+    async def report(server_id: str, reason: str) -> None: ...
+    def to_canonical(native: dict) -> ServerCard: ...
+    def from_canonical(card: ServerCard) -> dict: ...
+```
+
+### 11.2 Native: Pharos Registry
+
+The reference adapter. No translation; speaks the §6 API natively. Supports federation, publisher verification, reviews, and pricing metadata out of the box.
+
+### 11.3 Official MCP Registry adapter
+
+Translates between the canonical `ServerCard` and the official registry's `/v0.1/servers` schema.
+
+- `GET /v0.1/servers?search=<text>` → the adapter maps the substring search to the canonical `query.text` and performs **client-side semantic re-ranking** (using a small local embedding model or the host's LLM) since the official registry explicitly does not provide semantic search.
+- `GET /v0.1/servers/{name}/versions/{version}` → maps to `GET /v1/servers/{id}`.
+- Missing fields (pricing, reviews, ratings) are returned as `None`; the SDK degrades gracefully and labels such results as "limited metadata" in the approval UX.
+- Publisher verification uses the official registry's namespace-based auth (GitHub OAuth for `io.github.*`, DNS for domain namespaces) mapped to the `publisher.verified` field.
+
+### 11.4 ARD adapter
+
+Translates between canonical `ServerCard`s and ARD catalog entries (`application/mcp-server-card+json`).
+
+- ARD `POST /search` (per §7.2 of the ARD spec) → the adapter sends the ARD query shape and maps results back, converting `urn:air:<publisher>:<ns>:<name>` identifiers to `urn:pharos:...` canonical IDs (preserving the original via a `source_urn` field).
+- ARD's `score` (0–100) is normalized to `pharos_score` (0.0–1.0). As in ARD, this is a relevance metric, not a trust rating.
+- ARD `trustManifest` (identity, attestations, provenance) maps directly to the canonical `trust` and `publisher` objects.
+- ARD federation (`auto`/`referrals`/`none`) passes through unchanged — Pharos and ARD share the same federation model by design.
+- ARD's `representativeQueries` field maps to `representative_queries`.
+
+This adapter makes Pharos Discovery a **superset client** of ARD: any ARD-compliant registry is searchable via Pharos, but Pharos adds the approval-gated connection layer and the cross-registry federation that ARD leaves to orchestrators.
+
+### 11.5 AGNTCY adapter (planned)
+
+AGNTCY (Linux Foundation Internet of Agents) provides discovery, identity, messaging, and observability for multi-agent systems. The AGNTCY adapter maps AGNTCY's agent registry schema to canonical `ServerCard`s, treating AGNTCY-registered agents as discoverable MCP-compatible services where applicable. Planned for Phase 3 (§15).
+
+### 11.6 A2A adapter (planned)
+
+Agent2Agent (A2A) publishes `AgentCard` JSON documents at `/.well-known/agent-card.json` describing an agent's `name`, `description`, `version`, `url`, `skills`, `defaultInputModes`, `defaultOutputModes`, and `authentication`. The A2A adapter:
+
+- Crawls/queries A2A agent cards and maps each `skill` to a canonical `capability`.
+- Surfaces A2A agents as discoverable resources, with the approval flow noting that the connection is to an A2A agent (JSON-RPC 2.0 over HTTP) rather than an MCP server.
+- This is the bridge that makes Pharos Discovery a **unified discovery layer for both MCP tools and A2A agents**, not just MCP.
+
+### 11.7 Walled-garden bridges
+
+For vendor registries that do not expose a public search API (Claude Connectors marketplace, MS Copilot connector store):
+
+- Bridges are **read-only** and **best-effort**. They scrape or use vendor-provided listing APIs where terms permit.
+- Results are labeled `"source": "claude-connectors"` (etc.) and marked `limited_metadata=true`.
+- The SDK does not attempt to bypass authentication or terms of service. If a vendor's ToS forbids programmatic listing, that bridge is not shipped.
+- The long-term bet is that vendors adopt open discovery (ARD or Pharos) and bridges become unnecessary. Until then, bridges extend coverage without being a dependency.
+
+---
+
+## 12. Comparison With Existing Approaches
+
+| Dimension | **Pharos Discovery** | **ARD (Google/MS/HF)** | **AGNTCY** | **A2A** | **Claude Connectors** | **M365 Copilot dynamic discovery** | **Official MCP Registry** | **mcp-gateway-registry** |
+|---|---|---|---|---|---|---|---|---|
+| What it is | Embeddable client SDK | Discovery spec + manifest format | Open infra stack (IoA) | Agent-to-agent protocol | Vendor marketplace | Vendor plugin runtime | Public catalog | Gateway + registry server |
+| Scope | MCP + A2A discovery + connection | Discovery only (pre-invocation) | Discovery + identity + messaging + observability | Agent interop (not discovery) | MCP for Claude | MCP for Copilot | MCP catalog | MCP gateway/control plane |
+| Provider-agnostic | ✅ (core goal) | ✅ (spec is neutral) | ✅ | ✅ | ❌ Claude only | ❌ M365 only | ✅ | ✅ |
+| Embeddable client | ✅ Python + TS | ❌ (spec only) | Partial | ❌ (protocol) | ❌ | ❌ | ❌ | ❌ (server-side) |
+| Semantic search | Via registry | Via registry | Via registry | N/A | ❌ | ❌ | ❌ (substring only) | ✅ FAISS |
+| User approval gate | ✅ enforced in SDK | ❌ (out of scope) | ❌ | ❌ | Vendor-managed | Vendor-managed (DLP) | ❌ | ❌ |
+| Consent logging | ✅ local + optional registry | ❌ | ❌ | ❌ | Vendor-managed | Vendor-managed | ❌ | ❌ |
+| Publisher verification | ✅ signatures + attestations | ✅ trustManifest | ✅ identity layer | ✅ Agent Card | Vendor-curated | Vendor-curated | Namespace auth | Configured |
+| Federation | ✅ auto/referrals/none | ✅ same model | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Business discovery (publish-once) | ✅ via Pharos Registry | ✅ via `ai-catalog.json` | ✅ | ❌ | ❌ | ❌ | ✅ (publish to registry) | ✅ |
+| Pricing/reviews metadata | ✅ first-class | Via Schema.org ext | ❌ | ❌ | Vendor-specific | ❌ | ❌ | ❌ |
+| Transport handling (stdio + HTTP/SSE) | ✅ | ❌ (pre-invocation) | ❌ | ❌ | ✅ (Claude-managed) | ✅ (Copilot-managed) | ❌ | ✅ (gateway) |
+| Status | Pre-implementation | v0.9 draft | Active | v1.x | Shipping | Shipping | Shipping | Shipping |
+
+**Key differentiators of Pharos Discovery:**
+
+1. **It is a client, not a spec or a server.** ARD is a specification (someone else implements it); the official MCP Registry is a server (someone else queries it); mcp-gateway-registry is server infra. Pharos Discovery is the **embeddable client** that agents actually import.
+2. **Consent is in the protocol, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass.
+3. **Neutrality by design.** ARD is Google-led; AGNTCY is Cisco/Linux Foundation; Claude Connectors is Anthropic. Pharos is positioned as the neutral middle — implementing adapters for all of them, canonicalizing none.
+4. **Business metadata is first-class.** Pricing, reviews, and publisher identity are core fields, not Schema.org extensions. This reflects the "next Google" thesis: businesses are being discovered, not just tools.
+
+---
+
+## 13. Business Discovery: Getting Found by Agents
+
+For the agentic economy to work, businesses must be able to publish their MCP services once and be found by every agent. Pharos Discovery defines the client side; the **Pharos Registry** (sister project) defines the publishing side. The interface between them is `POST /v1/publish` (§6.8).
+
+### 13.1 The publish flow
+
+```
+Business (MCP server operator)
+   │
+   │  1. Build an MCP server exposing their service
+   │  2. Author a ServerCard (JSON)
+   │  3. Sign it with their publisher private key
+   │  4. POST /v1/publish to the Pharos Registry
+   │     (or: host /.well-known/pharos-catalog.json for crawl-based ingestion)
+   ▼
+Pharos Registry
+   │
+   │  5. Verify publisher domain (DNS challenge or did:web)
+   │  6. Verify signature
+   │  7. Index capabilities + representative_queries for semantic search
+   │  8. Surface in search results to all agents using Pharos Discovery
+   ▼
+Agents (everywhere)
+   │
+   │  9. Agent receives a user request → searches → finds the business
+   │ 10. Presents the business's ServerCard to the user
+   │ 11. User approves → agent connects → business serves the request
+   ▼
+User gets the capability they needed; business got found by an agent.
+```
+
+### 13.2 The publish payload
+
+```json
+{
+  "id": "urn:pharos:acme.com:travel:flight-booking",
+  "display_name": "Acme Flight Booking",
+  "description": "Search and book flights across 400+ airlines with live pricing.",
+  "publisher": {
+    "id": "did:web:acme.com",
+    "name": "Acme Corp",
+    "contact": "api@acme.com"
+  },
+  "version": "2.1.0",
+  "transport": ["http+sse"],
+  "endpoint": "https://mcp.acme.com/flights/sse",
+  "capabilities": ["flight_search", "flight_book", "itinerary_manage"],
+  "auth": {
+    "type": "oauth",
+    "scopes": ["bookings:write", "profile:read"],
+    "auth_url": "https://acme.com/oauth/authorize"
+  },
+  "pricing": {
+    "model": "per_call",
+    "price_usd": 0.002,
+    "free_tier": "100 calls/month",
+    "billing_url": "https://acme.com/billing"
+  },
+  "representative_queries": [
+    "book a one-way flight from NYC to Tokyo",
+    "find the cheapest flight next Friday to SFO"
+  ],
+  "documentation_url": "https://docs.acme.com/mcp",
+  "tags": ["travel", "flights", "booking"],
+  "trust": {
+    "signature": "ed25519:...",
+    "attestations": [
+      {"type": "SOC2-Type2", "uri": "https://trust.acme.com/soc2.pdf"}
+    ]
+  }
+}
+```
+
+### 13.3 The "publish once, found everywhere" guarantee
+
+A business that publishes to the Pharos Registry is discoverable by:
+
+- Any agent embedding the Pharos Discovery SDK (native).
+- Any ARD-compliant orchestrator, via the registry's ARD-compatible `/search` endpoint (the Pharos Registry exposes an ARD facade).
+- The official MCP Registry, via an optional sync adapter that mirrors published servers to `registry.modelcontextprotocol.io`.
+- Any downstream registry that federates with Pharos (via the `referrals` model).
+
+This is the core value proposition for businesses: **one publish, every agent.**
+
+### 13.4 Discovery as the new SEO
+
+Pharos Discovery treats `representative_queries` as the agentic analog of SEO keywords. Businesses that author high-quality representative queries get ranked higher for relevant natural-language agent searches. The registry uses these (plus the description and capabilities) to build semantic embeddings. Businesses that omit them will be under-discovered — the agentic equivalent of a page with no `<title>`.
+
+---
+
+## 14. MVP Scope vs. Future Features
+
+### 14.1 MVP (Phase 1)
+
+The MVP delivers the core discovery-to-connection loop for a single agent vendor, against the Pharos Registry, for HTTP/SSE MCP servers.
+
+**In scope:**
+- Python SDK (TypeScript follows in Phase 2)
+- `PharosClient.search()` against the Pharos Registry
+- `ServerCard` schema with publisher, capabilities, auth, pricing, rating, trust
+- Approval flow with CLI renderer (callback-based)
+- `ApprovalToken` issuance and local consent store
+- Connection Manager for **HTTP+SSE and Streamable HTTP** transports
+- MCP `initialize` → `tools/list` → `tools/call` lifecycle
+- Publisher signature verification (ed25519 + did:web)
+- Local blocklist fetch
+- Tool-usage logging + `on_tool_use` callback
+- Official MCP Registry adapter (read-only, client-side re-ranking)
+
+**Explicitly out of MVP:**
+- stdio transport (added in Phase 2)
+- TypeScript SDK (Phase 2)
+- ARD adapter (Phase 2)
+- Federation / referrals (Phase 3)
+- A2A and AGNTCY adapters (Phase 3)
+- Reviews and pricing surfaces beyond display (Phase 3)
+- Walled-garden bridges (Phase 3+)
+- Sandboxing hooks (Phase 2)
+- Registry-side consent audit (Phase 3)
+
+### 14.2 Future features (post-MVP)
+
+- **Sandbox execution** for stdio servers (Docker/firejail/nsjail wrappers)
+- **Cross-registry federation** with automatic referral following
+- **A2A agent discovery** (treating A2A Agent Cards as discoverable capabilities)
+- **AGNTCY integration** (Linux Foundation IoA)
+- **ARD full compatibility** (bi-directional: Pharos Registry exposes an ARD facade; Pharos client consumes ARD registries)
+- **Business dashboard** for publishers (analytics on discovery impressions, approvals, tool calls)
+- **Revenue model**: optional revenue-share pricing tier where businesses pay per agent-mediated connection (the "AdWords for agents" layer)
+- **On-device embedding model** for privacy-preserving client-side re-ranking when querying substring-only registries
+- **Revocation protocol** — push-based revocation of publisher keys and server cards
+- **Multi-agent approval** — when multiple agents share a session, quorum-based approval for high-risk connections
+- **Voice-first approval UX** — full spoken confirmation flow with TTS/STT hooks
+
+---
+
+## 15. Development Roadmap
+
+### Phase 0 — Specification & Spike (this document)
+**Goal:** ratify the spec, validate the protocol against the official MCP Registry and one ARD registry.
+- ✅ This `SPEC.md`
+- Spike: hand-craft a `ServerCard` for a real MCP server, exercise the MCP `initialize` → `tools/call` flow against it from a Python script.
+- Spike: call the official MCP Registry's `GET /v0.1/servers?search=filesystem` and map the response to a `ServerCard`.
+- Spike: call an ARD registry's `POST /search` and map the response.
+- **Exit criteria:** the spec's data model round-trips through all three sources without loss.
+
+### Phase 1 — Python MVP (weeks 1–6)
+**Goal:** a working `pharos-discovery` Python package that an agent can embed to search the Pharos Registry, get approval, and connect to an HTTP/SSE MCP server.
+- `pharos_discovery.PharosClient` with `search`, `request_approval`, `connect`, `revoke`
+- `ServerCard`, `ApprovalToken`, `MCPClient` types
+- CLI approval renderer
+- HTTP+SSE + Streamable HTTP Connection Manager
+- Publisher signature verification (ed25519 + did:web)
+- Local consent store (append-only, signed)
+- Official MCP Registry adapter (read-only)
+- Tool-usage logging
+- Integration tests against a local mock registry + a real public MCP server
+- **Exit criteria:** a demo script that searches, approves, and calls a tool on a real remote MCP server, end-to-end.
+
+### Phase 2 — TypeScript + stdio + ARD (weeks 7–12)
+- `@pharos/discovery` TypeScript package (parity with Python MVP)
+- stdio transport (subprocess launch, sandbox hooks)
+- ARD adapter (consume ARD registries; Pharos Registry exposes an ARD-compatible `/search`)
+- Sandboxing config (Docker/firejail)
+- Egress allowlist for HTTP transports
+- Host-agent integration guide + reference integration with one open-source agent (e.g. a Hermes Agent skill)
+- **Exit criteria:** a second agent runtime embeds the TS SDK and performs an end-to-end discovery-to-connection flow.
+
+### Phase 3 — Federation + A2A + AGNTCY (weeks 13–20)
+- Cross-registry federation (`auto` and `referrals` modes, max depth, referral following)
+- A2A adapter (discover A2A agents via Agent Cards)
+- AGNTCY adapter (discover agents in AGNTCY registries)
+- Reviews and pricing as first-class interactive surfaces (submit review, compare pricing)
+- Registry-side consent audit (opt-in)
+- Walled-garden read-only bridges (Claude Connectors listing, where ToS permits)
+- Publisher dashboard v1 (analytics)
+- **Exit criteria:** a single agent search federates across Pharos Registry + official MCP Registry + one ARD registry + one A2A directory and returns merged, ranked results.
+
+### Phase 4 — Scale & business layer (weeks 21+)
+- Revenue-share pricing tier (per-connection billing for businesses)
+- On-device embedding model for client-side re-ranking
+- Push-based revocation protocol
+- Voice-first approval UX
+- Multi-agent quorum approval
+- Formal conformance test suite (modeled on ARD's conformance CLI)
+- Governance: Pharos Discovery working group, neutral home (OSI/LF?), spec stabilization toward v1.0
+
+---
+
+## 16. Appendices
+
+### Appendix A: `ServerCard` JSON Schema (canonical)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServerCard",
+  "type": "object",
+  "required": ["id", "display_name", "publisher", "version", "transport", "capabilities", "auth"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^urn:pharos:"},
+    "display_name": {"type": "string"},
+    "description": {"type": "string"},
+    "publisher": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "verified": {"type": "boolean"},
+        "verification_method": {"type": "string"}
+      }
+    },
+    "version": {"type": "string"},
+    "transport": {"type": "array", "items": {"enum": ["stdio", "http+sse", "streamable-http"]}},
+    "endpoint": {"type": ["string", "null"]},
+    "stdio_command": {"type": ["string", "null"]},
+    "capabilities": {"type": "array", "items": {"type": "string"}},
+    "tools_count": {"type": "integer"},
+    "auth": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"enum": ["none", "api_key", "oauth", "mtls"]},
+        "scopes": {"type": "array", "items": {"type": "string"}},
+        "auth_url": {"type": "string"}
+      }
+    },
+    "pricing": {
+      "type": ["object", "null"],
+      "properties": {
+        "model": {"enum": ["free", "per_call", "subscription", "revenue_share"]},
+        "price_usd": {"type": "number"},
+        "free_tier": {"type": "string"},
+        "billing_url": {"type": "string"}
+      }
+    },
+    "rating": {
+      "type": ["object", "null"],
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 5},
+        "count": {"type": "integer"}
+      }
+    },
+    "trust": {
+      "type": ["object", "null"],
+      "properties": {
+        "signature": {"type": "string"},
+        "attestations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "representative_queries": {"type": "array", "items": {"type": "string"}},
+    "pharos_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "source_registry": {"type": "string"}
+  }
+}
+```
+
+### Appendix B: Identifier format
+
+Pharos Discovery uses domain-anchored URN identifiers, isomorphic to ARD's `urn:air:` scheme but in the `urn:pharos:` namespace:
+
+```
+urn:pharos:<publisher-domain>:<namespace>:<server-name>
+```
+
+- `<publisher-domain>` — a verifiable FQDN (e.g. `acme.com`). Acts as the trust anchor.
+- `<namespace>` — optional hierarchical segments (e.g. `travel`, `finance:trading`).
+- `<server-name>` — the terminal short name.
+
+Rationale mirrors ARD Appendix C: the URN is a stable logical noun decoupled from physical endpoints, domain-anchored for decentralized trust, and globally unique without a central registrar. Pharos and ARD identifiers are trivially convertible (`urn:air:` ↔ `urn:pharos:`) via the ARD adapter.
+
+### Appendix C: MCP protocol cheat sheet
+
+For implementers. Pharos Discovery handles this internally; it is documented here for clarity.
+
+**`initialize` request (client → server):**
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {"roots": {"listChanged": true}},
+    "clientInfo": {"name": "pharos-discovery", "version": "0.1.0"}
+  }
+}
+```
+
+**`initialize` response (server → client):**
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "result": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+    "serverInfo": {"name": "acme-flights", "version": "2.1.0"},
+    "instructions": "Use flight_search for availability, flight_book to ticket."
+  }
+}
+```
+
+**`notifications/initialized` (client → server):** `{}` — handshake complete.
+
+**`tools/list`:**
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+```
+
+**`tools/call`:**
+```json
+{
+  "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+  "params": {
+    "name": "flight_search",
+    "arguments": {"origin": "NYC", "destination": "TYO", "date": "2026-07-25"}
+  }
+}
+```
+
+### Appendix D: References
+
+- **MCP Specification** — https://modelcontextprotocol.io/specification/2025-03-26 (architecture, lifecycle, transports, tools)
+- **Official MCP Registry API** — https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/api/official-registry-api.md
+- **ARD Specification v0.9** — https://agenticresourcediscovery.org/spec/ (authors: Junjie Bu — Google, R.V. Guha — Microsoft, Shaun Smith — Hugging Face)
+- **ARD spec repository** — https://github.com/ards-project/ard-spec
+- **AGNTCY** — https://agntcy.org/ , https://docs.agntcy.org/ (Linux Foundation Internet of Agents)
+- **Agent2Agent (A2A) Protocol** — https://a2a-protocol.org/latest/ , https://github.com/a2aproject/A2A
+- **A2A Agent Card** — https://agent2agent.info/docs/concepts/agentcard/
+- **mcp-gateway-registry** — https://github.com/agentic-community/mcp-gateway-registry (FAISS semantic search, `/api/search/semantic`)
+- **AWS MCP Gateway & Registry** — https://aws.amazon.com/blogs/opensource/governing-ai-assets-at-scale-with-mcp-gateway-and-registry/
+- **Claude MCP Connector** — https://platform.claude.com/docs/en/agents-and-tools/mcp-connector
+- **M365 Copilot dynamic tool discovery** — https://github.com/MicrosoftDocs/m365copilot-docs/blob/main/docs/plugin-dynamic-tool-discovery.md
+- **MCP Transports** — https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+
+---
+
+**End of SPEC.md — Pharos Discovery v0.1.0 (Draft)**
