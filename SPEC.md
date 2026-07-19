@@ -1,6 +1,6 @@
 # Pharos Discovery — Technical Specification
 
-**Version:** 0.3.0 (Draft)
+**Version:** 0.4.0 (Draft)
 **Status:** Pre-implementation
 **Date:** July 19, 2026
 **License:** MIT
@@ -65,6 +65,8 @@ We are deliberately **not adopting Google's ARD spec** as our north star. ARD is
 - **Neutral on ARD** — we implement an adapter (§11.4), not a commitment. ARD catalogs are federation peers.
 - **A complementary superset to the official MCP Registry.** We consume the official registry's `server.json` / `/v0.1/servers` entries unchanged and add three layers the official registry deliberately omits: semantic + structured discovery, a consent/approval gate, and OAuth via App Registration Inheritance (§17). We do not compete with the official registry for the canonical record of which servers exist; we make that record discoverable, approvable, and connectable.
 
+**The MCP protocol is a standard; `registry.modelcontextprotocol.io` is one registry that happened to launch first.** Pharos is complementary to the protocol, not subordinate to any single registry. The protocol defines how agents and servers speak to each other; a registry is a catalog of which servers exist. Those are different concerns. Multiple registries can coexist behind one protocol — exactly as the web has one HTTP protocol and many search engines. Pharos is built to be one such registry-backed discovery layer, neutral among registries and federating across all of them.
+
 ### 2.4 Failure modes and triggers to pivot
 
 The "next Google" framing is aspirational. The realistic outcomes form a spectrum, and the architecture should be robust to each:
@@ -98,6 +100,8 @@ The rest of this spec is written to be useful under any of these outcomes; the s
 | **ARD catalogs** | Google, Microsoft, Hugging Face | Publishers host `/.well-known/ai-catalog.json`; registries crawl and expose `POST /search` with semantic text + structured filters. v0.9 draft. | Proposal-stage; tied to ARD's URN identifier scheme and ai-catalog data model. |
 
 The core problem: **a business must publish to all of these to be universally discoverable, and an agent must integrate with all of these to be universally capable.** This does not scale.
+
+> **A note on terminology.** The **MCP protocol** (a wire standard for agent↔server communication) and a **registry** (a catalog of which servers exist) are distinct concerns. The protocol is owned by the MCP community; `registry.modelcontextprotocol.io` is one concrete registry built on top of it. Throughout this spec, "the official MCP Registry" refers to that specific catalog, not to the protocol. Pharos is complementary to the protocol and federates with any compliant registry.
 
 ### 3.2 The gaps Pharos Discovery closes
 
@@ -252,11 +256,12 @@ The primary discovery endpoint. Accepts a natural-language query and optional st
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `query.text` | string | yes | Natural-language description of the need. Used for semantic ranking. |
+| `query.text` | string | one of `text`/`embedding` | Natural-language description of the need. Used for semantic ranking. Omitted in `privacy_mode` or when `query.embedding` is used (§10.8). |
+| `query.embedding` | number[] | one of `text`/`embedding` | Pre-computed embedding vector (float array) generated **locally** by the SDK (§10.8). When set, the SDK sends only the vector, not the text — the registry performs nearest-neighbor search via `blinded_search` without ever seeing the raw query. Stronger privacy than `privacy_mode` (which drops text and relies on filters) because it preserves semantic recall. |
 | `query.filter` | object | no | Structured constraints (see §6.3.1). |
 | `ranking.mode` | enum | no | `relevance` (default), `popularity`, `verified_first`, `newest`. |
 | `ranking.diversify_by_publisher` | bool | no | If true, collapse near-duplicate servers from the same publisher. Default `true`. |
-| `pagination.limit` | int | no | Max results per page (default 10, max 50). |
+| `pagination.limit` | int | no | Max results per page (default 10, max 50). Deep pagination (beyond the first 500 results per IP per hour) requires authentication (§13.5, H19). |
 | `pagination.cursor` | string | no | Opaque cursor for pagination. |
 | `federation` | enum | no | `auto` (default), `referrals`, `none`. See §6.5. |
 
@@ -369,6 +374,21 @@ Fetches the full `ServerCard` for a known ID (e.g. after the user selects from s
 
 **Response:** a single `ServerCard` object (same shape as a search result entry), optionally enriched.
 
+#### 6.4.1 URN resolution
+
+The `ServerCard.id` is a logical URN (`urn:pharos:<fqdn>:<namespace>/<name>`, Appendix B), decoupled from any physical endpoint. Resolution from URN to a live `ServerCard` proceeds:
+
+1. The SDK queries the registry's `GET /v1/servers/{id}`. The registry is the authority for URN → card mapping.
+2. If the registry holds the card natively, it returns it.
+3. If the card is federated from an upstream registry (§6.5), the registry resolves the canonical ID, fetches (or has cached) the card from upstream, and returns it. The returned card carries `source_registry` identifying the origin.
+4. URNs are stable across endpoint changes, transport changes, and registry migrations. A server that moves from `https://mcp.acme.com/...` to `https://mcp2.acme.com/...` keeps the same URN; only the `endpoint` field changes.
+
+**Key rotation and re-verification (H4).** Publisher keys pinned by the SDK (§9.3, §10.8) are re-validated on a TTL, not held forever:
+
+- The SDK re-fetches `https://<publisher>/.well-known/pharos-pubkey.json` at most every `key_pin_ttl_seconds` (default 86400 = 24h). A failed re-fetch after TTL quarantines the server (connection refused) until re-validation succeeds.
+- A change in the publisher domain's **WHOIS registrant or nameservers** triggers immediate re-verification of `domain_control` (§10.1), independent of TTL. A domain transferred to a new registrant is treated as a new publisher; the old `identity` verification does not carry over.
+- A `ServerCard` whose publisher key fails to refresh after TTL is marked `stale` in the local cache — not surfaced in search, not connectable — until re-validated.
+
 ### 6.5 Federation
 
 Registries MAY federate. The client controls federation via the `federation` parameter:
@@ -378,6 +398,13 @@ Registries MAY federate. The client controls federation via the `federation` par
 - **`none`** — search only the registry's own index.
 
 This mirrors ARD's federation model (§7.2 of the ARD spec) for compatibility. The difference: Pharos Discovery treats ARD registries, the official MCP Registry, and walled-garden bridges as **federation peers**, not as a canonical hierarchy.
+
+**Federation dedup by canonical ID (H4).** When `federation == "auto"`, the same server may appear in multiple registries under different native IDs (e.g. `urn:air:acme.com:travel:flight-booking` in an ARD registry and `urn:pharos:acme.com:travel/flight-booking` in the Pharos Registry). The merging step MUST deduplicate by **canonical ID**, not by native ID:
+
+- Each adapter normalizes the native ID to a canonical `urn:pharos:<fqdn>:<namespace>/<name>` (Appendix B) before merging. The original native ID is preserved in a `source_urn` field on the card.
+- Two cards with the same canonical ID (and same `version`) are collapsed into one; the card from the registry ranked higher in the federation preference order wins, and `source_registry` records the winner. The other is dropped from results.
+- Two cards with the same canonical ID but different `version`s are kept as distinct results (the user may choose), labeled with their versions.
+- Cards whose publisher domains do not match across sources (canonical-ID mismatch despite similar names) are NOT collapsed; this prevents an attacker on a federated registry from shadowing a legitimate publisher by registering a lookalike name.
 
 ### 6.6 `POST /v1/approve` — record consent (optional, registry-side)
 
@@ -396,7 +423,30 @@ When the host agent's approval UX completes, the SDK emits a local `ApprovalToke
 
 The registry returns an `audit_id`. This is **opt-in per host agent** — privacy-preserving agents may keep consent purely local. The SDK supports both modes.
 
-### 6.7 `GET /v1/servers/{id}/oauth` — OAuth metadata (Phase 2)
+### 6.7 `GET /v1/events` — SSE push invalidation
+
+A Server-Sent Events (SSE) endpoint the SDK MAY subscribe to for push-based invalidation of cached `ServerCard`s, the blocklist, and publisher keys. This closes the latency gap between a registry-side change (a server newly listed as malicious, a publisher key rotated, a card updated) and the SDK's local cache TTL (§10.3 blocklist cache is 60s; `ServerCard` cache default 300s).
+
+**Request:** `GET /v1/events` with `Accept: text/event-stream`. The SDK MAY pass `Last-Event-ID` to resume after a disconnect.
+
+**Event types:**
+
+| Event `type` | Payload | SDK action |
+|---|---|---|
+| `card.updated` | `{server_id, version, updated_at}` | Invalidate the local cached `ServerCard` for `server_id`; re-fetch on next access. |
+| `card.deleted` | `{server_id}` | Remove from cache; if currently connected, emit `ServerDeleted(server_id)` and tear down per §9.5. |
+| `card.deprecated` | `{server_id, successor_id}` | Update cached card `status="deprecated"`; surface deprecation in the approval UX. |
+| `blocklist.updated` | `{added: [...], removed: [...]}` | Merge into the local blocklist (§10.3); block newly-added servers before any in-flight connection. |
+| `publisher_key.rotated` | `{publisher_id, new_jwks_url}` | Re-fetch and re-pin the publisher key (§10.8); quarantine on fetch failure. |
+| `ping` | `{}` | Keepalive; the SDK treats a missed ping beyond `health_check_interval` as a dead stream and reconnects. |
+
+**Reconnection.** The SDK reconnects with exponential backoff (initial 1s, cap 60s) and `Last-Event-ID` so the server can replay missed events. If the SSE stream is unavailable, the SDK falls back to TTL-based polling (the existing cache + blocklist TTLs) — `/v1/events` is an optimization for freshness, not a correctness requirement.
+
+**Auth.** Unauthenticated for public-registry events on the public Pharos Registry; enterprise registries MAY require an API key passed as a query param or `Authorization` header (SSE does not support custom headers on the EventSource API, so query-param auth is the norm).
+
+This endpoint is referenced from §8.5 (`events_endpoint` config), §10.3 (blocklist push invalidation), and §10.8 (publisher key rotation).
+
+### 6.8 `GET /v1/servers/{id}/oauth` — OAuth metadata (Phase 2)
 
 Returns the full OAuth/authorization configuration for a server, used by the SDK's `OAuthFlowHandler` (§17) to present the vendor's consent defaults and trigger the MCP server's inline OAuth UI (via MCP Apps). This endpoint is an optimization — the same fields are already embedded in the `ServerCard.auth` object (§6.3) — but it allows a client to refresh just the OAuth config (which may rotate, e.g. `endpoints.jwks` key rolls) without re-fetching the whole card.
 
@@ -438,16 +488,43 @@ Returns the full OAuth/authorization configuration for a server, used by the SDK
 
 The `pharos_cimd_url` field is the stable URL where the agent provider's Client ID Metadata Document (CIMD, §17.3) is hosted by the Pharos Registry. The CIMD establishes the *agent provider's* verified identity (used for agent authentication to the registry and for vendor-side agent allow-listing); it is **not** the `client_id` used against the MCP server's authorization server. Under App Registration Inheritance, the `client_id` for the per-server OAuth flow is the vendor's pre-registered `app_registration.client_id`, which the MCP server inherits and uses server-side.
 
-### 6.8 `POST /v1/feedback` — reviews & reports
+### 6.9 `POST /v1/feedback` — reviews & reports
 
 - `POST /v1/feedback/review` — submit a star rating + text review for a server.
 - `POST /v1/feedback/report` — report a malicious or misbehaving server (feeds the registry's trust system and the SDK's local blocklist).
 
-### 6.9 `POST /v1/publish` — business discovery (publisher-side)
+### 6.10 `POST /v1/publish` — business discovery (publisher-side)
 
 Used by businesses to register their MCP service so it can be discovered. See §13.
 
-### 6.10 Error codes
+### 6.11 `GET /v1/privacy` — privacy policy (machine-readable)
+
+Returns the registry's machine-readable privacy policy for discovery queries. The SDK fetches this on first search and surfaces it in the privacy disclosure (§10.8).
+
+**Response:**
+
+```json
+{
+  "query_text_logged": false,
+  "query_embedding_supported": true,
+  "blinded_search_supported": true,
+  "query_log_retention_days": 30,
+  "query_log_data_residency": ["US"],
+  "aggregate_anonymized_logging": true,
+  "per_user_logging": false,
+  "shared_with_third_parties": false,
+  "human_readable_url": "https://registry.pharos.dev/privacy",
+  "fetched_at": "2026-07-19T08:42:11Z"
+}
+```
+
+The SDK uses `blinded_search_supported` to decide whether `query.embedding` (§6.3) is usable against this registry; if not, it falls back to `query.text` (or `privacy_mode` filters).
+
+### 6.12 `GET /v1/export` — bulk registry download (authenticated)
+
+A bulk-download endpoint for clients (researchers, mirror operators, offline agents) that need the full registry corpus rather than paginated search. **Authentication is required** (API key or OAuth); unauthenticated requests are refused with `401 UNAUTHENTICATED`. The response is a streaming JSON-lines or zipped-archive dump of all `ServerCard`s the registry is willing to export. Rate-limited well below the read path. This exists so that bulk access is an explicit, authenticated, rate-limited channel rather than something achieved by scraping paginated search (§13.5, H19).
+
+### 6.13 Error codes
 
 | HTTP | Code | Meaning |
 |---|---|---|
@@ -624,10 +701,12 @@ When the user denies an approval, the SDK captures a structured reason and suppo
 
 ## 8. Agent SDK Design
 
-Pharos Discovery ships as two first-party libraries, with identical surfaces:
+Pharos Discovery ships as two first-party libraries, with identical surfaces generated from a single IDL (§8.6):
 
 - **Python**: `pharos-discovery` (PyPI) — Python 3.10+
 - **TypeScript**: `@pharos/discovery` (npm) — Node 20+, browser-compatible build
+
+**Both SDKs ship in Phase 1 (parallel), not sequentially.** The JS/TS ecosystem (Cursor, Vercel, Cloudflare, Cline, Continue, Mastra) is where agent tooling moves fastest, so a Python-only Phase 1 would forfeit the highest-leverage adoption surface. Building both from the same IDL keeps the cost manageable and prevents drift.
 
 ### 8.1 Python surface
 
@@ -1063,7 +1142,7 @@ OAuth under App Registration Inheritance has a fundamentally smaller attack surf
 - **Server-side exfiltration (C7).** The agent never sees the token, but the MCP server holds it and can misuse it. A malicious MCP server can call the vendor's API with the user's token for *any* purpose within the granted scope — not just the agent's requested tool call — and can exfiltrate the resulting data to a third-party endpoint. The SDK's `egress_allowlist` (§10.2) only covers *agent* egress, not *MCP server* egress. Mitigations (all partial — server-side abuse is fundamentally out of the SDK's control and consent is the only leverage):
   - The inline OAuth UI (§17.5) SHOULD display: "This server will be able to call `<vendor API>` on your behalf for any purpose within the approved scopes." The over-broad risk is made explicit to the user before consent.
   - Vendors SHOULD use their IdP's fine-grained scopes (e.g. `bookings:write:flight_only` rather than `bookings:write`), and the SDK SHOULD surface scope granularity in the approval prompt so the user can see the difference.
-  - For `mirrored`/`native` servers, the Pharos Registry MAY run static analysis on the server's tarball to detect suspicious egress endpoints and flag them in the card.
+  - For `mirrored`/`native` servers, the Pharos Registry MAY run static analysis on the natively-hosted package to detect suspicious egress endpoints and flag them in the card.
   - This is acknowledged as a residual risk that consent cannot fully close; it is listed in the §10.7 threat model.
 
 ### 10.6 Security for business adoption
@@ -1235,13 +1314,13 @@ A host may already have a vendor-native connector for a server Pharos would disc
 2. **Consent is in the client, not out of scope.** ARD explicitly scopes itself to "before invocation." Claude Connectors and Copilot handle consent vendor-side. Pharos bakes the approval gate into the SDK with no bypass *for conformant SDK-using agents* (§10.7.1) — this is a client-side contract, not a wire-level protocol primitive. Non-SDK agents can bypass it; server-side enforcement of `ApprovalToken` is a future protocol extension the spec tracks but does not claim to provide today.
 3. **Neutrality by design.** ARD is Google-led; AGNTCY is Cisco/Linux Foundation; Claude Connectors is Anthropic. Pharos is positioned as the neutral middle — implementing adapters for all of them, canonicalizing none.
 4. **Business metadata is first-class.** Pricing, reviews, and publisher identity are core fields, not Schema.org extensions. This reflects the "next Google" thesis: businesses are being discovered, not just tools.
-5. **OAuth via App Registration Inheritance solves the MCP auth bootstrap problem — without the agent ever handling a token.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server, and each requiring a per-server app registration or a DCR dance. This does not scale. Pharos Discovery's model (§17) has two levels: (a) agent providers register *once* with the Pharos Registry to establish a verified CIMD identity, and (b) **MCP server vendors pre-register an OAuth app with their IdP and bundle that registration into `pharos.json`** — so when an agent installs the MCP server, it *inherits* the app registration. No user creates a new app registration. The MCP server (not the agent) then runs the OAuth flow server-side, holding the `client_secret` and the resulting token, and proxies tool calls. The login UI is rendered **inline in the chat** via the MCP Apps extension (sandboxed iframe, JSON-RPC over `postMessage`) — the user never leaves the chat. The agent and SDK never see the token or the secret. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side and require leaving the chat for login.
+5. **OAuth via App Registration Inheritance solves the MCP auth bootstrap problem — without the agent ever handling a token.** MCP adopted OAuth 2.1, but every agent provider currently must implement OAuth flows for *every* MCP server, each potentially using a different authorization server, and each requiring a per-server app registration or a DCR dance. This does not scale. Pharos Discovery's model (§17) has two levels: (a) agent providers register *once* with the Pharos Registry to establish a verified CIMD identity, and (b) **MCP server vendors pre-register an OAuth app with their IdP and bundle that registration into `pharos.json`** — so when an agent installs the MCP server, it *inherits* the app registration. No user creates a new app registration. The MCP server (not the agent) then runs the OAuth flow server-side, holding the `client_secret` and the resulting token, and proxies tool calls. On hosts that support **MCP Apps**, the login UI is rendered **inline in the chat** via the MCP Apps extension (sandboxed iframe, JSON-RPC over `postMessage`) — the user never leaves the chat. On hosts without MCP Apps but with a system browser, the SDK falls back to a **server-brokered redirect flow with PKCE** (§17.5.1): the agent opens the browser to the MCP server's `/oauth/authorize` URL, the server completes the flow, and the agent polls or receives a callback — still preserving the "agent never sees the token" property. Hosts with neither MCP Apps nor a system browser surface `OAuthUnavailable`. The agent and SDK never see the token or the secret in any mode. This is the single largest differentiator against Claude Connectors and M365 Copilot, both of which handle OAuth per-server on the vendor side and (where they offer inline login) require their own host-specific inline stack.
 
 ---
 
 ## 13. Business Discovery: Getting Found by Agents
 
-For the agentic economy to work, businesses must be able to publish their MCP services once and be found by every agent. Pharos Discovery defines the client side; the **Pharos Registry** (sister project) defines the publishing side. The interface between them is `POST /v1/publish` (§6.8).
+For the agentic economy to work, businesses must be able to publish their MCP services once and be found by every agent. Pharos Discovery defines the client side; the **Pharos Registry** (sister project) defines the publishing side. The interface between them is `POST /v1/publish` (§6.10).
 
 ### 13.1 The publish flow
 
@@ -1344,21 +1423,24 @@ A business that publishes to the Pharos Registry is discoverable by:
 
 This is the core value proposition for businesses: **one publish, every agent.**
 
-### 13.4 Availability & tarball mirroring
+### 13.4 Availability & native hosting
 
-The Pharos Registry mirrors npm and PyPI tarballs for the MCP servers it indexes. This matters for discovery because an agent or user discovering a server needs to trust that the server will still be available when they go to connect — especially for stdio servers launched from a package (`npx -y @acme/flights-mcp`), where an unpublished or yanked upstream package means a discovered server silently vanishes.
+The Pharos Registry guarantees that a discovered server remains available when an agent goes to connect — especially for stdio servers launched from a package (`npx -y @acme/flights-mcp`), where an unpublished or yanked upstream package means a discovered server silently vanishes. The registry does this via **native hosting plus on-demand upstream fetch**, not a bulk mirror of every npm/PyPI package:
+
+- **Native hosting.** For `native` and `mirrored` servers, the registry hosts the server's package/content itself (first-party storage) rather than pointing at a third-party package index that may yank it.
+- **On-demand upstream fetch.** For `referenced` servers, the registry fetches the upstream package/endpoint on demand at connect time (with a short cache) rather than holding a perpetual bulk copy. If upstream is unreachable at fetch time, the card is marked `status: deleted` on next re-index. This avoids the storage and freshness costs of bulk-mirroring the entire npm/PyPI corpus while still guaranteeing the registry can materialize the server at connect time.
 
 The `ServerCard.availability` field (Appendix A) captures this:
 
 | Value | Meaning | Discovery implication |
 |---|---|---|
-| `mirrored` | The Pharos Registry holds a copy of the server's tarball (npm/PyPI) or a cached HTTP snapshot. Guaranteed retrievable. | Highest availability. Agents can install/connect even if upstream disappears. Shown with a "mirrored" trust badge. |
-| `referenced` | The registry indexes the server but points at the upstream package/endpoint. Availability depends on upstream. | Standard. The card links to upstream; if upstream vanishes, the card is marked `status: deleted` on next re-index. |
+| `mirrored` | The Pharos Registry natively hosts a copy of the server's package (or a cached HTTP snapshot) and guarantees retrievability even if the original upstream disappears. | Highest availability. Agents can install/connect even if upstream vanishes. Shown with a "mirrored" trust badge. |
+| `referenced` | The registry indexes the server but fetches the upstream package/endpoint on demand at connect time. Availability depends on upstream liveness at fetch time. | Standard. If upstream is unreachable at fetch, the card is marked `status: deleted` on next re-index. |
 | `native` | The server is published directly to the Pharos Registry (first-party), not via npm/PyPI. | The registry is the source of truth; availability is the registry's own SLA. |
 
-The SDK surfaces `availability` in the approval prompt so the user can see whether they're connecting to a mirrored, guaranteed-available server or one that may disappear with upstream changes. The filter `availability` (array) is supported in `POST /v1/search` (§6.3.1).
+The SDK surfaces `availability` in the approval prompt so the user can see whether they're connecting to a natively-hosted, guaranteed-available server or one that may disappear with upstream changes. The filter `availability` (array) is supported in `POST /v1/search` (§6.3.1).
 
-**Highest-trust combination.** A `mirrored` server whose `auth` includes an `app_registration` block (vendor pre-registered OAuth, §17) is the highest-trust combination Pharos surfaces: the server's package is guaranteed retrievable by the Pharos Registry, and the OAuth flow requires no per-server app registration by the user or agent — the vendor pre-registered, the MCP server inherits, and the `client_secret` never leaves the server side. A `referenced` server with only DCR support (legacy fallback) is the lowest-trust OAuth path: the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals so the user can make an informed consent decision.
+**Highest-trust combination.** A `mirrored` server whose `auth` includes an `app_registration` block (vendor pre-registered OAuth, §17) is the highest-trust combination Pharos surfaces: the server's package is guaranteed retrievable by the Pharos Registry (native hosting), and the OAuth flow requires no per-server app registration by the user or agent — the vendor pre-registered, the MCP server inherits, and the `client_secret` never leaves the server side. A `referenced` server with only DCR support (legacy fallback) is the lowest-trust OAuth path: the server may vanish upstream, and the connection requires an ephemeral DCR registration. The SDK surfaces both signals so the user can make an informed consent decision.
 
 ### 13.5 Rate limiting (registry-side)
 
@@ -1368,6 +1450,12 @@ The Pharos Registry (sister project) implements npm/PyPI-style rate limiting des
 - **Search — generous limits.** Search is the primary read path and gets the most generous limits, with burst tolerance. Abuse is mitigated via the CDN + per-IP token bucket, not by gating legitimate agent traffic.
 - **Publishes — authenticated, fair-use.** `POST /v1/publish` and `POST /v1/agents/register` require authentication and are subject to fair-use per-publisher limits to prevent registry spam.
 - **Feedback (reviews/reports) — authenticated, lower limits** to prevent review bombing.
+
+**Enumeration defenses (H19).** The public read path is generous but not unbounded, to make registry scraping (for competitor intelligence, spam targeting, or harvesting publisher contact info) unattractive relative to the authenticated `/v1/export` channel:
+
+- **Pagination cap.** Unauthenticated paginated `GET /v1/search` and `GET /v1/servers/{id}` calls are capped at **500 results per IP per hour** cumulatively across paginated cursors. Beyond the cap, the registry returns `429 RATE_LIMITED` with `Retry-After`. Deep pagination (page 50+) requires authentication; unauthenticated deep-pagination cursors return `401 UNAUTHENTICATED`.
+- **Empty-query gating.** `POST /v1/search` with an empty `query.text` AND no `query.filter` (a "list everything" probe) requires authentication. Unauthenticated empty queries return `401 UNAUTHENTICATED`. Legitimate discovery always has either text or a filter.
+- **`GET /v1/export` for bulk.** Bulk access is an explicit authenticated, rate-limited channel (§6.12), not achieved by walking paginated search. This keeps the read path fast for real discovery and routes bulk consumers to a monitored channel.
 
 **SDK behavior on `429 RATE_LIMITED`.** The Discovery SDK MUST handle `429` responses gracefully:
 
@@ -1379,16 +1467,26 @@ The Pharos Registry (sister project) implements npm/PyPI-style rate limiting des
 
 Pharos Discovery treats `representative_queries` as the agentic analog of SEO keywords. Businesses that author high-quality representative queries get ranked higher for relevant natural-language agent searches. The registry uses these (plus the description and capabilities) to build semantic embeddings. Businesses that omit them will be under-discovered — the agentic equivalent of a page with no `<title>`.
 
+**Anti-gaming rules (H12).** Because `representative_queries` influence ranking, they are abuse-prone. The registry enforces:
+
+- **Cap.** A `ServerCard` MAY carry **at most 10** `representative_queries`. The registry rejects publish payloads with more. This prevents keyword-stuffing.
+- **Low-specificity penalty.** Queries that are too generic to be discriminating (e.g. "do things", "help", "best service") are penalized in the embedding index — they do not boost rank for any specific intent. The registry computes a specificity score per query and drops or down-weights sub-threshold queries.
+- **`pharos_score` incorporates post-connection signals.** Ranking is not based solely on publisher-authored text (which is gameable). `pharos_score` blends publisher metadata with **post-connection signals**: successful `tools/call` completions, user non-denial of approval, and lack of `report_server` events, aggregated and anonymized. A server that ranks well on text but has a high approval-denial or failure rate loses rank over time. This makes "rank well then deliver poorly" a losing strategy.
+- **Reviews require verified publisher context.** A review is only counted toward `rating` if the reviewer's session produced a verified connection (the SDK's `ToolUsageEvent` chain, opt-in via §6.6 audit). Drive-by reviews from unverified sessions are stored for transparency but excluded from the score. This prevents a publisher from reviewing itself.
+- **Review-bombing detection.** The registry detects coordinated review bursts (many low-star reviews from unrelated sessions in a short window, or many 5-star reviews from new accounts) and quarantines them pending manual review. Quarantined reviews do not affect `rating` until adjudicated.
+
+**Privacy reconciliation.** The post-connection signals above are **aggregate and anonymized** — they do not require per-user query logging. This is how §13.6's "discovery as SEO" framing (which assumes queries are observable and rankable) reconciles with §10.8's query privacy: ranking comes from aggregate signal volume and post-connection outcomes, not from per-user query text. `query.text` is never logged at user level (§10.8); `query.embedding` enables ranking without the registry ever seeing the text at all.
+
 ---
 
 ## 14. MVP Scope vs. Future Features
 
 ### 14.1 MVP (Phase 1)
 
-The MVP delivers the core discovery-to-connection loop for a single agent vendor, against the Pharos Registry, for HTTP/SSE MCP servers.
+The MVP delivers the core discovery-to-connection loop, against the Pharos Registry, for HTTP/SSE MCP servers. **Both Python and TypeScript SDKs ship in Phase 1 in parallel**, generated from the same IDL (§8.6).
 
 **In scope:**
-- Python SDK (TypeScript follows in Phase 2)
+- Python SDK (`pharos-discovery`) AND TypeScript SDK (`@pharos/discovery`) — parallel, both from the IDL
 - `PharosClient.search()` against the Pharos Registry
 - `ServerCard` schema with publisher, capabilities, auth, pricing, rating, trust
 - Approval flow with CLI renderer (callback-based)
@@ -1399,12 +1497,12 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Local blocklist fetch
 - Tool-usage logging + `on_tool_use` callback
 - Official MCP Registry adapter (read-only, client-side re-ranking)
+- `pharos-discovery-quickstart` repo (search → approve → connect → call-a-tool end-to-end in both languages)
 
 **Explicitly out of MVP:**
 - stdio transport (added in Phase 2)
-- TypeScript SDK (Phase 2)
 - ARD adapter (Phase 2)
-- **OAuth via App Registration Inheritance / `OAuthFlowHandler` / MCP Apps inline OAuth (Phase 2 — §17).** The expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the OAuth metadata endpoint (§6.7), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at a vendor-provided `auth_url`, in-memory token).
+- **OAuth via App Registration Inheritance / `OAuthFlowHandler` / MCP Apps inline OAuth (Phase 2 — §17).** The expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the OAuth metadata endpoint (§6.8), and the `OAuthFlowHandler` interface are **designed for in Phase 0** (this spec) so the data model and approval flow are forward-compatible, but the implementation lands in Phase 2 after basic search + approve + connect works. Phase 1 ships with the simple OAuth flow described in §9.4 (launch at a vendor-provided `auth_url`, in-memory token).
 - Federation / referrals (Phase 3)
 - A2A and AGNTCY adapters (Phase 3)
 - Reviews and pricing surfaces beyond display (Phase 3)
@@ -1440,10 +1538,10 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - **Design review: OAuth via App Registration Inheritance (§17) data model.** Confirm the expanded `auth` schema (`app_registration` + `ui` + `secret_handling`), the `OAuthFlowHandler` interface (which coordinates rather than runs a redirect flow), the CIMD hosting plan for agent provider identity, and the MCP Apps inline-OAuth integration are implementable against at least one real MCP server that bundles an OAuth app registration in its `pharos.json` and supports the MCP Apps `ui://oauth/login` resource.
 - **Exit criteria:** the spec's data model round-trips through all three sources without loss, AND the §17 design is validated as implementable (no implementation yet).
 
-### Phase 1 — Python MVP (weeks 1–6)
-**Goal:** a working `pharos-discovery` Python package that an agent can embed to search the Pharos Registry, get approval, and connect to an HTTP/SSE MCP server.
-- `pharos_discovery.PharosClient` with `search`, `request_approval`, `connect`, `revoke`
-- `ServerCard`, `ApprovalToken`, `MCPClient` types
+### Phase 1 — Python + TypeScript MVP in parallel (weeks 1–6)
+**Goal:** working `pharos-discovery` (Python) and `@pharos/discovery` (TypeScript) packages, both generated from the IDL (§8.6), that an agent can embed to search the Pharos Registry, get approval, and connect to an HTTP/SSE MCP server. Both ship in Phase 1 to maximize adoption — the JS/TS ecosystem (Cursor, Vercel, Cloudflare, Cline, Continue, Mastra) is where agent tooling moves fastest.
+- `pharos_discovery.PharosClient` (Python) and `@pharos/discovery` `PharosClient` (TS) with `search`, `request_approval`, `connect`, `revoke`
+- `ServerCard`, `ApprovalToken`, `MCPClient` types (IDL-generated in both languages)
 - CLI approval renderer
 - HTTP+SSE + Streamable HTTP Connection Manager
 - Publisher signature verification (ed25519 + did:web)
@@ -1451,15 +1549,15 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Official MCP Registry adapter (read-only)
 - Tool-usage logging
 - Integration tests against a local mock registry + a real public MCP server
-- **Exit criteria:** a demo script that searches, approves, and calls a tool on a real remote MCP server, end-to-end.
+- `pharos-discovery-quickstart` repo: a single repo with Python and TS example agents that search, approve, and call a tool end-to-end
+- **Exit criteria:** demo scripts in BOTH languages that search, approve, and call a tool on a real remote MCP server, end-to-end; conformance test suite (§8.6) passes for both SDKs.
 
-### Phase 2 — TypeScript + stdio + ARD + OAuth via App Registration Inheritance (weeks 7–12)
-- `@pharos/discovery` TypeScript package (parity with Python MVP)
+### Phase 2 — stdio + ARD + OAuth via App Registration Inheritance (weeks 7–12)
 - stdio transport (subprocess launch, sandbox hooks)
 - ARD adapter (consume ARD registries; Pharos Registry exposes an ARD-compatible `/search`)
 - **OAuth via App Registration Inheritance (§17):**
   - `OAuthFlowHandler` implementation (Python + TS) coordinating the inline-OAuth flow: retrieve `app_registration` from the `ServerCard`, present vendor `consent_defaults` (user-overridable), trigger the MCP server's inline OAuth UI via MCP Apps, wait for server-side auth confirmation
-  - `GET /v1/servers/{id}/oauth` endpoint on the Pharos Registry (§6.7)
+  - `GET /v1/servers/{id}/oauth` endpoint on the Pharos Registry (§6.8)
   - One-time agent provider registration: `POST /v1/agents/register` on the Pharos Registry to host CIMD metadata at `https://registry.pharos.dev/v1/agents/{provider_id}/cimd` (establishes verified agent provider identity; NOT the per-server `client_id`)
   - Expanded `auth` schema in `ServerCard` (Appendix A) populated by registry publishers from vendor `pharos.json`
   - MCP Apps inline OAuth UI: sandboxed-iframe rendering of `ui://oauth/login`, JSON-RPC over `postMessage`, CSP enforcement
@@ -1491,18 +1589,24 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
 - Formal conformance test suite (modeled on ARD's conformance CLI)
 - Governance: Pharos Discovery working group, neutral home (OSI/LF?), spec stabilization toward v1.0
 
+> **Timeline note.** Timeline estimates reflect traditional development rates. With agentic development at 10–100× human speed, actual delivery may be significantly faster. This is a sequential full implementation — no stubs or placeholders.
+
+> **Governance.** Governance and sunset policy will be added as adoption grows.
+
 ---
 
 ## 16. Appendices
 
 ### Appendix A: `ServerCard` JSON Schema (canonical)
 
+This schema is the canonical source of truth for the `ServerCard` type referenced in §8.3. Both SDKs are generated from this schema via the IDL (§8.6). It is kept in sync with the Python class definitions in §8.3.
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ServerCard",
   "type": "object",
-  "required": ["id", "display_name", "publisher", "version", "transport", "capabilities", "auth", "availability"],
+  "required": ["id", "display_name", "publisher", "version", "transport", "capabilities", "auth", "availability", "published_at", "updated_at", "status"],
   "properties": {
     "id": {"type": "string", "pattern": "^urn:pharos:"},
     "display_name": {"type": "string"},
@@ -1511,10 +1615,11 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
       "type": "object",
       "required": ["id", "name"],
       "properties": {
-        "id": {"type": "string"},
+        "id": {"type": "string", "description": "did:web:<fqdn>"},
         "name": {"type": "string"},
         "verified": {"type": "boolean"},
-        "verification_method": {"type": "string"}
+        "verification_method": {"type": "string", "enum": ["domain_control", "identity"]},
+        "contact": {"type": ["string", "null"], "description": "Publisher contact (email or URL); surfaced for abuse reports. Optional."}
       }
     },
     "version": {"type": "string"},
@@ -1523,7 +1628,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
     "stdio_command": {"type": ["string", "null"]},
     "capabilities": {"type": "array", "items": {"type": "string"}},
     "tools_count": {"type": "integer"},
-    "availability": {"enum": ["mirrored", "referenced", "native"]},
+    "tools_count_verified": {"type": "boolean", "default": false, "description": "Registry-sampled verification (§13.2); false until verified."},
     "auth": {
       "type": "object",
       "required": ["type"],
@@ -1549,26 +1654,31 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
             },
             "consent_defaults": {"type": "array", "items": {"type": "string"}, "description": "OAuth scopes pre-checked in the approval prompt; the user may expand or reduce."},
             "redirect_uri_pattern": {"type": "string"},
+            "app_management_url": {"type": "string", "description": "Vendor's app-management URL surfaced to the user when revocation is unconfirmed (§10.5, H16)."},
             "endpoints": {
               "type": "object",
               "properties": {
                 "authorization": {"type": "string"},
                 "token": {"type": "string"},
                 "revocation": {"type": "string"},
-                "jwks": {"type": "string"}
+                "jwks": {"type": "string", "description": "JWKS URL the SDK uses to verify the signed OAuth confirmation JWT (§17.4 step 5) and revocation_proof (§10.5)."}
               }
             }
           }
         },
         "ui": {
           "type": "object",
-          "description": "MCP Apps inline OAuth UI descriptor (§17.6). The MCP server returns an HTML login segment at resource_uri, rendered in a sandboxed iframe in the chat.",
+          "description": "MCP Apps inline OAuth UI descriptor (§17.5). The MCP server returns an HTML login segment at resource_uri, rendered in a sandboxed iframe in the chat.",
           "properties": {
             "resource_uri": {"type": "string", "description": "e.g. ui://oauth/login"},
             "csp": {"type": "string", "description": "Content Security Policy the host SHOULD enforce on the inline iframe."}
           }
         },
-        "scopes": {"type": "array", "items": {"type": "string"}, "description": "Flat scope list for non-OAuth or legacy auth types; OAuth servers use app_registration.scopes instead."},
+        "scopes": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Flat scope list. Precedence (M4): for OAuth servers, app_registration.scopes is authoritative and this top-level scopes field is a legacy/display-only copy; for non-OAuth auth types, this field is authoritative. When both are present and conflict, app_registration.scopes wins for OAuth servers."
+        },
         "auth_url": {"type": "string", "description": "Legacy: authorization URL for the Phase 1 simple OAuth flow (§9.4). Deprecated in favor of app_registration.endpoints.authorization."},
         "auth_server_url": {"type": "string", "description": "Legacy top-level copy; prefer app_registration.auth_server_url."},
         "authorization_endpoint": {"type": "string", "description": "Legacy; prefer app_registration.endpoints.authorization."},
@@ -1582,6 +1692,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
         "token_auth_method": {"type": "string"}
       }
     },
+    "availability": {"enum": ["mirrored", "referenced", "native"]},
     "pricing": {
       "type": ["object", "null"],
       "properties": {
@@ -1591,6 +1702,7 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
         "billing_url": {"type": "string"}
       }
     },
+    "pricing_verified": {"type": "boolean", "default": false, "description": "Registry-verified pricing; false until verified (§7.2)."},
     "rating": {
       "type": ["object", "null"],
       "properties": {
@@ -1602,27 +1714,74 @@ The MVP delivers the core discovery-to-connection loop for a single agent vendor
       "type": ["object", "null"],
       "properties": {
         "signature": {"type": "string"},
-        "attestations": {"type": "array", "items": {"type": "string"}}
+        "attestations": {
+          "type": "array",
+          "description": "Attestation objects (H13). Each carries a type, a URI to the evidence, and a verified flag indicating whether the registry independently verified the attestation. The old string-array shape could not carry the registry_verified flag.",
+          "items": {
+            "type": "object",
+            "required": ["type", "uri"],
+            "properties": {
+              "type": {"type": "string", "description": "e.g. SOC2-Type2, GDPR, ISO27001"},
+              "uri": {"type": "string", "description": "URL to the evidence document."},
+              "verified": {"type": "boolean", "default": false, "description": "True only if the registry independently verified this attestation."},
+              "verifier": {"type": ["string", "null"], "description": "Identity of the verifier when verified=true."},
+              "verified_at": {"type": ["string", "null"], "description": "ISO8601 timestamp of registry verification."}
+            }
+          }
+        }
       }
     },
-    "representative_queries": {"type": "array", "items": {"type": "string"}},
-    "pharos_score": {"type": "number", "minimum": 0, "maximum": 1},
-    "source_registry": {"type": "string"}
+    "representative_queries": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 10,
+      "description": "At most 10 (H12). Low-specificity queries are penalized in the embedding index."
+    },
+    "pharos_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "0.0–1.0 relevance; NOT a trust rating. Null for ARD-sourced results (§11.4)."},
+    "source_registry": {"type": "string"},
+    "source_score": {"type": ["number", "null"], "description": "Original score from the source registry before normalization (§11.4)."},
+    "source_urn": {"type": ["string", "null"], "description": "Original native ID when federated from a non-Pharos registry (§6.5 dedup)."},
+    "published_at": {"type": "string", "description": "ISO8601 — when first published to a registry (H2)."},
+    "updated_at": {"type": "string", "description": "ISO8601 — when the card was last modified (H2)."},
+    "status": {"enum": ["active", "deprecated", "deleted"], "description": "Lifecycle status (§10.7)."},
+    "successor_id": {"type": ["string", "null"], "description": "Canonical ID of the replacement server when status == deprecated."},
+    "privacy_policy_url": {"type": ["string", "null"]},
+    "terms_url": {"type": ["string", "null"]},
+    "data_residency": {"type": "array", "items": {"type": "string"}, "description": "Region codes, e.g. [US, EU]; empty if unknown."},
+    "rate_limits": {"type": ["object", "null"], "description": "Server's own rate limits, e.g. {per_minute: 100, per_day: 10000}."},
+    "health_endpoint": {"type": ["string", "null"], "description": "Liveness URL the registry probes."},
+    "protocol_versions": {"type": "array", "items": {"type": "string"}, "description": "MCP protocol versions the server speaks, e.g. [2025-03-26]."}
   }
 }
 ```
 
+**`auth.scopes` precedence (M4).** The `ServerCard` can carry OAuth scopes in two places: `auth.scopes` (top-level, flat string array) and `auth.app_registration.scopes` (array of `{name, description}` objects). To avoid ambiguity:
+
+1. **OAuth servers** (`auth.type == "oauth"`) with `app_registration` present: `app_registration.scopes` is **authoritative**. `auth.scopes` (if present) is a legacy display-only copy and MUST NOT be used for scope enforcement or consent. When the two conflict, `app_registration.scopes` wins.
+2. **Non-OAuth auth types** (`api_key`, `mtls`, `none`) and legacy OAuth servers without `app_registration`: `auth.scopes` is authoritative.
+3. The SDK's `OAuthFlowHandler` reads scopes exclusively from `app_registration.scopes` for OAuth servers; the Connection Manager's `approved_oauth_scopes` check (§7.4) is against the granted set returned by the MCP server, not against either `auth.scopes` field.
+
 ### Appendix B: Identifier format
 
-Pharos Discovery uses domain-anchored URN identifiers, isomorphic to ARD's `urn:air:` scheme but in the `urn:pharos:` namespace:
+Pharos Discovery uses domain-anchored URN identifiers, isomorphic to ARD's `urn:air:` scheme but in the `urn:pharos:` namespace. The canonical grammar is:
 
 ```
-urn:pharos:<publisher-domain>:<namespace>:<server-name>
+urn:pharos:<fqdn>:<namespace>/<name>
 ```
 
-- `<publisher-domain>` — a verifiable FQDN (e.g. `acme.com`). Acts as the trust anchor.
-- `<namespace>` — optional hierarchical segments (e.g. `travel`, `finance:trading`).
-- `<server-name>` — the terminal short name.
+- `<fqdn>` — a verifiable fully-qualified domain name (e.g. `acme.com`). Acts as the trust anchor (must match the publisher's `did:web` domain, §10.1).
+- `<namespace>` — optional hierarchical segments separated by `:` (e.g. `travel`, `finance:trading`). MAY be omitted, yielding `urn:pharos:<fqdn>/<name>`.
+- `<name>` — the terminal short name, separated from the namespace by `/` (e.g. `flight-booking`). The `/` delimiter distinguishes the (possibly absent) `:`-separated namespace from the terminal name, making the grammar unambiguous to parse.
+
+**Examples:**
+
+```
+urn:pharos:acme.com:travel/flight-booking
+urn:pharos:acme.com:finance:trading/portfolio-rebalance
+urn:pharos:stripe.com/payments
+```
+
+> **Grammar note (H4).** An earlier draft used `urn:pharos:<domain>:<namespace>:<name>` with `:` as the only delimiter, which was ambiguous when the namespace had multiple segments. The `/`-delimited terminal name resolves the ambiguity and is the canonical form. Adapters accepting the legacy `:`-only form for backward compatibility MUST normalize to the `/`-delimited canonical form before dedup (§6.5).
 
 Rationale mirrors ARD Appendix C: the URN is a stable logical noun decoupled from physical endpoints, domain-anchored for decentralized trust, and globally unique without a central registrar. Pharos and ARD identifiers are trivially convertible (`urn:air:` ↔ `urn:pharos:`) via the ARD adapter.
 
@@ -1802,6 +1961,8 @@ authorization code for a token SERVER-SIDE and keeps it.
 
 The provider registers *once*, ever. If the provider rotates keys, they update the registry; the URL stays stable. If the provider ships a new version, the version is reflected in the CIMD document, not in a new registration.
 
+**CIMD signing (H15).** CIMD documents are **signed by the agent provider**, not by the Pharos Registry. The registry serves them as **opaque signed blobs** at the stable CIMD URL — it is a content host, not an issuer. Vendors verify the CIMD's signature against the provider's **pinned public key**, fetched from the provider's own `.well-known/agent-provider-keys` (a provider-controlled endpoint), NOT from registry data. This means a compromised or malicious registry cannot mint a fake agent-provider identity: even if the registry serves a forged CIMD blob, the vendor's signature check against the provider-pinned key fails. The threat "Registry mints fake agent identity" is recorded in §10.7.
+
 ### 17.4 The `OAuthFlowHandler` — coordinates, does not run a redirect flow
 
 Under App Registration Inheritance, the `OAuthFlowHandler` **no longer runs a standard OAuth redirect flow**. It coordinates. The five-step flow:
@@ -1828,10 +1989,24 @@ Under App Registration Inheritance, the `OAuthFlowHandler` **no longer runs a st
        • exchanges the authorization code for a token itself
        • stores the token server-side
 
-5. MCP server sends the agent an auth-completed CONFIRMATION
-   → NOT the token — just { authorized: true, scope: [...] }
+5. MCP server sends the agent an auth-completed SIGNED CONFIRMATION
+   → NOT the token — a signed JWT assertion from the vendor's IdP attesting
+     { user_sub, scope, exp } (and `client_id`), verifiable via
+     app_registration.endpoints.jwks
+   → the SDK MUST verify this JWT (signature against endpoints.jwks, plus
+     `exp` not in the past and `client_id` matching the inherited
+     app_registration.client_id) before trusting authorized: true
+   → on verification failure: OAuthResult.authorized=false,
+     error="invalid_jwt"; the connection is torn down
    → token stays with the MCP server, which proxies all tool calls
 ```
+
+**Step 4b — crash / disconnect handling (H10).** The inline OAuth flow depends on a live iframe and a live MCP server. If the iframe errors out, the MCP server disconnects, or the flow times out (`auth_timeout` exceeded), the SDK MUST:
+
+1. Invalidate the `ApprovalToken` issued for this flow (it cannot be reused).
+2. Emit `OAuthResult.authorized=false` with `error="server_lost"` (or `"timeout"` if the timeout fired).
+3. Tear down the connection (close the iframe, abort any in-flight MCP `initialize`).
+4. Surface a `RetryableOAuthFailure(server_id, reason)` event to the host so the host can re-prompt the user to re-approve and restart the flow from step 1. The SDK does NOT auto-retry — a fresh user approval is required because the server-side state is indeterminate (the token may or may not have been issued before the disconnect).
 
 **The handler's flow selection.** When `pharos.connect(approval)` is called for a server with `auth.type == "oauth"`, the `OAuthFlowHandler.authorize()` inspects the `ServerCard.auth` config:
 
@@ -1867,7 +2042,49 @@ Under App Registration Inheritance, the `OAuthFlowHandler` **no longer runs a st
 - Hosts MAY refuse to render inline OAuth UI at all (falling back to a "connect in the vendor's own app" prompt) for high-security deployments.
 - Hosts MAY block suspicious UI (e.g. login forms that attempt to exfiltrate credentials to a non-declared endpoint) and report the server via `POST /v1/feedback/report`.
 
-**Host support.** MCP Apps is supported by Claude, ChatGPT, VS Code, Goose, and more. Hosts that do not yet support MCP Apps fall back to the legacy redirect flow (Phase 1 behavior, §9.4) or refuse OAuth-protected servers.
+**Host support.** MCP Apps is supported by Claude, ChatGPT, VS Code, Goose, and more. Hosts that do not yet support MCP Apps fall back to the server-brokered redirect flow (§17.5.1) if they have a system browser, or surface `OAuthUnavailable` otherwise.
+
+### 17.5.1 Host capability negotiation
+
+At startup (and before the first OAuth-protected connection), the SDK probes the host runtime for two capabilities and selects the OAuth flow accordingly:
+
+| Host capability | OAuth flow selected | Token holder |
+|---|---|---|
+| `supports_mcp_apps: true` | **Inline flow** (§17.5) — MCP Apps sandboxed iframe in the chat | MCP server (server-side) |
+| `supports_mcp_apps: false`, `has_system_browser: true` | **Server-brokered redirect flow with PKCE** (below) | MCP server (server-side) |
+| neither | **`OAuthUnavailable`** — the SDK refuses to start an OAuth flow and surfaces a `OAuthUnavailable(server_id, reason)` event; the host MAY fall back to an API-key path if the server supports one, or abandon the connection. | n/a |
+
+**Server-brokered redirect flow with PKCE.** This is the fallback for hosts that have a system browser but no MCP Apps inline rendering. It preserves the core "agent never sees the token" property by keeping the authorization-code exchange server-side in the MCP server:
+
+1. The SDK asks the MCP server to start a server-brokered flow. The MCP server generates a PKCE verifier and challenge, and returns a short-lived broker session plus the IdP `/oauth/authorize` URL (with the MCP server's inherited `client_id`, the PKCE challenge, `redirect_uri` pointing at the MCP server's `/oauth/callback`, and `state`).
+2. The SDK opens the system browser to that `/oauth/authorize` URL. The user authenticates at the vendor's real IdP (the browser's address bar and cert are the user's trust anchor — see phishing defenses below).
+3. The IdP redirects to the MCP server's `/oauth/callback` with the authorization code. The MCP server exchanges the code for tokens **server-side** using its stored `client_secret` and the PKCE verifier, and stores the token server-side.
+4. The SDK either polls the MCP server's OAuth-status endpoint or receives a callback (e.g. via a local loopback redirect the MCP server POSTs to, or an SSE event) indicating `authorized: true`.
+5. The MCP server returns the **signed confirmation** (§17.4 step 5) — never the token.
+
+The agent and SDK never receive the access token or `client_secret`; the MCP server proxies all subsequent tool calls exactly as in the inline flow. `OAuthResult.acquired_via == "server_brokered_redirect"` distinguishes this path in the result.
+
+### 17.5.2 Versioning and compatibility
+
+The MCP Apps extension is a moving target. To avoid silent breakage:
+
+- **Pinned spec version.** The SDK declares the MCP Apps spec version it targets (`mcp_apps_spec_version`, currently `2026-01`) in the host-capability probe. The host and the SDK MUST agree on a compatible version before the inline flow is used; otherwise the SDK falls back to §17.5.1.
+- **Backward compatibility.** A newer host running an older SDK (or vice versa) MUST degrade gracefully: unknown MCP Apps message fields are ignored; a missing required field aborts the inline flow and falls back to the server-brokered redirect (§17.5.1).
+- **Dialog/popup alternative.** Hosts that cannot render an inline iframe (e.g. minimal TUI agents) but can open a system dialog/popup window MAY use a popup variant of the inline flow: the MCP Apps HTML segment is rendered in a separate OS window rather than an in-chat iframe, with the same JSON-RPC-over-`postMessage` contract. This is recorded as `OAuthResult.acquired_via == "mcp_apps_popup"`. Hosts with neither inline rendering nor a popup/dialog capability fall back to §17.5.1.
+
+### 17.5.3 Inline OAuth phishing defenses
+
+Because the inline OAuth UI is rendered inside the host's chrome, a malicious MCP server could attempt to spoof a vendor's login page and harvest credentials. The defenses below make the host's chrome the non-spoofable trust anchor:
+
+- **Host-rendered chrome (not server-rendered).** The host — not the MCP server, not the iframe content — renders a non-spoofable border/chrome around the inline OAuth iframe. This chrome displays, at minimum:
+  - the publisher's **verified domain** (from `publisher.id`, e.g. `acme.com`), with the verification badge;
+  - the OAuth `authorization` and `token` endpoints (from `app_registration.endpoints`) the iframe is expected to navigate to;
+  - a warning: *"Do not enter your password if the domain shown in the iframe's address bar does not match your IdP."*
+  The iframe content cannot draw over or modify this chrome (it is rendered by the host outside the iframe's DOM).
+- **Iframe navigates to the IdP's real authorize URL.** The inline OAuth UI MUST ultimately navigate to the vendor IdP's real `endpoints.authorization` URL. The host SHOULD surface the iframe's current URL (or at least its registrable domain) in the chrome so the user can verify it matches the declared `app_registration.endpoints.authorization`. If the iframe attempts to navigate to a host outside `app_registration.endpoints`, the host MUST block the navigation and abort the flow with `OAuthResult.authorized=false, error="invalid_jwt"` style hard error.
+- **Brand-similarity rejection at publish time.** The registry rejects `display_name` / `publisher.name` strings that are confusingly similar to a well-known brand (Levenshtein distance ≤ 2 against a maintained brand list, case-insensitive) unless the publisher owns that brand's verified domain (§7.2). This prevents an attacker from registering "Googgle OAuth" and tricking the user into typing their Google password.
+- **`client_id` binding to verified publisher (§10.1, H14).** The `client_id` in `app_registration` is bound at publish time to the publisher's verified domain, so an attacker cannot copy Acme's `client_id` to lend credibility to a phishing form on a different domain.
+- **Threat model entry.** This is recorded in §10.7 as "Inline OAuth phishing (C5)".
 
 ### 17.6 `availability` field, trust, and OAuth
 
@@ -1899,4 +2116,4 @@ The lowest-trust OAuth path is a `referenced` server with only DCR support (lega
 
 ---
 
-**End of SPEC.md — Pharos Discovery v0.2.0 (Draft)**
+**End of SPEC.md — Pharos Discovery v0.4.0 (Draft)**
