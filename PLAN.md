@@ -13,8 +13,8 @@ Dual-language SDK (Python + TypeScript) for discovering, approving, and connecti
 ## Phase 1: Core SDK (Python + TypeScript in parallel)
 
 - [x] T1: Bootstrap monorepo structure
-- [ ] T2: Python SDK core types (pydantic models: Publisher, AuthSpec, ServerCard, ApprovalRequest/Response/Token, OAuthResult, RevocationResult, PlanApproval)
-- [ ] T3: TypeScript SDK core types (zod schemas: same types as Python)
+- [x] T2: Python SDK core types (pydantic models, 25 tests)
+- [x] T3: TypeScript SDK core types (zod schemas, 8 tests)
 - [x] T4: Python errors + cache layer (TRON-direct, 39 tests)
 - [ ] T5: TypeScript errors + cache layer
 - [ ] T6: Python registry adapter (PharosRegistryAdapter — search + get server card)
