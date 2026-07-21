@@ -19,9 +19,9 @@ Dual-language SDK (Python + TypeScript) for discovering, approving, and connecti
 - [x] T5: TypeScript errors + cache layer (OpenCode, 25 tests)
 - [x] T6: Python registry adapter (OpenCode + TRON verify, 11 tests)
 - [x] T7: TypeScript registry adapter (OpenCode, 11 tests)
-- [ ] T8: Python PharosClient (search, request_approval, connect, revoke)
-- [ ] T9: TypeScript PharosClient (same)
-- [ ] T10: Python approval engine + token signing (ed25519)
+- [x] T8: Python PharosClient (search, connect_and_approve, revoke, check_scope) — 15 tests
+- [x] T9: TypeScript PharosClient (same) — 15 tests
+- [x] T10: Python approval engine + token signing (HMAC-SHA256, @reviewer invoked) — 24 tests
 - [ ] T11: TypeScript approval engine + token signing (Web Crypto)
 - [ ] T12: Python connection manager (HTTP+SSE + streamable-http transports)
 - [ ] T13: TypeScript connection manager (same)

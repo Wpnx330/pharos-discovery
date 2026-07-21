@@ -6,3 +6,5 @@ export { ServerCardCache } from "./cache.js";
 export type { CacheEntry } from "./cache.js";
 export { PharosRegistryAdapter } from "./adapters/registry.js";
 export type { SearchResult, SearchFilters } from "./adapters/registry.js";
+export { PharosClient } from "./client.js";
+export type { ApprovalHandler, ConnectionHandler, PharosClientOptions } from "./client.js";
