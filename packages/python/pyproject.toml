@@ -1,0 +1,39 @@
+[project]
+name = "pharos-discovery"
+version = "0.1.0"
+description = "Discovery SDK for MCP servers — search, approve, connect"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Chris Wykel" }]
+
+dependencies = [
+    "anyio>=4.0",
+    "httpx>=0.27",
+    "pydantic>=2.0",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "onnxruntime>=1.17",
+    "pharos-discovery-embeddings",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pharos_discovery"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

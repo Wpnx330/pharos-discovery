@@ -1,0 +1,26 @@
+[project]
+name = "pharos-discovery"
+version = "0.1.0"
+description = "Discovery SDK for MCP servers — search, approve, connect"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Chris Wykel" }]
+
+# Workspace configuration — packages/python is the main package
+[tool.uv.workspace]
+members = ["packages/python"]
+
+[tool.uv.sources]
+pharos-discovery = { workspace = true }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/python/tests"]
+asyncio_mode = "auto"

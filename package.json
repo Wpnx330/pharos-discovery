@@ -1,0 +1,15 @@
+{
+  "name": "pharos-discovery-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discovery SDK for MCP servers — search, approve, connect",
+  "license": "MIT",
+  "workspaces": [
+    "packages/typescript"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=packages/typescript",
+    "test": "npm run test --workspace=packages/typescript",
+    "lint": "npm run lint --workspace=packages/typescript"
+  }
+}
