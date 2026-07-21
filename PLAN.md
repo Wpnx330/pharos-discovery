@@ -16,9 +16,9 @@ Dual-language SDK (Python + TypeScript) for discovering, approving, and connecti
 - [x] T2: Python SDK core types (pydantic models, 25 tests)
 - [x] T3: TypeScript SDK core types (zod schemas, 8 tests)
 - [x] T4: Python errors + cache layer (TRON-direct, 39 tests)
-- [ ] T5: TypeScript errors + cache layer
-- [ ] T6: Python registry adapter (PharosRegistryAdapter — search + get server card)
-- [ ] T7: TypeScript registry adapter (same)
+- [x] T5: TypeScript errors + cache layer (OpenCode, 25 tests)
+- [x] T6: Python registry adapter (OpenCode + TRON verify, 11 tests)
+- [x] T7: TypeScript registry adapter (OpenCode, 11 tests)
 - [ ] T8: Python PharosClient (search, request_approval, connect, revoke)
 - [ ] T9: TypeScript PharosClient (same)
 - [ ] T10: Python approval engine + token signing (ed25519)
