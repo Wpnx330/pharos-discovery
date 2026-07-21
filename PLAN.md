@@ -25,7 +25,7 @@ Dual-language SDK (Python + TypeScript) for discovering, approving, and connecti
 - [x] T11: TypeScript approval engine + token signing (Web Crypto HMAC-SHA256) — 22 tests
 - [x] T12: Python connection manager (HTTP+SSE + streamable-http + stdio, retry) — 19 tests
 - [x] T13: TypeScript connection manager (same 3 transports) — 19 tests
-- [ ] T14: End-to-end integration tests (both SDKs)
+- [x] T14: End-to-end integration tests (both SDKs) — 9 Py + 9 TS E2E tests
 
 ## Phase 2: Advanced Features
 

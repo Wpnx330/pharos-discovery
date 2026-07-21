@@ -39,7 +39,7 @@ class ConnectionHandler(Protocol):
     async def connect(self, card: ServerCard, token: ApprovalToken) -> Any:
         ...
 
-    async def disconnect(self, connection: Any) -> None:
+    async def disconnect(self, server_id: str) -> None:
         ...
 
 
@@ -206,7 +206,7 @@ class PharosClient:
     async def revoke(self, server_id: str) -> None:
         """Revoke approval and disconnect from a server."""
         if server_id in self._connections and self._connection_handler:
-            await self._connection_handler.disconnect(self._connections[server_id])
+            await self._connection_handler.disconnect(server_id)
             del self._connections[server_id]
 
         if server_id in self._approved_servers:
@@ -245,9 +245,9 @@ class PharosClient:
     async def close(self) -> None:
         """Clean up all connections."""
         if self._connection_handler:
-            for conn in self._connections.values():
+            for server_id in list(self._connections.keys()):
                 try:
-                    await self._connection_handler.disconnect(conn)
+                    await self._connection_handler.disconnect(server_id)
                 except Exception:
                     pass
         self._connections.clear()

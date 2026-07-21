@@ -24,7 +24,7 @@ export interface ApprovalHandler {
 
 export interface ConnectionHandler {
   connect(card: ServerCard, token: ApprovalToken): Promise<unknown>;
-  disconnect(connection: unknown): Promise<void>;
+  disconnect(serverId: string): Promise<void>;
 }
 
 export interface PharosClientOptions {
@@ -196,9 +196,8 @@ export class PharosClient {
   }
 
   async revoke(serverId: string): Promise<void> {
-    const conn = this.connections.get(serverId);
-    if (conn && this.connectionHandler) {
-      await this.connectionHandler.disconnect(conn);
+    if (this.connections.has(serverId) && this.connectionHandler) {
+      await this.connectionHandler.disconnect(serverId);
       this.connections.delete(serverId);
     }
     this.approvedServers.delete(serverId);
@@ -216,9 +215,9 @@ export class PharosClient {
 
   async close(): Promise<void> {
     if (this.connectionHandler) {
-      for (const conn of this.connections.values()) {
+      for (const serverId of this.connections.keys()) {
         try {
-          await this.connectionHandler.disconnect(conn);
+          await this.connectionHandler.disconnect(serverId);
         } catch {
           // ignore
         }
