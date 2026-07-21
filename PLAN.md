@@ -22,9 +22,9 @@ Dual-language SDK (Python + TypeScript) for discovering, approving, and connecti
 - [x] T8: Python PharosClient (search, connect_and_approve, revoke, check_scope) — 15 tests
 - [x] T9: TypeScript PharosClient (same) — 15 tests
 - [x] T10: Python approval engine + token signing (HMAC-SHA256, @reviewer invoked) — 24 tests
-- [ ] T11: TypeScript approval engine + token signing (Web Crypto)
-- [ ] T12: Python connection manager (HTTP+SSE + streamable-http transports)
-- [ ] T13: TypeScript connection manager (same)
+- [x] T11: TypeScript approval engine + token signing (Web Crypto HMAC-SHA256) — 22 tests
+- [x] T12: Python connection manager (HTTP+SSE + streamable-http + stdio, retry) — 19 tests
+- [x] T13: TypeScript connection manager (same 3 transports) — 19 tests
 - [ ] T14: End-to-end integration tests (both SDKs)
 
 ## Phase 2: Advanced Features

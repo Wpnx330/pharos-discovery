@@ -8,3 +8,6 @@ export { PharosRegistryAdapter } from "./adapters/registry.js";
 export type { SearchResult, SearchFilters } from "./adapters/registry.js";
 export { PharosClient } from "./client.js";
 export type { ApprovalHandler, ConnectionHandler, PharosClientOptions } from "./client.js";
+export { ConnectionManager, HttpSSETransport, StreamableHTTPTransport, StdioTransport } from "./connection/manager.js";
+export type { MCPTransport } from "./connection/manager.js";
+export { ApprovalEngine } from "./approval/engine.js";
