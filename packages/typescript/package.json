@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "description": "Discovery SDK for MCP servers — search, approve, connect",
   "license": "MIT",
+  "author": "Chris Wykel <chris@getpharos.dev>",
+  "homepage": "https://getpharos.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wpnx330/pharos-discovery"
+  },
+  "bugs": {
+    "url": "https://github.com/Wpnx330/pharos-discovery/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "discovery",
+    "registry",
+    "ai",
+    "agent"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -17,11 +34,17 @@
   "engines": {
     "node": ">=20"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm run test"
   },
   "dependencies": {
     "zod": "^3.23.0"

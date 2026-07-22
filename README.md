@@ -1,35 +1,84 @@
-# Pharos Discovery
+# Pharos Discovery SDK
 
-> The universal agent discovery framework for MCP — search, evaluate, approve, and connect to MCP services from any AI agent.
+Universal agent discovery framework for [MCP (Model Context Protocol)](https://modelcontextprotocol.io) servers — search, approve, and connect to MCP servers from any registry.
 
-Pharos Discovery is a framework that any AI agent can embed to discover MCP services at runtime. Instead of each agent provider building their own walled-garden discovery (Claude Connectors, MS Copilot, etc.), Pharos Discovery provides a single open standard that works across all agents.
+## Features
 
-## Why?
+- **Registry Client** — Search and browse MCP server packages from any Pharos-compatible registry
+- **MCP Adapter** — Normalize server cards from MCP official registry, npm, and custom registries
+- **Approval Engine** — HMAC-signed token approval system with configurable handlers
+- **Connection Manager** — Multi-transport connections (streamable-http, http+sse, stdio) with retry and reconnection
+- **Security** — Blocklist (hash-based) and key pinning (TOFU) for safe server connections
+- **SSE Events** — Subscribe to registry events (package.published, package.unpublished, etc.) with auto-reconnect
+- **Consent Store** — Persistent user consent records with TTL and revocation
+- **Headless Mode** — CI/CD-friendly approval policies (allow_all, deny_all, allow_trusted_only)
+- **Plan Approval** — Two-phase install: review risk-assessed plan, then approve execution
+- **Caching** — TTL-based cache with LRU eviction for registry responses
 
-The MCP ecosystem is fragmenting. Every major agent provider is building their own discovery channel. Businesses that want to be found by agents have to publish to 10+ different directories. Pharos Discovery solves this with one universal, open framework.
+## Installation
 
-## How It Works
+### Python
 
-1. **Agent receives a user request** that requires a capability it doesn't have
-2. **Agent searches the Pharos registry** using natural language or structured queries
-3. **Agent presents matching MCP servers** to the user with rich metadata (capabilities, auth requirements, pricing, reviews)
-4. **User approves** the connection — privacy-first, no silent connections
-5. **Agent installs/enables the MCP server** and begins using it
-6. **Agent reports results** back to the user with tool usage transparency
+```bash
+pip install pharos-discovery
+```
 
-## Features (Planned)
+### TypeScript
 
-- **Provider-agnostic** — Works with Claude, GPT, DeepSeek, Gemini, xAI, Zap, any agent
-- **User-approval-gated** — No agent connects to anything without explicit user consent
-- **Rich metadata** — Capabilities, auth requirements, pricing, publisher verification
-- **Runtime discovery** — Find and enable capabilities at runtime, no pre-configuration
-- **Transport-agnostic** — Works with both stdio and HTTP/SSE MCP transports
-- **Embeddable** — Thin client library for Python, TypeScript, and more
+```bash
+npm install @pharos/discovery
+```
 
-## Status
+## Quick Start
 
-🚧 **Early development** — Specification and architecture in progress.
+### Python
+
+```python
+from pharos_discovery import RegistryClient, ApprovalEngine
+
+client = RegistryClient("https://getpharos.dev")
+results = await client.search("filesystem")
+
+# Approve and connect
+engine = ApprovalEngine(secret="your-hmac-secret")
+token = engine.sign_token(server_id="fs-server", scopes=["read"])
+```
+
+### TypeScript
+
+```typescript
+import { RegistryClient, ApprovalEngine } from "@pharos/discovery";
+
+const client = new RegistryClient("https://getpharos.dev");
+const results = await client.search("filesystem");
+
+const engine = new ApprovalEngine({ secret: "your-hmac-secret" });
+const token = engine.signToken({ serverId: "fs-server", scopes: ["read"] });
+```
+
+## Architecture
+
+The SDK is a monorepo with parallel implementations:
+
+- **`packages/python/`** — Python 3.10+ with pydantic v2, httpx, anyio
+- **`packages/typescript/`** — Node 20+ with zod, dual ESM/CJS output
+
+Both implementations share the same API surface and are feature-complete.
+
+## Testing
+
+### Python
+```bash
+cd packages/python
+PYTHONPATH=src python3 -m pytest tests/ -q
+```
+
+### TypeScript
+```bash
+cd packages/typescript
+npx vitest run
+```
 
 ## License
 
-MIT
+MIT © Chris Wykel
