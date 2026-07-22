@@ -11,3 +11,7 @@ export type { ApprovalHandler, ConnectionHandler, PharosClientOptions } from "./
 export { ConnectionManager, HttpSSETransport, StreamableHTTPTransport, StdioTransport } from "./connection/manager.js";
 export type { MCPTransport } from "./connection/manager.js";
 export { ApprovalEngine } from "./approval/engine.js";
+export { Blocklist } from "./security/blocklist.js";
+export { KeyPinStore } from "./security/key-pinning.js";
+export { EventSubscriber, EVENT_TYPES } from "./events/subscriber.js";
+export type { EventType, SSEEvent, ParsedEvent } from "./events/subscriber.js";
