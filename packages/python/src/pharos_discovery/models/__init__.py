@@ -20,6 +20,12 @@ from pharos_discovery.models.server_card import (
     ServerCard,
     TrustSpec,
 )
+from pharos_discovery.models.plan import (
+    InstallPlan,
+    PlanReview,
+    RiskLevel,
+    ServerInstallEntry,
+)
 
 __all__ = [
     "AppRegistration",
@@ -27,15 +33,19 @@ __all__ = [
     "ApprovalResponse",
     "ApprovalToken",
     "AuthSpec",
+    "InstallPlan",
     "OAuthResult",
     "OAuthStatus",
     "OAuthUI",
     "PlanApprovalRequest",
     "PlanApprovalResponse",
+    "PlanReview",
     "PricingSpec",
     "Publisher",
     "RatingSpec",
     "RevocationResult",
+    "RiskLevel",
     "ServerCard",
+    "ServerInstallEntry",
     "TrustSpec",
 ]
