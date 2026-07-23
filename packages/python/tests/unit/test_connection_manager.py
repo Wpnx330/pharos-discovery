@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pharos_discovery.connection.manager import (
@@ -167,9 +168,14 @@ class TestSend:
     async def test_send_message(self, manager):
         card = make_card("http+sse")
         await manager.connect(card, make_token())
-        response = await manager.send(card.id, {"id": "req-1", "method": "search"})
-        assert response["status"] == "ok"
-        assert response["id"] == "req-1"
+        # Mock the HTTP POST that the real transport now performs.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+        with patch.object(httpx.AsyncClient, "post", new=AsyncMock(return_value=mock_resp)):
+            response = await manager.send(card.id, {"id": "req-1", "method": "search"})
+        assert response["result"]["ok"] is True
 
     @pytest.mark.anyio
     async def test_send_not_connected(self, manager):

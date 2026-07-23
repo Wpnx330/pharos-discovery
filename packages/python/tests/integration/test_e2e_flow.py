@@ -121,12 +121,17 @@ class TestFullDiscoveryFlow:
         assert approval_handler.calls[0].purpose == "Search for flights to Tokyo"
         assert connection_manager.active_count == 1
 
-        # Send a message through the connection
-        response = await connection_manager.send(
-            "urn:pharos:server-001",
-            {"id": "req-1", "method": "search", "params": {"destination": "Tokyo"}},
-        )
-        assert response["status"] == "ok"
+        # Send a message through the connection (mock the HTTP POST)
+        mock_send_resp = MagicMock()
+        mock_send_resp.status_code = 200
+        mock_send_resp.headers = {"content-type": "application/json"}
+        mock_send_resp.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}}
+        with patch.object(httpx.AsyncClient, "post", new=AsyncMock(return_value=mock_send_resp)):
+            response = await connection_manager.send(
+                "urn:pharos:server-001",
+                {"id": "req-1", "method": "search", "params": {"destination": "Tokyo"}},
+            )
+        assert response["result"]["status"] == "ok"
 
         # Check scope
         await client.check_scope("urn:pharos:server-001", "flights:search")

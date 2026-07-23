@@ -161,9 +161,21 @@ describe("ConnectionManager", () => {
     it("sends a message", async () => {
       const card = makeCard("http+sse");
       await manager.connect(card, makeToken());
-      const response = await manager.send(card.id, { id: "req-1", method: "search" });
-      expect(response.status).toBe("ok");
-      expect(response.id).toBe("req-1");
+      // Mock the HTTP POST that the real transport now performs.
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const original = globalThis.fetch;
+      globalThis.fetch = mockFetch as any;
+      try {
+        const response = await manager.send(card.id, { id: "req-1", method: "search" });
+        expect((response as any).result.ok).toBe(true);
+      } finally {
+        globalThis.fetch = original;
+      }
     });
 
     it("throws when not connected", async () => {

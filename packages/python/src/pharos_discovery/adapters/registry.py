@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 
 from pharos_discovery.errors import NoServersFound, RegistryUnavailable
-from pharos_discovery.models import ServerCard
+from pharos_discovery.models import AuthSpec, Publisher, ServerCard
 
 
 class SearchResult:
@@ -14,6 +14,129 @@ class SearchResult:
     def __init__(self, card: ServerCard, score: float | None = None):
         self.card = card
         self.score = score
+
+
+def _normalize_to_server_card(
+    item: dict[str, Any],
+    source_registry: str,
+) -> ServerCard:
+    """Normalize a raw registry item into a :class:`ServerCard`.
+
+    Handles two shapes:
+    1. **Pharos-native** — already has ``id`` and ``display_name`` (pass-through).
+    2. **Live registry** (getpharos.dev) — has ``name``, ``title``,
+       ``capabilities`` as a dict with ``tools``/``auth`` keys, and
+       ``publisher`` with a ``namespace`` field.
+    """
+    # --- Pharos-native shape (existing tests / other registries) -----------
+    if "id" in item and "display_name" in item:
+        return ServerCard(**item)
+
+    # --- Live registry shape (getpharos.dev /v1/search & /v1/packages) -----
+    name = item.get("name") or item.get("id") or "unknown"
+    title = item.get("title") or item.get("display_name") or name
+    description = item.get("description") or item.get("summary") or ""
+    version = item.get("version") or "0.0.0"
+
+    # Publisher — live registry uses {namespace, verified}
+    pub_raw = item.get("publisher") or {}
+    publisher = Publisher(
+        id=pub_raw.get("namespace") or pub_raw.get("id") or "unknown",
+        name=pub_raw.get("namespace") or pub_raw.get("name") or "unknown",
+        verified=pub_raw.get("verified"),
+        verification_method=pub_raw.get("verification_method"),
+        contact=pub_raw.get("contact"),
+    )
+
+    # Capabilities — live registry uses {"tools": bool, "auth": {"type": str}}
+    caps_raw = item.get("capabilities")
+    if isinstance(caps_raw, dict):
+        capabilities: list[str] = []
+        if caps_raw.get("tools"):
+            capabilities.append("tools")
+        if caps_raw.get("resources"):
+            capabilities.append("resources")
+        if caps_raw.get("prompts"):
+            capabilities.append("prompts")
+        auth_raw = caps_raw.get("auth") or {}
+        auth_type = auth_raw.get("type") if auth_raw.get("type") else "none"
+    elif isinstance(caps_raw, list):
+        capabilities = [str(c) for c in caps_raw]
+        auth_raw = item.get("auth") or {}
+        auth_type = auth_raw.get("type", "none") if isinstance(auth_raw, dict) else "none"
+    else:
+        capabilities = []
+        auth_raw = item.get("auth") or {}
+        auth_type = auth_raw.get("type", "none") if isinstance(auth_raw, dict) else "none"
+
+    if auth_type not in ("none", "api_key", "oauth", "mtls"):
+        auth_type = "none"
+    auth = AuthSpec(type=auth_type)  # type: ignore[arg-type]
+
+    # Transport
+    raw_transports = item.get("transport") or item.get("transports") or []
+    if isinstance(raw_transports, str):
+        raw_transports = [raw_transports]
+    transports = [t for t in raw_transports if t in ("stdio", "http+sse", "streamable-http")]
+    if not transports:
+        transports = ["stdio"]
+
+    # Endpoint / stdio command
+    endpoint = item.get("endpoint") or item.get("url")
+    stdio_command = item.get("stdio_command") or item.get("command")
+
+    # For package-detail responses, extract from latest version's manifest
+    versions = item.get("versions")
+    if isinstance(versions, list) and versions:
+        dist_tags = item.get("dist_tags") or {}
+        latest_tag = dist_tags.get("latest")
+        latest_entry = None
+        if latest_tag:
+            latest_entry = next((v for v in versions if v.get("version") == latest_tag), None)
+        if latest_entry is None:
+            latest_entry = versions[-1]
+        manifest = latest_entry.get("manifest") or {}
+        if not endpoint:
+            endpoint = manifest.get("endpoint")
+        if not stdio_command:
+            stdio_command = manifest.get("command") or manifest.get("stdio_command")
+        manifest_caps = manifest.get("capabilities")
+        if isinstance(manifest_caps, list):
+            capabilities = [str(c) for c in manifest_caps]
+        manifest_transport = manifest.get("transport")
+        if isinstance(manifest_transport, str) and manifest_transport in ("stdio", "http+sse", "streamable-http"):
+            transports = [manifest_transport]
+        # Use the latest version string if the top-level version was a default.
+        if latest_entry.get("version") and version == "0.0.0":
+            version = latest_entry["version"]
+
+    # Timestamps
+    published_at = item.get("published_at") or item.get("created_at") or ""
+    updated_at = item.get("updated_at") or item.get("modified_at") or ""
+    if not published_at:
+        published_at = "1970-01-01T00:00:00Z"
+    if not updated_at:
+        updated_at = published_at
+
+    return ServerCard(
+        id=name,
+        display_name=title,
+        description=description,
+        publisher=publisher,
+        version=version,
+        transport=transports,  # type: ignore[arg-type]
+        endpoint=endpoint,
+        stdio_command=stdio_command,
+        capabilities=capabilities,
+        tools_count=item.get("tools_count", len(capabilities) if capabilities else 0),
+        auth=auth,
+        availability="native",
+        tags=item.get("tags") or [],
+        source_registry=source_registry,
+        published_at=published_at,
+        updated_at=updated_at,
+        status="active",
+    )
 
 
 class PharosRegistryAdapter:
@@ -64,6 +187,8 @@ class PharosRegistryAdapter:
         """
         params: dict[str, Any] = {"limit": limit}
         if text:
+            # Prefer "q" (live registry) but also send "text" for compatibility
+            params["q"] = text
             params["text"] = text
         if filters:
             for key, value in filters.items():
@@ -99,8 +224,8 @@ class PharosRegistryAdapter:
 
         results: list[SearchResult] = []
         for item in items:
-            card = ServerCard(**item)
-            score = item.get("_score")
+            card = _normalize_to_server_card(item, self._base_url)
+            score = item.get("_score") or item.get("score")
             results.append(SearchResult(card=card, score=score))
 
         return results
@@ -109,12 +234,15 @@ class PharosRegistryAdapter:
         self,
         server_id: str,
         etag: str | None = None,
-    ) -> tuple[ServerCard, str | None]:
+    ) -> tuple[ServerCard | None, str | None]:
         """Fetch a single server card by ID.
 
+        Tries ``/v1/servers/{id}`` first (Pharos-native spec), then falls back
+        to ``/v1/packages/{id}`` (live getpharos.dev registry).
+
         Args:
-            server_id: The server's URN identifier
-            etag: Optional ETag for conditional request
+            server_id: The server's identifier (URN or package name).
+            etag: Optional ETag for conditional request.
 
         Returns:
             Tuple of (ServerCard, new_etag_or_None)
@@ -122,22 +250,50 @@ class PharosRegistryAdapter:
         Raises:
             RegistryUnavailable: On HTTP errors
         """
+        # Try /v1/servers/{id} (Pharos-native spec endpoint).
+        try:
+            card, new_etag = await self._try_get_card(
+                f"{self._base_url}/v1/servers/{server_id}", etag
+            )
+            if card is not None or new_etag is not None:
+                return card, new_etag
+        except RegistryUnavailable:
+            # Non-404 error on primary endpoint — propagate.
+            raise
+
+        # Primary returned 404 (card and etag both None) — try live fallback.
+        card, new_etag = await self._try_get_card(
+            f"{self._base_url}/v1/packages/{server_id}", etag
+        )
+        if card is None and new_etag is None:
+            # Both endpoints returned 404 — server not found.
+            raise RegistryUnavailable(
+                self._base_url, status=404, detail="Server not found"
+            )
+        return card, new_etag
+
+    async def _try_get_card(
+        self,
+        url: str,
+        etag: str | None,
+    ) -> tuple[ServerCard | None, str | None]:
         headers = self._auth_headers()
         if etag:
             headers["If-None-Match"] = etag
 
         try:
             async with httpx.AsyncClient(timeout=self._get_timeout) as client:
-                resp = await client.get(
-                    f"{self._base_url}/v1/servers/{server_id}",
-                    headers=headers,
-                )
+                resp = await client.get(url, headers=headers)
         except httpx.HTTPError as exc:
             raise RegistryUnavailable(self._base_url, detail=str(exc)) from exc
 
         if resp.status_code == 304:
-            # Not modified - caller should use cached version
-            return None, etag  # type: ignore[return-value]
+            return None, etag
+
+        if resp.status_code == 404:
+            # Signal caller to try the fallback endpoint by returning None/None.
+            # (Distinguishable from a 304 which returns None/etag.)
+            return None, None
 
         if resp.status_code != 200:
             raise RegistryUnavailable(
@@ -147,7 +303,8 @@ class PharosRegistryAdapter:
             )
 
         new_etag = resp.headers.get("ETag")
-        card = ServerCard(**resp.json())
+        body = resp.json()
+        card = _normalize_to_server_card(body, self._base_url)
         return card, new_etag
 
     async def get_blocklist(self) -> list[str]:
@@ -169,6 +326,10 @@ class PharosRegistryAdapter:
                 )
         except httpx.HTTPError as exc:
             raise RegistryUnavailable(self._base_url, detail=str(exc)) from exc
+
+        if resp.status_code == 404:
+            # Live registry may not implement /v1/blocklist — return empty.
+            return []
 
         if resp.status_code != 200:
             raise RegistryUnavailable(

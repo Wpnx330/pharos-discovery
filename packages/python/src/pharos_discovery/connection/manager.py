@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import time
 from typing import Any, Literal, Protocol
+
+import httpx
 
 from pharos_discovery.errors import ConnectionFailed, TransportError
 from pharos_discovery.models import ApprovalToken, ServerCard
@@ -20,7 +24,10 @@ class MCPTransport(Protocol):
 class HttpSSETransport:
     """HTTP+SSE transport for MCP servers.
 
-    Connects via HTTP POST for commands and SSE for streaming responses.
+    Sends JSON-RPC 2.0 requests via HTTP POST and reads the JSON response
+    body.  Designed to work against any MCP server that accepts a single
+    POST endpoint (the common case for ``http+sse`` and
+    ``streamable-http`` servers).
     """
 
     def __init__(self, endpoint: str, token: ApprovalToken, timeout: float = 30.0):
@@ -29,23 +36,48 @@ class HttpSSETransport:
         self._timeout = timeout
         self._connected = False
         self._last_activity: float | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._id_counter = itertools.count(1)
 
     async def connect(self) -> None:
-        # In production, this would establish HTTP connection + SSE stream
-        # For now, mark as connected
+        self._client = httpx.AsyncClient(timeout=self._timeout)
         self._connected = True
         self._last_activity = time.monotonic()
 
     async def disconnect(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
         self._connected = False
         self._last_activity = None
 
     async def send(self, message: dict[str, Any]) -> dict[str, Any]:
-        if not self._connected:
+        if not self._connected or self._client is None:
             raise TransportError("http+sse", "Not connected")
         self._last_activity = time.monotonic()
-        # In production, POST to endpoint with auth header, read SSE response
-        return {"status": "ok", "id": message.get("id", "unknown")}
+
+        # Ensure the message has an id for request/response correlation.
+        if "id" not in message:
+            message["id"] = next(self._id_counter)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        body = json.dumps(message)
+
+        try:
+            resp = await self._client.post(self._endpoint, content=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise TransportError("http+sse", str(exc)) from exc
+
+        if resp.status_code >= 400:
+            raise TransportError(
+                "http+sse",
+                f"HTTP {resp.status_code}: {resp.text[:500]}",
+            )
+
+        return _parse_mcp_response(resp)
 
     async def is_alive(self) -> bool:
         return self._connected
@@ -68,20 +100,47 @@ class StreamableHTTPTransport:
         self._timeout = timeout
         self._connected = False
         self._last_activity: float | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._id_counter = itertools.count(1)
 
     async def connect(self) -> None:
+        self._client = httpx.AsyncClient(timeout=self._timeout)
         self._connected = True
         self._last_activity = time.monotonic()
 
     async def disconnect(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
         self._connected = False
         self._last_activity = None
 
     async def send(self, message: dict[str, Any]) -> dict[str, Any]:
-        if not self._connected:
+        if not self._connected or self._client is None:
             raise TransportError("streamable-http", "Not connected")
         self._last_activity = time.monotonic()
-        return {"status": "ok", "id": message.get("id", "unknown")}
+
+        if "id" not in message:
+            message["id"] = next(self._id_counter)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        body = json.dumps(message)
+
+        try:
+            resp = await self._client.post(self._endpoint, content=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise TransportError("streamable-http", str(exc)) from exc
+
+        if resp.status_code >= 400:
+            raise TransportError(
+                "streamable-http",
+                f"HTTP {resp.status_code}: {resp.text[:500]}",
+            )
+
+        return _parse_mcp_response(resp)
 
     async def is_alive(self) -> bool:
         return self._connected
@@ -96,7 +155,11 @@ class StreamableHTTPTransport:
 
 
 class StdioTransport:
-    """Standard I/O transport for local MCP servers."""
+    """Standard I/O transport for local MCP servers.
+
+    Spawns a subprocess and communicates over stdin/stdout using newline-
+    delimited JSON-RPC 2.0 (the standard MCP stdio framing).
+    """
 
     def __init__(self, command: str, token: ApprovalToken, timeout: float = 30.0):
         self._command = command
@@ -104,24 +167,54 @@ class StdioTransport:
         self._timeout = timeout
         self._connected = False
         self._last_activity: float | None = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._id_counter = itertools.count(1)
 
     async def connect(self) -> None:
-        # In production, spawn subprocess
+        import shlex
+
+        parts = shlex.split(self._command)
+        self._proc = await asyncio.create_subprocess_exec(
+            *parts,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         self._connected = True
         self._last_activity = time.monotonic()
 
     async def disconnect(self) -> None:
+        if self._proc:
+            self._proc.terminate()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self._proc.kill()
+            self._proc = None
         self._connected = False
         self._last_activity = None
 
     async def send(self, message: dict[str, Any]) -> dict[str, Any]:
-        if not self._connected:
+        if not self._connected or self._proc is None or self._proc.stdin is None:
             raise TransportError("stdio", "Not connected")
         self._last_activity = time.monotonic()
-        return {"status": "ok", "id": message.get("id", "unknown")}
+
+        if "id" not in message:
+            message["id"] = next(self._id_counter)
+
+        line = json.dumps(message) + "\n"
+        self._proc.stdin.write(line.encode("utf-8"))
+        await self._proc.stdin.drain()
+
+        # Read one line of response.
+        assert self._proc.stdout is not None
+        raw = await asyncio.wait_for(self._proc.stdout.readline(), timeout=self._timeout)
+        if not raw:
+            raise TransportError("stdio", "Subprocess closed stdout")
+        return json.loads(raw.decode("utf-8").strip())
 
     async def is_alive(self) -> bool:
-        return self._connected
+        return self._connected and self._proc is not None and self._proc.returncode is None
 
     @property
     def command(self) -> str:
@@ -130,6 +223,93 @@ class StdioTransport:
     @property
     def last_activity(self) -> float | None:
         return self._last_activity
+
+
+def _parse_mcp_response(resp: httpx.Response) -> dict[str, Any]:
+    """Parse an MCP HTTP response, handling both JSON and SSE formats."""
+    content_type = resp.headers.get("content-type", "")
+
+    if "text/event-stream" in content_type:
+        # SSE: extract the first ``data:`` line containing a JSON object.
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if line.startswith("data:") and "{" in line:
+                payload = line[len("data:"):].strip()
+                if payload:
+                    return json.loads(payload)
+        raise TransportError("http", "SSE response contained no data lines")
+
+    # Default: plain JSON body.
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise TransportError("http", f"Failed to parse response: {exc}") from exc
+
+
+class MCPConnection:
+    """High-level MCP client helper wrapping a connected transport.
+
+    Provides convenience methods for the standard MCP lifecycle:
+    ``initialize`` → ``tools/list`` → ``tools/call``.
+    """
+
+    def __init__(self, transport: MCPTransport, server_id: str):
+        self._transport = transport
+        self._server_id = server_id
+        self._initialized = False
+        self._next_id = itertools.count(1)
+
+    @property
+    def server_id(self) -> str:
+        return self._server_id
+
+    @property
+    def transport(self) -> MCPTransport:
+        return self._transport
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
+    async def _send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        msg: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": next(self._next_id),
+            "method": method,
+        }
+        if params:
+            msg["params"] = params
+        return await self._transport.send(msg)
+
+    async def initialize(self) -> dict[str, Any]:
+        """Send the MCP ``initialize`` request."""
+        result = await self._send("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "pharos-discovery-sdk", "version": "0.1.0"},
+        })
+        # Send initialized notification (no id, no response expected).
+        try:
+            await self._transport.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            pass  # Best-effort notification.
+        self._initialized = True
+        return result
+
+    async def list_tools(self) -> dict[str, Any]:
+        """Send the MCP ``tools/list`` request."""
+        return await self._send("tools/list")
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a ``tools/call`` request."""
+        return await self._send("tools/call", {
+            "name": name,
+            "arguments": arguments or {},
+        })
+
+    async def close(self) -> None:
+        """Disconnect the underlying transport."""
+        await self._transport.disconnect()
 
 
 class ConnectionManager:
@@ -218,6 +398,16 @@ class ConnectionManager:
     def get_transport(self, server_id: str) -> MCPTransport | None:
         """Get the transport for a server, if connected."""
         return self._connections.get(server_id)
+
+    def get_mcp_connection(self, server_id: str) -> MCPConnection | None:
+        """Get a high-level :class:`MCPConnection` wrapper for a server.
+
+        Returns ``None`` if the server is not connected.
+        """
+        transport = self._connections.get(server_id)
+        if transport is None:
+            return None
+        return MCPConnection(transport, server_id)
 
     def _create_transport(self, card: ServerCard, token: ApprovalToken) -> MCPTransport:
         """Create the appropriate transport based on server card."""

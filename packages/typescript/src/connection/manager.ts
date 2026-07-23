@@ -10,9 +10,32 @@ export interface MCPTransport {
   readonly lastActivity: number | null;
 }
 
+/** Parse an MCP HTTP response (JSON or SSE). */
+function parseMcpResponse(resp: Response, text: string): Record<string, unknown> {
+  const contentType = resp.headers.get("content-type") ?? "";
+
+  if (contentType.includes("text/event-stream")) {
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data:") && trimmed.includes("{")) {
+        const payload = trimmed.slice(5).trim();
+        if (payload) return JSON.parse(payload);
+      }
+    }
+    throw new TransportError("http", "SSE response contained no data lines");
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (exc) {
+    throw new TransportError("http", `Failed to parse response: ${exc}`);
+  }
+}
+
 export class HttpSSETransport implements MCPTransport {
   private connected = false;
   private _lastActivity: number | null = null;
+  private idCounter = 1;
 
   constructor(
     private _endpoint: string,
@@ -46,7 +69,33 @@ export class HttpSSETransport implements MCPTransport {
   async send(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.connected) throw new TransportError("http+sse", "Not connected");
     this._lastActivity = Date.now();
-    return { status: "ok", id: (message.id as string) ?? "unknown" };
+
+    if (!("id" in message)) {
+      message.id = this.idCounter++;
+    }
+
+    let resp: Response;
+    try {
+      resp = await fetch(this._endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(this._timeout),
+      });
+    } catch (exc) {
+      throw new TransportError("http+sse", String(exc));
+    }
+
+    if (resp.status >= 400) {
+      const detail = await resp.text().catch(() => "");
+      throw new TransportError("http+sse", `HTTP ${resp.status}: ${detail.slice(0, 500)}`);
+    }
+
+    const text = await resp.text();
+    return parseMcpResponse(resp, text);
   }
 
   async isAlive(): Promise<boolean> {
@@ -57,6 +106,7 @@ export class HttpSSETransport implements MCPTransport {
 export class StreamableHTTPTransport implements MCPTransport {
   private connected = false;
   private _lastActivity: number | null = null;
+  private idCounter = 1;
 
   constructor(
     private _endpoint: string,
@@ -90,7 +140,33 @@ export class StreamableHTTPTransport implements MCPTransport {
   async send(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.connected) throw new TransportError("streamable-http", "Not connected");
     this._lastActivity = Date.now();
-    return { status: "ok", id: (message.id as string) ?? "unknown" };
+
+    if (!("id" in message)) {
+      message.id = this.idCounter++;
+    }
+
+    let resp: Response;
+    try {
+      resp = await fetch(this._endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(this._timeout),
+      });
+    } catch (exc) {
+      throw new TransportError("streamable-http", String(exc));
+    }
+
+    if (resp.status >= 400) {
+      const detail = await resp.text().catch(() => "");
+      throw new TransportError("streamable-http", `HTTP ${resp.status}: ${detail.slice(0, 500)}`);
+    }
+
+    const text = await resp.text();
+    return parseMcpResponse(resp, text);
   }
 
   async isAlive(): Promise<boolean> {
@@ -101,6 +177,8 @@ export class StreamableHTTPTransport implements MCPTransport {
 export class StdioTransport implements MCPTransport {
   private connected = false;
   private _lastActivity: number | null = null;
+  private idCounter = 1;
+  private proc: { kill: () => void } | null = null;
 
   constructor(
     private _command: string,
@@ -122,11 +200,17 @@ export class StdioTransport implements MCPTransport {
   }
 
   async connect(): Promise<void> {
+    // In Node.js environments with child_process, stdio would spawn a
+    // subprocess. In browsers/edge runtimes this is a no-op stub.
     this.connected = true;
     this._lastActivity = Date.now();
   }
 
   async disconnect(): Promise<void> {
+    if (this.proc) {
+      try { this.proc.kill(); } catch { /* ignore */ }
+      this.proc = null;
+    }
     this.connected = false;
     this._lastActivity = null;
   }
@@ -134,11 +218,90 @@ export class StdioTransport implements MCPTransport {
   async send(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.connected) throw new TransportError("stdio", "Not connected");
     this._lastActivity = Date.now();
-    return { status: "ok", id: (message.id as string) ?? "unknown" };
+    if (!("id" in message)) {
+      message.id = this.idCounter++;
+    }
+    // Stub — real stdio I/O requires Node child_process (platform-specific).
+    return { jsonrpc: "2.0", id: message.id, result: { ok: true } };
   }
 
   async isAlive(): Promise<boolean> {
     return this.connected;
+  }
+}
+
+/**
+ * High-level MCP client helper wrapping a connected transport.
+ *
+ * Provides convenience methods for the standard MCP lifecycle:
+ * `initialize` → `tools/list` → `tools/call`.
+ */
+export class MCPConnection {
+  private _initialized = false;
+  private nextId = 1;
+
+  constructor(
+    private _transport: MCPTransport,
+    private _serverId: string,
+  ) {}
+
+  get serverId(): string {
+    return this._serverId;
+  }
+
+  get transport(): MCPTransport {
+    return this._transport;
+  }
+
+  get initialized(): boolean {
+    return this._initialized;
+  }
+
+  private async _send(
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const msg: Record<string, unknown> = {
+      jsonrpc: "2.0",
+      id: this.nextId++,
+      method,
+    };
+    if (params) msg.params = params;
+    return this._transport.send(msg);
+  }
+
+  async initialize(): Promise<Record<string, unknown>> {
+    const result = await this._send("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "pharos-discovery-sdk", version: "0.1.0" },
+    });
+    // Send initialized notification (best-effort).
+    try {
+      await this._transport.send({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      });
+    } catch {
+      // Best-effort notification.
+    }
+    this._initialized = true;
+    return result;
+  }
+
+  async listTools(): Promise<Record<string, unknown>> {
+    return this._send("tools/list");
+  }
+
+  async callTool(
+    name: string,
+    args?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this._send("tools/call", { name, arguments: args ?? {} });
+  }
+
+  async close(): Promise<void> {
+    await this._transport.disconnect();
   }
 }
 
@@ -234,6 +397,12 @@ export class ConnectionManager {
 
   getTransport(serverId: string): MCPTransport | null {
     return this.connections.get(serverId) ?? null;
+  }
+
+  getMcpConnection(serverId: string): MCPConnection | null {
+    const transport = this.connections.get(serverId);
+    if (!transport) return null;
+    return new MCPConnection(transport, serverId);
   }
 
   private createTransport(card: ServerCard, token: ApprovalToken): MCPTransport {

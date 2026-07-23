@@ -94,11 +94,18 @@ describe("E2E: Full Discovery Flow", () => {
     expect(approvalHandler.calls[0].purpose).toBe("Search for flights to Tokyo");
     expect(connectionManager.activeCount).toBe(1);
 
-    // Send
+    // Send — mock fetch to handle POST for real transport
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ jsonrpc: "2.0", id: 1, result: { status: "ok" } }),
+      text: async () => JSON.stringify({ jsonrpc: "2.0", id: 1, result: { status: "ok" } }),
+      headers: new Map([["content-type", "application/json"]]),
+    }) as any;
     const response = await connectionManager.send("urn:pharos:server-001", {
       id: "req-1", method: "search", params: { destination: "Tokyo" },
     });
-    expect(response.status).toBe("ok");
+    expect((response as any).result.status).toBe("ok");
 
     // Check scope
     await expect(client.checkScope("urn:pharos:server-001", "flights:search")).resolves.toBeUndefined();
