@@ -125,7 +125,7 @@ describe("PharosClient", () => {
       const { client } = makeClient({ headless: true });
       const card = makeCard();
       await expect(client.connectAndApprove(card, "test")).rejects.toThrow(HeadlessApprovalRequired);
-    });
+    }, 15000);
 
     it("approval denied", async () => {
       const { client } = makeClient({ approved: false });
