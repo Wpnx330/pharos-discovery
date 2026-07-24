@@ -1,5 +1,6 @@
 import { PharosRegistryAdapter, type SearchResult, type SearchFilters } from "./adapters/registry.js";
 import { ServerCardCache } from "./cache.js";
+import { OAuthFlowHandler } from "./connection/oauth/handler.js";
 import {
   ApprovalDenied,
   ConnectionFailed,
@@ -47,14 +48,30 @@ export class PharosClient {
   private approvedServers: Map<string, ApprovalToken> = new Map();
   private connections: Map<string, unknown> = new Map();
   private blocklist: Set<string> | null = null;
+  private _oauthHandler: OAuthFlowHandler | null = null;
+  private _registryUrl: string;
+  private _apiKey: string | null;
 
   constructor(registryUrl: string, options: PharosClientOptions = {}) {
+    this._registryUrl = registryUrl.replace(/\/+$/, "");
+    this._apiKey = options.apiKey ?? null;
     this.adapter = new PharosRegistryAdapter(registryUrl, { apiKey: options.apiKey });
     this.cache = new ServerCardCache<ServerCard>(options.cacheTtl ?? 300);
     this.headlessMode = options.headless ?? false;
     this.maxNovel = options.maxNovelApprovals ?? 5;
     this.approvalHandler = options.approvalHandler ?? null;
     this.connectionHandler = options.connectionHandler ?? null;
+  }
+
+  /** Lazy-initialized OAuth flow handler (agent-side, §18.5-18.6). */
+  get oauth(): OAuthFlowHandler {
+    if (!this._oauthHandler) {
+      this._oauthHandler = new OAuthFlowHandler(
+        this._registryUrl,
+        { apiKey: this._apiKey ?? undefined },
+      );
+    }
+    return this._oauthHandler;
   }
 
   get isHeadless(): boolean {

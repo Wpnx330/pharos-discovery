@@ -6,6 +6,7 @@ from typing import Any, Literal, Protocol
 
 from pharos_discovery.adapters.registry import PharosRegistryAdapter, SearchResult
 from pharos_discovery.cache import ServerCardCache
+from pharos_discovery.connection.oauth import OAuthFlowHandler
 from pharos_discovery.errors import (
     ApprovalDenied,
     ConnectionFailed,
@@ -77,6 +78,25 @@ class PharosClient:
         self._approved_servers: dict[str, ApprovalToken] = {}
         self._connections: dict[str, Any] = {}
         self._blocklist: set[str] | None = None
+        self._oauth_handler: OAuthFlowHandler | None = None
+
+    @property
+    def oauth(self) -> OAuthFlowHandler:
+        """Return an :class:`OAuthFlowHandler` for inline OAuth flows.
+
+        Lazily initialized on first access.  The handler uses the same
+        registry URL and API key as the parent client.
+
+        Usage::
+
+            result = await client.oauth.connect("io.salesforce/salesforce-mcp")
+        """
+        if self._oauth_handler is None:
+            self._oauth_handler = OAuthFlowHandler(
+                self._adapter.base_url,
+                api_key=self._adapter._api_key,
+            )
+        return self._oauth_handler
 
     @property
     def headless(self) -> bool:

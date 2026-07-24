@@ -11,6 +11,12 @@ from pharos_discovery.approval import (
     HeadlessPolicy,
 )
 from pharos_discovery.plan import PlanApproval, PlanReviewer
+from pharos_discovery.connection.oauth import (
+    BrowserOAuthRenderer,
+    OAuthFlowHandler,
+    OAuthRenderer,
+    TerminalOAuthRenderer,
+)
 from pharos_discovery.models import (
     InstallPlan,
     PlanReview,
@@ -21,6 +27,7 @@ from pharos_discovery.models import (
 __all__ = [
     "ApprovalEngine",
     "Blocklist",
+    "BrowserOAuthRenderer",
     "ConsentRecord",
     "ConsentStore",
     "EVENT_TYPES",
@@ -29,10 +36,13 @@ __all__ = [
     "HeadlessPolicy",
     "InstallPlan",
     "KeyPinStore",
+    "OAuthFlowHandler",
+    "OAuthRenderer",
     "PlanApproval",
     "PlanReview",
     "PlanReviewer",
     "RiskLevel",
     "SSEEvent",
     "ServerInstallEntry",
+    "TerminalOAuthRenderer",
 ]

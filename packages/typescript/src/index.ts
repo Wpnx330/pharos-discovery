@@ -21,3 +21,6 @@ export { Blocklist } from "./security/blocklist.js";
 export { KeyPinStore } from "./security/key-pinning.js";
 export { EventSubscriber, EVENT_TYPES } from "./events/subscriber.js";
 export type { EventType, SSEEvent, ParsedEvent } from "./events/subscriber.js";
+export { OAuthFlowHandler, TerminalOAuthRenderer, BrowserOAuthRenderer, OAuthServerConfig } from "./connection/oauth/handler.js";
+export { generatePkceVerifier, computePkceChallenge, generateStateNonce } from "./connection/oauth/handler.js";
+export type { OAuthRenderer, OAuthFlowHandlerOptions, BuildAuthorizeUrlResult, RawOAuthConfig } from "./connection/oauth/handler.js";
