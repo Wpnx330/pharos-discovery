@@ -66,12 +66,12 @@ function normalizeToServerCard(item: Record<string, any>, sourceRegistry: string
   }
   const auth: AuthSpec = { type: authType as "none" | "api_key" | "oauth" | "mtls" };
 
-  // Transport
+  // Transport — accept both "http-sse" (registry API) and "http+sse" (MCP spec)
   let rawTransports = item.transport ?? item.transports ?? [];
   if (typeof rawTransports === "string") rawTransports = [rawTransports];
-  let transports = (rawTransports as unknown[]).filter((t) =>
-    ["stdio", "http+sse", "streamable-http"].includes(t as string)
-  ) as ("stdio" | "http+sse" | "streamable-http")[];
+  let transports = (rawTransports as unknown[])
+    .filter((t) => ["stdio", "http+sse", "http-sse", "streamable-http"].includes(t as string))
+    .map((t) => (t === "http-sse" ? "http+sse" : t)) as ("stdio" | "http+sse" | "streamable-http")[];
   if (transports.length === 0) transports = ["stdio"];
 
   // Endpoint / stdio command
@@ -98,9 +98,11 @@ function normalizeToServerCard(item: Record<string, any>, sourceRegistry: string
     }
 
     const manifestTransport = manifest.transport;
-    if (typeof manifestTransport === "string" &&
-        ["stdio", "http+sse", "streamable-http"].includes(manifestTransport)) {
-      transports = [manifestTransport as "stdio" | "http+sse" | "streamable-http"];
+    if (typeof manifestTransport === "string") {
+      const normalised = manifestTransport === "http-sse" ? "http+sse" : manifestTransport;
+      if (["stdio", "http+sse", "streamable-http"].includes(normalised)) {
+        transports = [normalised as "stdio" | "http+sse" | "streamable-http"];
+      }
     }
 
     if (latestEntry.version && version === "0.0.0") {

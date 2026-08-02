@@ -264,11 +264,14 @@ class MCPOfficialAdapter:
             contact=pub_raw.get("contact"),
         )
 
-        # Transport — MCP registry may store as "transports" or "transport"
+        # Transport — MCP registry may store as "transports" or "transport".
+        # Accept both "http-sse" (registry API) and "http+sse" (MCP spec).
         raw_transports = raw.get("transports") or raw.get("transport") or []
         if isinstance(raw_transports, str):
             raw_transports = [raw_transports]
-        transports = [t for t in raw_transports if t in ("stdio", "http+sse", "streamable-http")]
+        _VALID = ("stdio", "http+sse", "http-sse", "streamable-http")
+        transports = [t for t in raw_transports if t in _VALID]
+        transports = ["http+sse" if t == "http-sse" else t for t in transports]
         if not transports:
             transports = ["http+sse"]
 

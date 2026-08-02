@@ -212,12 +212,12 @@ export class MCPOfficialAdapter {
       contact: pubRaw.contact ?? undefined,
     };
 
-    // Transport
+    // Transport — accept both "http-sse" (registry API) and "http+sse" (MCP spec)
     const rawTransports: unknown[] = raw.transports ?? raw.transport ?? [];
-    const validTransports = ["stdio", "http+sse", "streamable-http"] as const;
-    let transports = (rawTransports as string[]).filter((t) =>
-      validTransports.includes(t as (typeof validTransports)[number]),
-    );
+    const validTransports = ["stdio", "http+sse", "http-sse", "streamable-http"] as const;
+    let transports = (rawTransports as string[])
+      .filter((t) => validTransports.includes(t as (typeof validTransports)[number]))
+      .map((t) => (t === "http-sse" ? "http+sse" : t));
     if (transports.length === 0) {
       transports = ["http+sse"];
     }

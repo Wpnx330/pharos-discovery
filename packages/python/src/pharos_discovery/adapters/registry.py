@@ -73,11 +73,15 @@ def _normalize_to_server_card(
         auth_type = "none"
     auth = AuthSpec(type=auth_type)  # type: ignore[arg-type]
 
-    # Transport
+    # Transport — accept both "http-sse" (registry API format) and
+    # "http+sse" (MCP spec format) as equivalent.
     raw_transports = item.get("transport") or item.get("transports") or []
     if isinstance(raw_transports, str):
         raw_transports = [raw_transports]
-    transports = [t for t in raw_transports if t in ("stdio", "http+sse", "streamable-http")]
+    _VALID = ("stdio", "http+sse", "http-sse", "streamable-http")
+    transports = [t for t in raw_transports if t in _VALID]
+    # Normalise http-sse → http+sse for internal consistency.
+    transports = ["http+sse" if t == "http-sse" else t for t in transports]
     if not transports:
         transports = ["stdio"]
 
@@ -104,8 +108,12 @@ def _normalize_to_server_card(
         if isinstance(manifest_caps, list):
             capabilities = [str(c) for c in manifest_caps]
         manifest_transport = manifest.get("transport")
-        if isinstance(manifest_transport, str) and manifest_transport in ("stdio", "http+sse", "streamable-http"):
-            transports = [manifest_transport]
+        if isinstance(manifest_transport, str):
+            # Normalise http-sse → http+sse.
+            if manifest_transport == "http-sse":
+                manifest_transport = "http+sse"
+            if manifest_transport in ("stdio", "http+sse", "streamable-http"):
+                transports = [manifest_transport]
         # Use the latest version string if the top-level version was a default.
         if latest_entry.get("version") and version == "0.0.0":
             version = latest_entry["version"]
