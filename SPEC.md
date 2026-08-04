@@ -2124,4 +2124,234 @@ The lowest-trust OAuth path is a `referenced` server with only DCR support (lega
 
 ---
 
-**End of SPEC.md — Pharos Discovery v0.4.0 (Draft)**
+## 18. PHAROS Discovery MCP Server
+
+The PHAROS Discovery MCP Server turns PHAROS *itself* into an MCP server. Any MCP-compatible client — Claude Desktop, LibreChat, VS Code, Cursor — can connect to it and gain discovery capabilities: searching the registry, installing servers, connecting with visual consent, and calling tools on discovered servers.
+
+This is the component that makes PHAROS universally accessible. Instead of requiring each agent platform to integrate the PHAROS SDK natively, the MCP server exposes discovery as standard MCP tools. If your app speaks MCP, it gets PHAROS for free.
+
+### 18.1 Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ MCP CLIENT (Claude Desktop / LibreChat / VS Code / Cursor)       │
+│                                                                  │
+│  User: "echo Hello from PHAROS!"                                 │
+│  AI sees pharos_* tools → calls them → renders UI if attached    │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ MCP protocol (stdio / SSE / streamable-http)
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ PHAROS Discovery MCP Server                                      │
+│ (pharos_discovery.mcp_server — wraps PharosClient)               │
+│                                                                  │
+│  Tools:                    Resources (MCP Apps):                 │
+│  ┌──────────────────────┐  ┌──────────────────────────────────┐ │
+│  │ pharos_search        │  │ ui://pharos/results  (search UI) │ │
+│  │ pharos_install       │  │ ui://pharos/approval (consent UI)│ │
+│  │ pharos_connect       │  │ ui://pharos/oauth    (OAuth UI)  │ │
+│  │ pharos_list_tools    │  └──────────────────────────────────┘ │
+│  │ pharos_call_tool     │                                       │
+│  └──────────────────────┘  _meta.ui.resourceUri on search+connect│
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ HTTP
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ PHAROS Registry (getpharos.dev) + Local MCP Servers              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The MCP server is a thin wrapper around `PharosClient` (§8). It does not reimplement discovery, approval, or connection logic — it delegates to the SDK. The value is in the MCP protocol surface: standard JSON-RPC tools and resources that any MCP client can consume.
+
+### 18.2 Tool definitions
+
+Five tools are exposed. Each returns JSON as text content.
+
+#### `pharos_search(query: string, limit?: int) → string`
+
+Searches the PHAROS registry for MCP servers matching the query.
+
+- **Input:** `query` (natural language), `limit` (1–50, default 10)
+- **Output:** `{"results": [{id, name, description, version, transport, publisher, tools_count, capabilities, endpoint}], "count": N}`
+- **Errors:** `{"results": [], "message": "No servers found."}` on empty; `{"error": "..."}` on registry failure
+- **MCP Apps:** `_meta.ui.resourceUri = "ui://pharos/results"` — host renders search results as clickable cards
+
+#### `pharos_install(server_id: string) → string`
+
+Installs an MCP server from the registry to the local machine via the `pharos` CLI.
+
+- **Input:** `server_id` (registry ID)
+- **Output:** `{"status": "installed", "server_id": "...", "output": "..."}`
+- **Errors:** `{"error": "Install failed", "stderr": "..."}` on failure; `{"error": "Install timed out"}` after 120s
+
+#### `pharos_connect(server_id: string, purpose?: string) → string`
+
+Connects to a running MCP server after user approval. Triggers the MCP Apps approval UI.
+
+- **Input:** `server_id`, `purpose` (shown to user in approval card, default "User request")
+- **Output:** `{"status": "connected", "server_id": "...", "endpoint": "...", "tools_count": N, "tools": [...]}`
+- **Errors:** `{"error": "Connection denied by user"}`, `{"error": "Connection failed: ..."}`
+- **MCP Apps:** `_meta.ui.resourceUri = "ui://pharos/approval"` — host renders approval card with Approve/Deny buttons
+- **Local endpoint resolution:** If the server card has no `endpoint` (registry stores packages, not live endpoints), the tool checks `~/.pharos/run/<server-id>.pid` and `ss -tlnp` to find the local port
+
+#### `pharos_list_tools(server_id: string) → string`
+
+Lists available tools on a connected server.
+
+- **Input:** `server_id` (must be already connected via `pharos_connect`)
+- **Output:** `{"server_id": "...", "tools": [{name, description, input_schema}], "count": N}`
+- **Errors:** `{"error": "Not connected. Use pharos_connect first."}`
+
+#### `pharos_call_tool(server_id: string, tool_name: string, arguments?: object) → string`
+
+Calls a tool on a connected MCP server.
+
+- **Input:** `server_id`, `tool_name`, `arguments` (JSON object passed to the tool)
+- **Output:** `{"server_id": "...", "tool": "...", "result": ...}`
+- **Errors:** `{"error": "Not connected..."}`, `{"error": "Tool call failed: ..."}`
+
+### 18.3 MCP Apps integration
+
+The server implements the MCP Apps extension (stable: 2026-01-26, extension ID: `io.modelcontextprotocol/ui`).
+
+#### How it works
+
+1. **Tool declares UI:** Tools that benefit from visual interaction set `_meta.ui.resourceUri` on their tool definition. The host sees this metadata during `tools/list`.
+2. **Host fetches HTML:** After a tool call, the host fetches the declared resource via `resources/read`. The resource is returned with MIME type `text/html;profile=mcp-app`.
+3. **Host renders iframe:** The HTML is rendered in a sandboxed iframe inline in the conversation. The iframe has no direct access to the MCP server — it communicates through the host.
+4. **JSON-RPC bridge:** The iframe communicates with the host via `postMessage` using JSON-RPC 2.0. The host forwards tool calls to the MCP server and returns results to the iframe.
+
+#### UI Resources
+
+| URI | MIME Type | Purpose | Triggered By |
+|---|---|---|---|
+| `ui://pharos/results` | `text/html;profile=mcp-app` | Search results gallery — clickable server cards | `pharos_search` |
+| `ui://pharos/approval` | `text/html;profile=mcp-app` | Server approval card — Approve/Deny buttons, publisher verification, scopes | `pharos_connect` |
+| `ui://pharos/oauth` | `text/html;profile=mcp-app` | OAuth consent screen — scope list, Authorize/Cancel buttons | OAuth-requiring servers |
+
+#### Approval flow (MCP Apps)
+
+The approval flow replaces the terminal `y/N` prompt from the test agent (§7) with a visual card:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 🔒 PHAROS — Approval Required                           │
+│                                                         │
+│ Purpose: User request to echo a message                 │
+│                                                         │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ test-echo-server  v0.2.2                            │ │
+│ │ Publisher: Wpnx330 ✓ verified                       │ │
+│ │ Version: 0.2.2                                      │ │
+│ │ Transport: http+sse                                 │ │
+│ │ Endpoint: http://127.0.0.1:8765                     │ │
+│ │ Requested Scopes: [tools:call]                      │ │
+│ └─────────────────────────────────────────────────────┘ │
+│                                                         │
+│        [Deny]           [Approve Connection]            │
+└─────────────────────────────────────────────────────────┘
+```
+
+The iframe sends the user's response back via `notifications/tool_result` postMessage:
+```json
+{"jsonrpc": "2.0", "method": "notifications/tool_result", "params": {"approved": true}}
+```
+
+#### OAuth flow (MCP Apps)
+
+For servers requiring OAuth (§17), the `ui://pharos/oauth` resource renders an OAuth consent screen. The user sees the requested scopes and clicks Authorize/Cancel — they never leave the chat to log in. This implements the inline OAuth UX described in §17.1(6).
+
+### 18.4 Transport
+
+| Transport | Use Case | Configuration |
+|---|---|---|
+| **stdio** (default) | Local use — Claude Desktop, VS Code, Cursor | Client launches server as subprocess |
+| **SSE** | Remote use — LibreChat, web-based clients | `PHAROS_MCP_TRANSPORT=sse PHAROS_MCP_HOST=0.0.0.0 PHAROS_MCP_PORT=8766` |
+| **streamable-http** | Newer MCP clients preferring HTTP streaming | `PHAROS_MCP_TRANSPORT=streamable-http` |
+
+The server uses the MCP Python SDK's `FastMCP` class, which supports all three transports. Host and port for network transports are configured via the server's `settings` object (env vars `PHAROS_MCP_HOST`, `PHAROS_MCP_PORT`).
+
+### 18.5 Configuration
+
+The server is configured via environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PHAROS_REGISTRY_URL` | `https://getpharos.dev` | Registry API base URL |
+| `PHAROS_CLI` | `pharos` | Path to the `pharos` CLI binary (for `pharos_install`) |
+| `PHAROS_MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, or `streamable-http` |
+| `PHAROS_MCP_HOST` | `0.0.0.0` | Bind host (SSE/streamable-http only) |
+| `PHAROS_MCP_PORT` | `8766` | Bind port (SSE/streamable-http only) |
+
+### 18.6 Client configuration examples
+
+#### Claude Desktop (`claude_desktop_config.json`)
+
+```json
+{
+  "mcpServers": {
+    "pharos": {
+      "command": "python3",
+      "args": ["-m", "pharos_discovery.mcp_server"],
+      "env": {
+        "PYTHONPATH": "/path/to/pharos-discovery/packages/python/src",
+        "PHAROS_REGISTRY_URL": "https://getpharos.dev"
+      }
+    }
+  }
+}
+```
+
+#### LibreChat (`librechat.yaml`)
+
+```yaml
+mcpServers:
+  pharos:
+    command: python3
+    args:
+      - -c
+      - "from pharos_discovery.mcp_server.server import main; main()"
+    env:
+      PYTHONPATH: /path/to/pharos-discovery/packages/python/src
+      PHAROS_REGISTRY_URL: https://getpharos.dev
+      PHAROS_CLI: /home/user/.local/bin/pharos
+```
+
+### 18.7 Security
+
+- **Sandboxed iframe:** MCP Apps iframes use `sandbox="allow-scripts"` by default. No external network access, no top-navigation, no same-origin access.
+- **CSP:** Content Security Policy defaults to `default-src 'self'` — no external resources loaded.
+- **Approval enforcement:** The `pharos_connect` tool requires user approval before establishing any connection. In headless mode (no MCP Apps support), the tool returns an error — connections are never silently established.
+- **No token exposure:** The MCP server holds connections in memory for the session. No tokens or secrets are persisted to disk.
+
+### 18.8 Relationship to existing SDK
+
+The MCP server **is** the SDK, wrapped as an MCP server. It does not replace `PharosClient` — it delegates to it:
+
+| SDK Component | MCP Server Usage |
+|---|---|
+| `PharosClient.search()` | `pharos_search` tool |
+| `pharos install` CLI | `pharos_install` tool (subprocess) |
+| `ConnectionManager.connect()` | `pharos_connect` tool |
+| `MCPTransport.list_tools()` | `pharos_list_tools` tool |
+| `MCPTransport.call_tool()` | `pharos_call_tool` tool |
+| `ApprovalEngine` | Visual approval via MCP Apps iframe |
+
+Agent builders who want fine-grained control still use the SDK directly (§8). Agent platforms that speak MCP get discovery for free via this server.
+
+### 18.9 Compatibility
+
+| Client | MCP Apps Support | PHAROS MCP Server |
+|---|---|---|
+| Claude Desktop | ✅ Native | ✅ stdio |
+| VS Code Insiders | ✅ Native | ✅ stdio |
+| LibreChat (nazq fork) | ✅ Fork (v0.8.2) | ✅ stdio |
+| LibreChat (upstream) | ❌ RFC pending | ⚠️ Tools work, no visual UI |
+| Cursor | ⚠️ Unknown | ⚠️ Untested |
+| Any MCP client | Tools always work | MCP Apps UI requires client support |
+
+**Key insight:** The PHAROS MCP server degrades gracefully. Clients without MCP Apps support still see all 5 tools and can call them — they just don't get the visual approval/search UI. The tool returns JSON with the relevant information, and the client can render it however it likes (text, card, custom UI).
+
+---
+
+**End of SPEC.md — Pharos Discovery v0.5.0 (Draft)**
