@@ -56,6 +56,72 @@ const engine = new ApprovalEngine({ secret: "your-hmac-secret" });
 const token = engine.signToken({ serverId: "fs-server", scopes: ["read"] });
 ```
 
+## MCP Server
+
+The `pharos_discovery.mcp_server` package exposes the SDK as an MCP server, so any MCP-compatible client (Claude Desktop, LibreChat, VS Code, Hermes Agent) can search, install, approve, and connect to MCP servers directly from chat.
+
+### Quick Start
+
+```bash
+pip install pharos-discovery
+python3 -m pharos_discovery.mcp_server
+```
+
+Add to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "pharos": {
+      "command": "python3",
+      "args": ["-m", "pharos_discovery.mcp_server"]
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `pharos_search` | Search the registry for MCP servers (natural-language query) |
+| `pharos_install` | Install an MCP server to the local machine via the `pharos` CLI |
+| `pharos_connect` | Connect to a running server after user approval (MCP Apps UI) |
+| `pharos_list_tools` | List tools available on a connected server |
+| `pharos_call_tool` | Call a tool on a connected server with arbitrary arguments |
+
+### MCP Apps UI Resources
+
+The server ships three sandboxed-iframe UI resources (MCP Apps, `io.modelcontextprotocol/ui`):
+
+- `ui://pharos/results` — search results gallery (clickable cards)
+- `ui://pharos/approval` — server approval card (Approve/Deny)
+- `ui://pharos/oauth` — OAuth consent screen
+
+### Transport
+
+Transport defaults to **stdio** (for local clients). Set `PHAROS_MCP_TRANSPORT` for network transports:
+
+```bash
+# SSE (for LibreChat, web clients)
+PHAROS_MCP_TRANSPORT=sse PHAROS_MCP_HOST=0.0.0.0 PHAROS_MCP_PORT=8766 \
+  python3 -m pharos_discovery.mcp_server
+
+# Streamable HTTP (newer MCP clients)
+PHAROS_MCP_TRANSPORT=streamable-http PHAROS_MCP_PORT=8766 \
+  python3 -m pharos_discovery.mcp_server
+```
+
+### Configuration
+
+| Env Var | Default | Description |
+|---|---|---|
+| `PHAROS_REGISTRY_URL` | `https://getpharos.dev` | Registry base URL |
+| `PHAROS_CLI` | `pharos` | Path to the `pharos` CLI binary (used by `pharos_install`) |
+| `PHAROS_MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, or `streamable-http` |
+| `PHAROS_MCP_HOST` | `0.0.0.0` | Bind host (SSE / streamable-http only) |
+| `PHAROS_MCP_PORT` | `8766` | Bind port (SSE / streamable-http only) |
+
 ## Architecture
 
 The SDK is a monorepo with parallel implementations:
