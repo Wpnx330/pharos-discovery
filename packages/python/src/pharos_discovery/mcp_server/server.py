@@ -198,8 +198,22 @@ APPROVAL_HTML = """<!DOCTYPE html>
     document.getElementById("purpose").textContent = "Purpose: " + (data.purpose || "User request");
     document.getElementById("server-name").textContent = s.display_name || s.name || s.id;
     document.getElementById("server-id").textContent = s.id;
-    document.getElementById("publisher").innerHTML = (s.publisher?.name || "unknown") +
-      (s.publisher?.verified ? ' <span class="badge badge-verified">✓ verified</span>' : '<span class="badge badge-warning">unverified</span>');
+    // Use textContent for user-controlled data, innerHTML only for static HTML structure
+    const pubEl = document.getElementById("publisher");
+    pubEl.textContent = s.publisher?.name || "unknown";
+    if (s.publisher?.verified) {
+      const badge = document.createElement("span");
+      badge.className = "badge badge-verified";
+      badge.textContent = "✓ verified";
+      pubEl.appendChild(document.createTextNode(" "));
+      pubEl.appendChild(badge);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "badge badge-warning";
+      badge.textContent = "unverified";
+      pubEl.appendChild(document.createTextNode(" "));
+      pubEl.appendChild(badge);
+    }
     document.getElementById("version").textContent = s.version || "N/A";
     document.getElementById("transport").textContent = (s.transport || []).join(", ") || "N/A";
     document.getElementById("endpoint").textContent = s.endpoint || "N/A";
@@ -207,8 +221,19 @@ APPROVAL_HTML = """<!DOCTYPE html>
     const scopesEl = document.getElementById("scopes");
     const scopes = data.scopes || s.scopes || [];
     if (scopes.length) {
-      scopesEl.innerHTML = '<div class="detail-label" style="margin-bottom:6px">Requested Scopes</div>' +
-        scopes.map(s => `<span class="scope-chip">${s}</span>`).join("");
+      // Build scopes safely with DOM APIs to prevent XSS
+      const label = document.createElement("div");
+      label.className = "detail-label";
+      label.style.marginBottom = "6px";
+      label.textContent = "Requested Scopes";
+      scopesEl.innerHTML = "";
+      scopesEl.appendChild(label);
+      scopes.forEach(sc => {
+        const chip = document.createElement("span");
+        chip.className = "scope-chip";
+        chip.textContent = sc;
+        scopesEl.appendChild(chip);
+      });
     }
   }
 
@@ -318,20 +343,55 @@ RESULTS_HTML = """<!DOCTYPE html>
       document.getElementById("empty").style.display = "block";
       return;
     }
-    container.innerHTML = results.map((r, i) => `
-      <div class="result-card" data-id="${r.id}" data-index="${i}">
-        <div class="result-name">${r.display_name || r.name || r.id}</div>
-        <div class="result-desc">${r.description || ''}</div>
-        <div class="result-meta">
-          <span>${r.version || 'v?'}</span>
-          <span>${(r.transport || []).join(', ')}</span>
-          <span>${r.publisher?.name || 'unknown'}
-            ${r.publisher?.verified ? '<span class="badge badge-verified">✓</span>' : ''}
-          </span>
-          ${r.tools_count ? `<span class="badge badge-tools">${r.tools_count} tools</span>` : ''}
-        </div>
-      </div>
-    `).join("");
+    // Build result cards with DOM APIs to prevent XSS from registry data
+    container.innerHTML = "";
+    results.forEach((r, i) => {
+      const card = document.createElement("div");
+      card.className = "result-card";
+      card.dataset.id = r.id;
+      card.dataset.index = i;
+
+      const name = document.createElement("div");
+      name.className = "result-name";
+      name.textContent = r.display_name || r.name || r.id;
+      card.appendChild(name);
+
+      const desc = document.createElement("div");
+      desc.className = "result-desc";
+      desc.textContent = r.description || "";
+      card.appendChild(desc);
+
+      const meta = document.createElement("div");
+      meta.className = "result-meta";
+
+      const ver = document.createElement("span");
+      ver.textContent = r.version || "v?";
+      meta.appendChild(ver);
+
+      const tr = document.createElement("span");
+      tr.textContent = (r.transport || []).join(", ");
+      meta.appendChild(tr);
+
+      const pub = document.createElement("span");
+      pub.textContent = r.publisher?.name || "unknown";
+      if (r.publisher?.verified) {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-verified";
+        badge.textContent = "✓";
+        pub.appendChild(document.createTextNode(" "));
+        pub.appendChild(badge);
+      }
+      meta.appendChild(pub);
+
+      if (r.tools_count) {
+        const tb = document.createElement("span");
+        tb.className = "badge badge-tools";
+        tb.textContent = r.tools_count + " tools";
+        meta.appendChild(tb);
+      }
+      card.appendChild(meta);
+      container.appendChild(card);
+    });
 
     document.querySelectorAll(".result-card").forEach(card => {
       card.addEventListener("click", () => {
@@ -435,8 +495,18 @@ OAUTH_HTML = """<!DOCTYPE html>
       document.getElementById("server-name").textContent = d.server_name || "Server";
       document.getElementById("info").textContent = d.server_name + " is requesting access to your account.";
       const scopes = d.scopes || [];
-      document.getElementById("scopes").innerHTML = scopes.map(s =>
-        `<li class="scope-item"><span class="scope-icon">→</span> ${s}</li>`).join("");
+      const scopesEl = document.getElementById("scopes");
+      scopesEl.innerHTML = "";
+      scopes.forEach(s => {
+        const li = document.createElement("li");
+        li.className = "scope-item";
+        const icon = document.createElement("span");
+        icon.className = "scope-icon";
+        icon.textContent = "→";
+        li.appendChild(icon);
+        li.appendChild(document.createTextNode(" " + s));
+        scopesEl.appendChild(li);
+      });
     }
   });
 
@@ -644,9 +714,12 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
     # iframe and the user clicks Approve/Deny. The result comes back via
     # the JSON-RPC bridge. Here we return the data; the _meta.ui.resourceUri
     # tells the host to render ui://pharos/approval with this data.
-    # For now, we auto-approve in non-interactive mode and return the data
-    # for the UI to render.
-    approved = True  # In production, this comes from the UI bridge
+    #
+    # TODO(security): For now, we auto-approve in non-interactive mode.
+    # In production, this must be replaced with a blocking call that waits
+    # for the user's Approve/Deny response from the MCP Apps UI bridge.
+    # Until then, pharos_connect grants access without user consent.
+    approved = True
 
     if not approved:
         return json.dumps({"error": "Connection denied by user", "server_id": server_id})
@@ -776,8 +849,10 @@ async def _resolve_local_endpoint(server_id: str) -> str | None:
     import os.path
 
     # Check pharos run directory for PID file
+    # Sanitize server_id to prevent path traversal (e.g. "../../etc/passwd")
+    safe_id = os.path.basename(server_id)
     run_dir = os.path.expanduser("~/.pharos/run")
-    pid_file = os.path.join(run_dir, f"{server_id}.pid")
+    pid_file = os.path.join(run_dir, f"{safe_id}.pid")
 
     if not os.path.exists(pid_file):
         return None
