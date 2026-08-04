@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy the Python package
+COPY packages/python/ ./
+
+# Install mcp SDK v1.x (FastMCP API), then the local package
+RUN pip install --no-cache-dir "mcp>=1.0,<2.0" && pip install --no-cache-dir -e .
+
+ENV PHAROS_MCP_TRANSPORT=streamable-http
+ENV PHAROS_MCP_HOST=0.0.0.0
+ENV PHAROS_MCP_PORT=8766
+ENV PHAROS_REGISTRY_URL=https://getpharos.dev
+
+EXPOSE 8766
+
+CMD ["python3", "-c", "from pharos_discovery.mcp_server.server import main; main()"]

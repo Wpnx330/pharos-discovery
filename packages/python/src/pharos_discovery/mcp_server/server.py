@@ -853,6 +853,16 @@ def main():
         mcp.settings.host = os.environ.get("PHAROS_MCP_HOST", "0.0.0.0")
         mcp.settings.port = int(os.environ.get("PHAROS_MCP_PORT", "8766"))
 
+        # Configure DNS rebinding protection to allow container/Docker hostnames
+        from mcp.server.transport_security import TransportSecuritySettings
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "0.0.0.0:*",
+                           "pharos-mcp:*", "host.docker.internal:*"],
+            allowed_origins=["http://localhost:*", "http://127.0.0.1:*",
+                             "http://pharos-mcp:*", "http://host.docker.internal:*"],
+        )
+
     # mypy/pyright: transport is str but run() wants a Literal; cast at runtime
     mcp.run(transport=transport)  # type: ignore[arg-type]
 
