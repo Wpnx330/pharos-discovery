@@ -2167,22 +2167,27 @@ The MCP server is a thin wrapper around `PharosClient` (§8). It does not reimpl
 
 Five tools are exposed. Each returns JSON as text content.
 
-#### `pharos_search(query: string, limit?: int) → string`
+#### pharos_search(query, limit, remote_only)
 
 Searches the PHAROS registry for MCP servers matching the query.
 
-- **Input:** `query` (natural language), `limit` (1–50, default 10)
-- **Output:** `{"results": [{id, name, description, version, transport, publisher, tools_count, capabilities, endpoint}], "count": N}`
-- **Errors:** `{"results": [], "message": "No servers found."}` on empty; `{"error": "..."}` on registry failure
-- **MCP Apps:** `_meta.ui.resourceUri = "ui://pharos/results"` — host renders search results as clickable cards
+- **Input:** query (natural language), limit (1-50, default 10), remote_only (default false)
+- **Output:** JSON array of matching servers with id, name, description, version, transport, publisher, tools_count, capabilities, endpoint
+- **Errors:** Empty results message on no matches; error JSON on registry failure
+- **MCP Apps:** _meta.ui.resourceUri = ui://pharos/results — host renders search results as clickable cards
+- **remote_only:** When true, filters results to remote transports only (sse, streamable-http, http). Designed for environments that cannot install local binaries (mobile agents, cloud-only deployments, containers without the pharos CLI). Passes transport filter to the SDK search() method.
 
-#### `pharos_install(server_id: string) → string`
+#### pharos_install(server_id)
 
-Installs an MCP server from the registry to the local machine via the `pharos` CLI.
+Installs or registers an MCP server from the registry. Behavior is transport-aware:
 
-- **Input:** `server_id` (registry ID)
-- **Output:** `{"status": "installed", "server_id": "...", "output": "..."}`
-- **Errors:** `{"error": "Install failed", "stderr": "..."}` on failure; `{"error": "Install timed out"}` after 120s
+- **Remote transports (sse, streamable-http, http):** Registers the endpoint directly without requiring the pharos CLI. The server card endpoint URL is stored for use by pharos_connect. This enables zero-binary installations in environments like mobile agents or cloud containers.
+- **stdio transport:** Downloads and installs the package via the pharos CLI (subprocess). The CLI resolves and installs any declared dependencies recursively (see S19).
+
+- **Input:** server_id (registry ID)
+- **Output (stdio):** status=installed, server_id, output
+- **Output (remote):** status=registered, server_id, transport, endpoint, message
+- **Errors:** Install failed with stderr on CLI failure; Install timed out after 120s; pharos CLI not found with hint (includes pip install pharos-mcp guidance and remote_only search suggestion) when CLI is missing for stdio install
 
 #### `pharos_connect(server_id: string, purpose?: string) → string`
 
@@ -2352,6 +2357,138 @@ Agent builders who want fine-grained control still use the SDK directly (§8). A
 
 **Key insight:** The PHAROS MCP server degrades gracefully. Clients without MCP Apps support still see all 5 tools and can call them — they just don't get the visual approval/search UI. The tool returns JSON with the relevant information, and the client can render it however it likes (text, card, custom UI).
 
+### 18.10 Pip Install UX (pharos-mcp package)
+
+The PHAROS MCP server and CLI are distributed together as a single pip package: `pharos-mcp`. This eliminates the multi-step installation process (download CLI, set PATH, install MCP server, configure clients) that would be too complex for end users.
+
+#### What pip install pharos-mcp does
+
+1. Installs the PHAROS MCP server (Python package)
+2. Bundles the `pharos` CLI binary (Go, compiled per-platform, shipped as package data)
+3. Creates two entry points: `pharos-mcp` (starts the MCP server) and `pharos` (the CLI)
+4. Post-install hook detects installed MCP clients (Cursor, Claude Desktop, VS Code) and offers to configure them automatically
+
+#### Package structure
+
+```
+pharos-mcp/
+├── pyproject.toml          # hatchling build, entry points, platform-specific data files
+├── src/pharos_mcp/
+│   ├── __init__.py
+│   ├── __main__.py         # python -m pharos_mcp → starts MCP server
+│   └── _post_install.py    # post-install hook: detect + configure MCP clients
+├── binaries/
+│   ├── pharos-linux-amd64  # Go binary for Linux x86_64
+│   ├── pharos-darwin-amd64 # macOS Intel
+│   ├── pharos-darwin-arm64 # macOS Apple Silicon
+│   └── pharos-windows-amd64.exe
+└── README.md
+```
+
+#### Post-install client configuration
+
+The post-install hook scans for known MCP client config files:
+
+| Client | Config Location | Detection |
+|--------|----------------|-----------|
+| Cursor | `~/.cursor/mcp.json` | Directory exists |
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) / `%APPDATA%\Claude\claude_desktop_config.json` (Windows) | File exists |
+| VS Code | `~/.vscode/settings.json` | Directory exists |
+| Generic | `~/.config/mcp/servers.json` | Fallback |
+
+When a client is detected, the user is prompted: "Configure PHAROS MCP for Cursor? (y/n)". If yes, the config entry is written automatically.
+
+#### One-command install
+
+```bash
+pip install pharos-mcp
+# → MCP server installed
+# → CLI binary available as 'pharos'
+# → Post-install: "Configure PHAROS MCP for Cursor? (y/n)"
+# → Done. User can now use pharos search/install or chat with an MCP-enabled agent.
+```
+
+### 18.11 Mobile / remote-only vision
+
+The remote_only filter and transport-aware install enable a mobile use case:
+
+1. A mobile AI agent app includes the PHAROS Agent SDK (TypeScript, React Native compatible)
+2. The agent calls `pharos_search(remote_only=true)` to find remote MCP servers
+3. The agent calls `pharos_install(server_id)` — for remote servers, this registers the endpoint without any local binary
+4. The agent calls `pharos_connect(server_id)` to establish the connection
+5. The agent calls `pharos_call_tool(server_id, tool_name, args)` to use the remote server's tools
+
+No local installation is required. The mobile agent never needs the Go CLI binary — it uses the SDK's HTTP-based connection manager to talk to remote MCP servers directly.
+
+Future: A "remote-only" mode for the TypeScript SDK that disables filesystem and process operations (lockfile, CLI execution) for environments where those are unavailable.
+
 ---
 
-**End of SPEC.md — Pharos Discovery v0.5.0 (Draft)**
+## 19. CLI Dependency Resolution
+
+The PHAROS CLI resolves and installs dependencies recursively, similar to npm or pip. This enables composable MCP servers — a developer can declare dependencies on other PHAROS packages and only manage their own additions.
+
+### 19.1 Manifest dependencies field
+
+The CLI manifest (pharos.json) includes a `dependencies` array:
+
+```json
+{
+  "name": "io.github.wpnx330/flight-finder",
+  "version": "1.0.0",
+  "dependencies": [
+    { "name": "io.github.carrierA/flights-mcp", "version": "^1.0.0" },
+    { "name": "io.github.carrierB/flights-mcp", "version": "^2.1.0" },
+    { "name": "io.github.carrierC/flights-mcp", "version": "~1.5.0" }
+  ]
+}
+```
+
+### 19.2 Resolution algorithm
+
+1. Parse the primary package's manifest
+2. For each dependency, fetch the package from the registry API
+3. Resolve the version using semver constraints (^, ~, x, latest, exact)
+4. Recursively resolve the dependency's own dependencies
+5. Detect circular dependencies (track visited packages by name)
+6. Detect version conflicts (same package resolved to different versions — use the higher version)
+7. Return a flat dependency tree (map of name to resolved version)
+
+### 19.3 Install behavior
+
+`pharos install <package>` now:
+
+1. Installs the primary package (existing behavior)
+2. Checks the manifest for dependencies
+3. If dependencies exist, resolves the full dependency tree
+4. Installs each dependency that is not already installed at the resolved version
+5. Prints a summary of installed/skipped dependencies
+6. Updates pharos.lock with all resolved versions
+
+### 19.4 pharos lock command
+
+`pharos lock` regenerates pharos.lock from pharos.json:
+
+1. Reads pharos.json from the current directory
+2. Resolves all dependencies to concrete versions
+3. Fetches transport metadata for each
+4. Writes/updates pharos.lock with resolved versions
+
+### 19.5 Use case: composable MCP servers
+
+A developer builds an all-encompassing flight finder MCP server by composing three community servers:
+
+```
+io.github.wpnx330/flight-finder (v1.0.0)
+├── io.github.carrierA/flights-mcp (^1.0.0 → 1.2.0)
+├── io.github.carrierB/flights-mcp (^2.1.0 → 2.3.1)
+└── io.github.carrierC/flights-mcp (~1.5.0 → 1.5.3)
+```
+
+When a user runs `pharos install flight-finder`, all three carrier MCPs are automatically downloaded and configured. The developer only manages the flight-finder orchestration logic — the carrier servers are maintained by their respective publishers.
+
+Alternatively, a developer can extend an existing server by declaring it as a dependency and adding their own features on top. They manage only their additions; the base server is pulled in automatically.
+
+---
+
+**End of SPEC.md — Pharos Discovery v0.6.0 (Draft)**
