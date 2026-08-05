@@ -562,12 +562,19 @@ def _get_pharos_cli() -> str:
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
 @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/results"}})
-async def pharos_search(query: str, limit: int = 10) -> str:
+async def pharos_search(
+    query: str,
+    limit: int = 10,
+    remote_only: bool = False,
+) -> str:
     """Search the PHAROS registry for MCP servers matching the query.
 
     Args:
         query: Natural-language search query (e.g. "echo", "flight search", "file system")
         limit: Maximum number of results to return (default 10, max 50)
+        remote_only: If True, only return servers with remote transports
+            (sse, streamable-http, http). Useful for environments that
+            cannot install local binaries (e.g. mobile agents, cloud-only).
 
     Returns:
         JSON array of matching servers with id, name, description, version,
@@ -576,8 +583,12 @@ async def pharos_search(query: str, limit: int = 10) -> str:
     client = _get_client()
     limit = min(max(limit, 1), 50)
 
+    filters: dict[str, Any] = {}
+    if remote_only:
+        filters["transport"] = ["sse", "streamable-http", "http"]
+
     try:
-        results = await client.search(text=query, limit=limit)
+        results = await client.search(text=query, filters=filters or None, limit=limit)
     except NoServersFound:
         return json.dumps({"results": [], "message": "No servers found. Try a different query."})
     except RegistryUnavailable as e:
@@ -612,12 +623,58 @@ async def pharos_search(query: str, limit: int = 10) -> str:
 async def pharos_install(server_id: str) -> str:
     """Install an MCP server from the PHAROS registry to the local machine.
 
+    For remote transports (sse, streamable-http, http), the server is registered
+    as a remote endpoint without requiring the pharos CLI. For stdio servers,
+    the pharos CLI must be installed locally to download and configure the package.
+
     Args:
         server_id: The server ID from search results (e.g. "test-echo-server")
 
     Returns:
-        JSON with install status, version, and install path.
+        JSON with install status, version, and install path (stdio) or
+        endpoint URL (remote).
     """
+    client = _get_client()
+
+    # Check transport from cached server card or fetch from registry
+    transport = None
+    endpoint = None
+    if server_id in _server_cards:
+        card = _server_cards[server_id]
+        transport = getattr(card, "transport", None)
+        endpoint = getattr(card, "endpoint", None)
+
+    # If we don't have the card cached, fetch it
+    if transport is None:
+        try:
+            card = await client.get_server(server_id)
+            transport = getattr(card, "transport", None)
+            endpoint = getattr(card, "endpoint", None)
+            _server_cards[server_id] = card
+        except Exception:
+            pass  # Fall through to CLI install attempt
+
+    # Remote transport: register endpoint without CLI
+    if transport and transport.lower() in ("sse", "streamable-http", "http"):
+        if not endpoint:
+            return json.dumps({
+                "error": f"Server '{server_id}' has transport '{transport}' but no endpoint URL",
+                "server_id": server_id,
+            })
+        _installed_servers[server_id] = {
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+            "transport": transport,
+            "endpoint": endpoint,
+        }
+        return json.dumps({
+            "status": "registered",
+            "server_id": server_id,
+            "transport": transport,
+            "endpoint": endpoint,
+            "message": f"Remote server registered. Use pharos_connect to connect.",
+        })
+
+    # stdio transport: use pharos CLI
     cli = _get_pharos_cli()
 
     try:
@@ -630,7 +687,11 @@ async def pharos_install(server_id: str) -> str:
     except asyncio.TimeoutError:
         return json.dumps({"error": "Install timed out (120s)", "server_id": server_id})
     except FileNotFoundError:
-        return json.dumps({"error": f"pharos CLI not found at '{cli}'", "server_id": server_id})
+        return json.dumps({
+            "error": f"pharos CLI not found at '{cli}'",
+            "server_id": server_id,
+            "hint": "For remote servers, use pharos_search(remote_only=True) to find servers that don't require local installation. To install stdio servers, install the pharos CLI first: pip install pharos-mcp",
+        })
 
     if proc.returncode != 0:
         return json.dumps({

@@ -561,3 +561,173 @@ class TestSecurity:
         # Arguments should be passed as-is to the connection, not executed
         mock_connection.call_tool.assert_called_once_with("echo", malicious_args)
         assert data["result"] == {"result": "ok"}
+
+
+
+class TestRemoteOnlyFilter:
+    """Tests for pharos_search remote_only filter."""
+
+    @pytest.mark.asyncio
+    async def test_search_remote_only_passes_transport_filter(self):
+        """remote_only=True should pass transport filter to client.search."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+
+            # Build a simple result mock that serializes cleanly
+            card = MagicMock()
+            card.id = "remote-server"
+            card.display_name = "Remote Server"
+            card.description = "A remote server"
+            card.version = "1.0.0"
+            card.transport = "streamable-http"
+            card.publisher = None  # simplifies JSON serialization
+            card.capabilities = ["tools"]
+            card.tools_count = 3
+            card.endpoint = "https://example.com/mcp"
+
+            result_mock = MagicMock()
+            result_mock.card = card
+            result_mock.score = 0.9
+            mock_client.search = AsyncMock(return_value=[result_mock])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search("test", remote_only=True)
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is not None
+            assert "transport" in filters
+            assert "streamable-http" in filters["transport"]
+            assert "sse" in filters["transport"]
+            assert "http" in filters["transport"]
+
+    @pytest.mark.asyncio
+    async def test_search_without_remote_only_no_filter(self):
+        """remote_only=False should not pass transport filter."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search("test", remote_only=False)
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is None
+
+    @pytest.mark.asyncio
+    async def test_search_default_no_filter(self):
+        """Default (no remote_only) should not pass transport filter."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search("test")
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is None
+
+
+class TestInstallTransportGuard:
+    """Tests for pharos_install transport-aware behavior."""
+
+    @pytest.mark.asyncio
+    async def test_install_remote_sse_registers_without_cli(self):
+        """Installing an SSE server should register endpoint without CLI."""
+        card = MagicMock()
+        card.transport = "sse"
+        card.endpoint = "https://example.com/sse"
+        srv._server_cards["remote-srv"] = card
+
+        with patch.object(srv, "_get_pharos_cli", return_value="pharos") as mock_cli:
+            result = await srv.pharos_install("remote-srv")
+            data = json.loads(result)
+
+            assert data["status"] == "registered"
+            assert data["transport"] == "sse"
+            assert data["endpoint"] == "https://example.com/sse"
+            mock_cli.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_install_remote_streamable_http_registers_without_cli(self):
+        """Installing a streamable-http server should register endpoint without CLI."""
+        card = MagicMock()
+        card.transport = "streamable-http"
+        card.endpoint = "https://example.com/mcp"
+        srv._server_cards["remote-http"] = card
+
+        result = await srv.pharos_install("remote-http")
+        data = json.loads(result)
+
+        assert data["status"] == "registered"
+        assert data["transport"] == "streamable-http"
+        assert data["endpoint"] == "https://example.com/mcp"
+
+    @pytest.mark.asyncio
+    async def test_install_remote_no_endpoint_returns_error(self):
+        """Remote server without endpoint should return error."""
+        card = MagicMock()
+        card.transport = "sse"
+        card.endpoint = None
+        srv._server_cards["bad-remote"] = card
+
+        result = await srv.pharos_install("bad-remote")
+        data = json.loads(result)
+
+        assert "error" in data
+        assert "no endpoint" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_install_stdio_uses_cli(self):
+        """Installing a stdio server should attempt CLI install."""
+        card = MagicMock()
+        card.transport = "stdio"
+        card.endpoint = None
+        srv._server_cards["stdio-srv"] = card
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"Installed successfully", b""))
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_install("stdio-srv")
+            data = json.loads(result)
+
+            assert data["status"] == "installed"
+            mock_exec.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_install_stdio_missing_cli_has_helpful_hint(self):
+        """Missing CLI for stdio install should include hint about pip install."""
+        card = MagicMock()
+        card.transport = "stdio"
+        card.endpoint = None
+        srv._server_cards["stdio-srv"] = card
+
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_install("stdio-srv")
+            data = json.loads(result)
+
+            assert "error" in data
+            assert "hint" in data
+            assert "pip install pharos-mcp" in data["hint"]
+            assert "remote_only" in data["hint"]
+
+    @pytest.mark.asyncio
+    async def test_install_unknown_transport_falls_back_to_cli(self):
+        """Unknown transport should fall back to CLI install attempt."""
+        card = MagicMock()
+        card.transport = "websocket"  # unsupported
+        card.endpoint = None
+        srv._server_cards["ws-srv"] = card
+
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_install("ws-srv")
+            data = json.loads(result)
+
+            # Should fall through to CLI attempt and get FileNotFoundError
+            assert "error" in data
+            assert "pharos CLI not found" in data["error"]
