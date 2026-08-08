@@ -783,6 +783,17 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
     signature = _sign_pending(raw_token, server_id)
     expires_at = int(time.time()) + 300  # 5-minute expiry
 
+    # Security: cap pending connections to prevent memory exhaustion.
+    # Clean up expired entries first, then enforce a hard limit.
+    now = int(time.time())
+    expired = [k for k, v in _pending_connections.items() if now >= v["expires_at"]]
+    for k in expired:
+        del _pending_connections[k]
+    if len(_pending_connections) >= 50:
+        return json.dumps({
+            "error": "Too many pending connections. Wait for existing tokens to expire (5 min) and try again.",
+        })
+
     # Store pending connection details
     _pending_connections[raw_token] = {
         "server_id": server_id,
