@@ -86,7 +86,8 @@ Add to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`)
 |---|---|
 | `pharos_search` | Search the registry for MCP servers (natural-language query) |
 | `pharos_install` | Install an MCP server to the local machine via the `pharos` CLI |
-| `pharos_connect` | Connect to a running server after user approval (MCP Apps UI) |
+| `pharos_connect` | Request a connection to a running server — returns pending approval token (MCP Apps UI) |
+| `pharos_approve` | Approve a pending connection — completes the connection after user confirmation |
 | `pharos_list_tools` | List tools available on a connected server |
 | `pharos_call_tool` | Call a tool on a connected server with arbitrary arguments |
 
