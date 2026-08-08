@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 from typing import Any
 
 import pytest
+import time
 
 from pharos_discovery.mcp_server import server as srv
 
@@ -107,7 +108,11 @@ class TestToolRegistration:
 
     def test_pharos_connect_registered(self):
         assert callable(srv.pharos_connect)
-        assert "Connect to a running MCP server" in srv.pharos_connect.__doc__
+        assert "Request a connection" in srv.pharos_connect.__doc__
+
+    def test_pharos_approve_registered(self):
+        assert callable(srv.pharos_approve)
+        assert "Approve a pending" in srv.pharos_approve.__doc__
 
     def test_pharos_list_tools_registered(self):
         assert callable(srv.pharos_list_tools)
@@ -276,22 +281,73 @@ class TestPharosConnect:
         assert "not found" in data["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_connect_from_cache(self, mock_client, mock_server_card):
-        """Should use cached card when available."""
+    async def test_connect_returns_pending_approval(self, mock_client, mock_server_card):
+        """Should return pending_approval status with a token (not auto-connected)."""
         srv._server_cards["echo-server"] = mock_server_card
-        # Should NOT call get_server since card is cached
+        srv._connections.clear()
+        srv._pending_connections.clear()
         with patch.object(srv, "_get_client", return_value=mock_client):
-            with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
-                mock_mgr = AsyncMock()
-                mock_connection = AsyncMock()
-                mock_mgr.connect = AsyncMock(return_value=mock_connection)
-                MockMgr.return_value = mock_mgr
-                with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
-                    result = await srv.pharos_connect("echo-server")
+            result = await srv.pharos_connect("echo-server")
+        data = json.loads(result)
+        assert data["status"] == "pending_approval"
+        assert "approval_token" in data
+        assert data["expires_in"] == 300
+        assert "approval_data" in data
+        # Connection should NOT be established yet
+        assert "echo-server" not in srv._connections
+        # get_server should NOT have been called (cached card)
+        mock_client.get_server.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approve_completes_connection(self, mock_client, mock_server_card):
+        """pharos_approve should complete the connection after pharos_connect."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        # Step 1: connect returns pending token
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_connect("echo-server")
+        data = json.loads(result)
+        assert data["status"] == "pending_approval"
+        token = data["approval_token"]
+        # Step 2: approve completes the connection
+        with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+            mock_mgr = AsyncMock()
+            mock_connection = AsyncMock()
+            mock_mgr.connect = AsyncMock(return_value=mock_connection)
+            MockMgr.return_value = mock_mgr
+            with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
+                result = await srv.pharos_approve(token)
         data = json.loads(result)
         assert data["status"] == "connected"
-        # get_server should NOT have been called
-        mock_client.get_server.assert_not_called()
+        assert data["server_id"] == "echo-server"
+        assert data["tools_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_approve_invalid_token(self):
+        """pharos_approve should reject unknown tokens."""
+        srv._pending_connections.clear()
+        result = await srv.pharos_approve("bogus-token")
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_approve_expired_token(self, mock_client, mock_server_card):
+        """pharos_approve should reject expired tokens."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_connect("echo-server")
+        data = json.loads(result)
+        token = data["approval_token"]
+        # Manually expire the token
+        srv._pending_connections[token]["expires_at"] = int(time.time()) - 1
+        result = await srv.pharos_approve(token)
+        data = json.loads(result)
+        assert "error" in data
+        assert "expired" in data["error"].lower()
 
 
 # ─── pharos_list_tools ─────────────────────────────────────────────────────────

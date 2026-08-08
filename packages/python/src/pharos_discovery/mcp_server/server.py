@@ -543,6 +543,12 @@ _client: PharosClient | None = None
 _connections: dict[str, Any] = {}  # server_id → MCP connection
 _installed_servers: dict[str, dict] = {}  # server_id → install metadata
 _server_cards: dict[str, ServerCard] = {}  # server_id → cached card
+_pending_connections: dict[str, dict] = {}  # token → pending connection details
+
+# Signing key for pending connection tokens (HMAC-SHA256).
+# In production this would be a proper server secret; for local MCP it's
+# derived from the process ID + a static component.
+_PENDING_SECRET = f"pharos-pending-{os.getpid()}-local".encode("utf-8")
 
 
 def _get_client() -> PharosClient:
@@ -711,20 +717,39 @@ async def pharos_install(server_id: str) -> str:
     })
 
 
+def _sign_pending(token: str, server_id: str) -> str:
+    """Sign a pending connection token with HMAC-SHA256."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    payload = f"{token}:{server_id}".encode("utf-8")
+    return _hmac.new(_PENDING_SECRET, payload, _hashlib.sha256).hexdigest()
+
+
+def _verify_pending(token: str, server_id: str, signature: str) -> bool:
+    """Verify a pending connection token's signature."""
+    import hmac as _hmac
+    expected = _sign_pending(token, server_id)
+    return _hmac.compare_digest(signature, expected)
+
+
 @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
 async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
-    """Connect to a running MCP server after getting user approval.
+    """Request a connection to a running MCP server.
 
-    This tool triggers a visual approval UI (MCP Apps) showing the server
-    details, publisher verification, requested scopes, and purpose.
-    The user must click "Approve" before the connection is established.
+    Returns an approval UI showing the server details, publisher verification,
+    requested scopes, and purpose. The user must review and approve the
+    connection by calling pharos_approve with the returned token.
+
+    This is a two-step flow:
+    1. pharos_connect — returns server details + pending token (NOT connected yet)
+    2. pharos_approve — user confirms, connection is established
 
     Args:
         server_id: The server ID to connect to
         purpose: Why the connection is being requested (shown to user)
 
     Returns:
-        JSON with connection status and available tools.
+        JSON with server details and a pending approval token.
     """
     client = _get_client()
 
@@ -753,6 +778,21 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
         if endpoint:
             card.endpoint = endpoint  # type: ignore
 
+    # Generate a pending connection token
+    raw_token = f"pc-{server_id}-{int(time.time())}-{os.urandom(4).hex()}"
+    signature = _sign_pending(raw_token, server_id)
+    expires_at = int(time.time()) + 300  # 5-minute expiry
+
+    # Store pending connection details
+    _pending_connections[raw_token] = {
+        "server_id": server_id,
+        "card": card,
+        "endpoint": endpoint,
+        "purpose": purpose,
+        "signature": signature,
+        "expires_at": expires_at,
+    }
+
     # Build approval data for the UI
     approval_data = {
         "server": {
@@ -771,21 +811,67 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
         "capabilities": card.capabilities,
     }
 
-    # In a real MCP Apps implementation, the host renders the approval UI
-    # iframe and the user clicks Approve/Deny. The result comes back via
-    # the JSON-RPC bridge. Here we return the data; the _meta.ui.resourceUri
-    # tells the host to render ui://pharos/approval with this data.
-    #
-    # TODO(security): For now, we auto-approve in non-interactive mode.
-    # In production, this must be replaced with a blocking call that waits
-    # for the user's Approve/Deny response from the MCP Apps UI bridge.
-    # Until then, pharos_connect grants access without user consent.
-    approved = True
+    return json.dumps({
+        "status": "pending_approval",
+        "server_id": server_id,
+        "approval_token": raw_token,
+        "expires_in": 300,
+        "message": f"Connection to '{card.display_name}' is pending. "
+                    "Ask the user to approve, then call pharos_approve "
+                    "with the approval_token to complete the connection.",
+        "approval_data": approval_data,
+    })
 
-    if not approved:
-        return json.dumps({"error": "Connection denied by user", "server_id": server_id})
 
-    # Build an approval token
+@mcp.tool()
+async def pharos_approve(approval_token: str) -> str:
+    """Approve a pending MCP server connection.
+
+    After pharos_connect returns a pending approval token, the user must
+    confirm they want to connect. This tool completes the connection.
+
+    Args:
+        approval_token: The token returned by pharos_connect
+
+    Returns:
+        JSON with connection status and available tools.
+    """
+    # Look up the pending connection
+    pending = _pending_connections.get(approval_token)
+    if pending is None:
+        return json.dumps({
+            "error": "Invalid or unknown approval token. "
+                     "Call pharos_connect first to get a new token.",
+        })
+
+    # Verify signature
+    if not _verify_pending(approval_token, pending["server_id"], pending["signature"]):
+        del _pending_connections[approval_token]
+        return json.dumps({"error": "Invalid approval token signature."})
+
+    # Check expiry
+    if time.time() >= pending["expires_at"]:
+        del _pending_connections[approval_token]
+        return json.dumps({
+            "error": "Approval token expired. Call pharos_connect again for a new token.",
+        })
+
+    server_id = pending["server_id"]
+    card = pending["card"]
+    endpoint = pending["endpoint"]
+
+    # Clean up the pending token (one-time use)
+    del _pending_connections[approval_token]
+
+    # Check if already connected (race condition guard)
+    if server_id in _connections:
+        return json.dumps({
+            "status": "already_connected",
+            "server_id": server_id,
+            "message": "Already connected. Use pharos_list_tools to see available tools.",
+        })
+
+    # Build an approval token for the connection manager
     token = ApprovalToken(
         token_id=f"tok-{server_id}-{int(time.time())}",
         server_id=server_id,
@@ -800,7 +886,6 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
 
     # Connect to the server
     try:
-        # Use the connection manager to establish MCP connection
         mgr = ConnectionManager()
         connection = await mgr.connect(card, token)
         _connections[server_id] = connection

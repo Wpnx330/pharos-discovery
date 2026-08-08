@@ -10,7 +10,8 @@ rendered as sandboxed iframes in the host's chat interface.
 Tools:
     pharos_search(query)         — search the registry for MCP servers
     pharos_install(server_id)    — install a server locally
-    pharos_connect(server_id)    — connect to a running server (with approval)
+    pharos_connect(server_id)    — request a connection (returns pending token)
+    pharos_approve(token)        — approve a pending connection (completes it)
     pharos_list_tools(server_id) — list tools available on a connected server
     pharos_call_tool(server_id, tool_name, args) — call a tool on a server
 
