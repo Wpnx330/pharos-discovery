@@ -42,7 +42,7 @@ from pharos_discovery.errors import (
 #   ui://pharos/oauth     — OAuth consent screen
 #   ui://pharos/results   — search results gallery (clickable cards)
 
-APPROVAL_HTML = """<!DOCTYPE html>
+APPROVAL_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -60,63 +60,93 @@ APPROVAL_HTML = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
-    padding: 24px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
     min-height: 100vh;
   }
-  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-  .logo { font-size: 24px; }
-  .title { font-size: 18px; font-weight: 600; }
+  .header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-shrink: 0; }
+  .logo { font-size: 20px; }
+  .title { font-size: 16px; font-weight: 600; }
+  .purpose {
+    background: rgba(88, 166, 255, 0.05);
+    border-left: 3px solid var(--accent);
+    padding: 10px 12px;
+    border-radius: 0 6px 6px 0;
+    margin-bottom: 12px;
+    font-size: 13px;
+    flex-shrink: 0;
+  }
   .card {
     background: var(--card-bg);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 16px;
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 12px;
+    flex-shrink: 0;
   }
-  .server-name { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
-  .server-id { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; }
-  .detail-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
-  .detail-label { color: var(--text-muted); font-size: 13px; }
-  .detail-value { font-size: 13px; font-weight: 500; }
+  .server-name { font-size: 18px; font-weight: 700; margin-bottom: 2px; }
+  .server-desc { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .detail-cell {
+    background: var(--card-bg);
+    padding: 8px 10px;
+  }
+  .detail-label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .detail-value { font-size: 13px; font-weight: 500; margin-top: 2px; }
   .badge {
     display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
     font-weight: 600;
+    margin-left: 4px;
+    vertical-align: middle;
   }
   .badge-verified { background: rgba(63, 185, 80, 0.15); color: var(--success); }
   .badge-warning { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
-  .scopes { margin-top: 12px; }
+  .badge-cap { background: rgba(88, 166, 255, 0.1); color: var(--accent); }
+  .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .tag { background: rgba(88, 166, 255, 0.08); color: var(--accent); padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+  .scopes { margin-top: 10px; flex-shrink: 0; }
+  .scope-label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
   .scope-chip {
     display: inline-block;
     background: rgba(88, 166, 255, 0.1);
     color: var(--accent);
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 12px;
-    margin: 2px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    margin: 2px 2px 0 0;
   }
-  .actions { display: flex; gap: 12px; margin-top: 20px; }
+  .actions { display: flex; gap: 10px; margin-top: auto; padding-top: 12px; flex-shrink: 0; }
   .btn {
     flex: 1;
-    padding: 12px 24px;
+    padding: 10px 20px;
     border: none;
     border-radius: 8px;
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 600;
     cursor: pointer;
-    transition: opacity 0.2s;
+    transition: opacity 0.15s;
   }
   .btn:hover { opacity: 0.85; }
   .btn-approve { background: var(--success); color: #fff; }
   .btn-deny { background: var(--card-bg); color: var(--text); border: 1px solid var(--border); }
-  .purpose { background: rgba(88, 166, 255, 0.05); border-left: 3px solid var(--accent); padding: 12px; border-radius: 0 8px 8px 0; margin-bottom: 16px; font-size: 14px; }
-  #status { text-align: center; margin-top: 12px; font-size: 14px; color: var(--text-muted); }
+  #status { text-align: center; margin-top: 8px; font-size: 13px; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -124,109 +154,96 @@ APPROVAL_HTML = """<!DOCTYPE html>
     <span class="logo">🔒</span>
     <span class="title">PHAROS Discovery — Approval Required</span>
   </div>
-
   <div class="purpose" id="purpose"></div>
   <div class="card">
     <div class="server-name" id="server-name"></div>
-    <div class="server-id" id="server-id"></div>
-    <div class="detail-row">
-      <span class="detail-label">Publisher</span>
-      <span class="detail-value" id="publisher"></span>
-    </div>
-    <div class="detail-row">
-      <span class="detail-label">Version</span>
-      <span class="detail-value" id="version"></span>
-    </div>
-    <div class="detail-row">
-      <span class="detail-label">Transport</span>
-      <span class="detail-value" id="transport"></span>
-    </div>
-    <div class="detail-row">
-      <span class="detail-label">Endpoint</span>
-      <span class="detail-value" id="endpoint"></span>
-    </div>
-    <div class="scopes" id="scopes"></div>
+    <div class="server-desc" id="server-desc"></div>
+    <div class="detail-grid" id="details"></div>
+    <div class="tags" id="tags"></div>
   </div>
-
+  <div class="scopes" id="scopes"></div>
   <div class="actions">
     <button class="btn btn-deny" id="deny">Deny</button>
     <button class="btn btn-approve" id="approve">Approve Connection</button>
   </div>
   <div id="status"></div>
-
 <script>
-  // MCP Apps bridge — communicate with host via postMessage JSON-RPC
-  const MCP_APP_MIME = "text/html;profile=mcp-app";
+  // Data injected by server — works even if host doesn't send postMessage
+  const TOOL_DATA = __APPROVAL_DATA__;
 
-  // The host injects tool result data into the iframe via a JSON-RPC
-  // "notifications/tool_result" message. We render it.
-  let toolData = null;
+  function render() {
+    const data = TOOL_DATA;
+    if (!data || !data.server) return;
+    const s = data.server;
 
-  window.addEventListener("message", async (event) => {
-    const msg = event.data;
-    if (!msg || msg.jsonrpc !== "2.0") return;
-
-    // Handle tool result notification from host
-    if (msg.method === "notifications/tool_result") {
-      toolData = msg.params;
-      renderApproval(toolData);
-    }
-  });
-
-  // Request the tool result from the host on load
-  window.addEventListener("load", () => {
-    // Send ui/initialize handshake
-    event.source?.postMessage({
-      jsonrpc: "2.0",
-      id: crypto.randomUUID(),
-      method: "ui/initialize",
-      params: { capabilities: {} }
-    }, "*");
-
-    // Request current tool data
-    event.source?.postMessage({
-      jsonrpc: "2.0",
-      id: crypto.randomUUID(),
-      method: "ui/getToolResult",
-      params: {}
-    }, "*");
-  });
-
-  function renderApproval(data) {
-    if (!data) return;
-    const s = data.server || {};
     document.getElementById("purpose").textContent = "Purpose: " + (data.purpose || "User request");
     document.getElementById("server-name").textContent = s.display_name || s.name || s.id;
-    document.getElementById("server-id").textContent = s.id;
-    // Use textContent for user-controlled data, innerHTML only for static HTML structure
-    const pubEl = document.getElementById("publisher");
-    pubEl.textContent = s.publisher?.name || "unknown";
-    if (s.publisher?.verified) {
-      const badge = document.createElement("span");
-      badge.className = "badge badge-verified";
-      badge.textContent = "✓ verified";
-      pubEl.appendChild(document.createTextNode(" "));
-      pubEl.appendChild(badge);
-    } else {
-      const badge = document.createElement("span");
-      badge.className = "badge badge-warning";
-      badge.textContent = "unverified";
-      pubEl.appendChild(document.createTextNode(" "));
-      pubEl.appendChild(badge);
-    }
-    document.getElementById("version").textContent = s.version || "N/A";
-    document.getElementById("transport").textContent = (s.transport || []).join(", ") || "N/A";
-    document.getElementById("endpoint").textContent = s.endpoint || "N/A";
+    document.getElementById("server-desc").textContent = s.description || "";
 
+    // Build detail grid
+    const details = document.getElementById("details");
+    const rows = [
+      ["Publisher", s.publisher?.name || "unknown", s.publisher?.verified],
+      ["Version", s.version || "N/A"],
+      ["Transport", (s.transport || []).join(", ") || "N/A"],
+      ["Endpoint", s.endpoint || "N/A"],
+      ["Tools", String(s.tools_count || 0)],
+      ["Pricing", s.pricing || "free"],
+    ];
+    rows.forEach(([label, value, verified]) => {
+      const cell = document.createElement("div");
+      cell.className = "detail-cell";
+      const lbl = document.createElement("div");
+      lbl.className = "detail-label";
+      lbl.textContent = label;
+      cell.appendChild(lbl);
+      const val = document.createElement("div");
+      val.className = "detail-value";
+      val.textContent = value;
+      if (verified === true) {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-verified";
+        badge.textContent = "verified";
+        val.appendChild(badge);
+      } else if (verified === false && label === "Publisher") {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-warning";
+        badge.textContent = "unverified";
+        val.appendChild(badge);
+      }
+      cell.appendChild(val);
+      details.appendChild(cell);
+    });
+
+    // Tags
+    const tagsEl = document.getElementById("tags");
+    (s.tags || []).forEach(t => {
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = t;
+      tagsEl.appendChild(tag);
+    });
+
+    // Capabilities as badges
+    if (s.capabilities && s.capabilities.length) {
+      const capRow = document.createElement("div");
+      capRow.style.marginTop = "8px";
+      s.capabilities.forEach(c => {
+        const badge = document.createElement("span");
+        badge.className = "badge badge-cap";
+        badge.textContent = c;
+        capRow.appendChild(badge);
+      });
+      tagsEl.appendChild(capRow);
+    }
+
+    // Scopes
     const scopesEl = document.getElementById("scopes");
-    const scopes = data.scopes || s.scopes || [];
+    const scopes = data.scopes || [];
     if (scopes.length) {
-      // Build scopes safely with DOM APIs to prevent XSS
       const label = document.createElement("div");
-      label.className = "detail-label";
-      label.style.marginBottom = "6px";
-      label.textContent = "Requested Scopes";
-      scopesEl.innerHTML = "";
+      label.className = "scope-label";
+      label.textContent = "Requested Access";
       scopesEl.appendChild(label);
       scopes.forEach(sc => {
         const chip = document.createElement("span");
@@ -240,18 +257,34 @@ APPROVAL_HTML = """<!DOCTYPE html>
   function sendResponse(approved) {
     document.getElementById("approve").disabled = true;
     document.getElementById("deny").disabled = true;
-    document.getElementById("status").textContent = approved ? "✅ Approved" : "❌ Denied";
+    document.getElementById("status").textContent = approved ? "Approved" : "Denied";
 
-    // Send result back to host via JSON-RPC
+    // Send result to host via postMessage (if supported)
     window.parent.postMessage({
       jsonrpc: "2.0",
       method: "notifications/tool_result",
       params: {
         approved: approved,
+        approval_token: TOOL_DATA?.approval_token || "",
         timestamp: new Date().toISOString()
       }
     }, "*");
   }
+
+  render();
+
+  // Also listen for postMessage from host (dual-mode: works with or without)
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0") return;
+    if (msg.method === "notifications/tool_result" && msg.params) {
+      // Host is sending data — re-render with it
+      if (msg.params.server) {
+        Object.assign(TOOL_DATA, msg.params);
+        render();
+      }
+    }
+  });
 
   document.getElementById("approve").addEventListener("click", () => sendResponse(true));
   document.getElementById("deny").addEventListener("click", () => sendResponse(false));
@@ -259,7 +292,7 @@ APPROVAL_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
-RESULTS_HTML = """<!DOCTYPE html>
+RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -276,38 +309,39 @@ RESULTS_HTML = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
-    padding: 24px;
+    padding: 16px;
   }
-  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-  .logo { font-size: 24px; }
-  .title { font-size: 18px; font-weight: 600; }
+  .header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .logo { font-size: 20px; }
+  .title { font-size: 16px; font-weight: 600; }
   .result-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
     cursor: pointer;
-    transition: border-color 0.2s;
+    transition: border-color 0.15s;
   }
   .result-card:hover { border-color: var(--accent); }
-  .result-name { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
-  .result-desc { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; }
-  .result-meta { display: flex; gap: 12px; font-size: 12px; color: var(--text-muted); }
+  .result-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+  .result-desc { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+  .result-meta { display: flex; gap: 8px; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; align-items: center; }
   .badge {
     display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
     font-weight: 600;
   }
   .badge-verified { background: rgba(63, 185, 80, 0.15); color: var(--success); }
   .badge-tools { background: rgba(88, 166, 255, 0.1); color: var(--accent); }
-  #empty { text-align: center; padding: 40px; color: var(--text-muted); }
+  #empty { text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -317,24 +351,9 @@ RESULTS_HTML = """<!DOCTYPE html>
   </div>
   <div id="results"></div>
   <div id="empty" style="display:none">No servers found. Try a different query.</div>
-
 <script>
-  window.addEventListener("message", (event) => {
-    const msg = event.data;
-    if (!msg || msg.jsonrpc !== "2.0") return;
-    if (msg.method === "notifications/tool_result") {
-      renderResults(msg.params);
-    }
-  });
-
-  window.addEventListener("load", () => {
-    window.parent.postMessage({
-      jsonrpc: "2.0",
-      id: crypto.randomUUID(),
-      method: "ui/getToolResult",
-      params: {}
-    }, "*");
-  });
+  // Data injected by server — works even if host doesn't send postMessage
+  const TOOL_DATA = __RESULTS_DATA__;
 
   function renderResults(data) {
     const results = data?.results || [];
@@ -343,7 +362,6 @@ RESULTS_HTML = """<!DOCTYPE html>
       document.getElementById("empty").style.display = "block";
       return;
     }
-    // Build result cards with DOM APIs to prevent XSS from registry data
     container.innerHTML = "";
     results.forEach((r, i) => {
       const card = document.createElement("div");
@@ -368,22 +386,33 @@ RESULTS_HTML = """<!DOCTYPE html>
       ver.textContent = r.version || "v?";
       meta.appendChild(ver);
 
+      const sep1 = document.createElement("span");
+      sep1.textContent = "·";
+      meta.appendChild(sep1);
+
       const tr = document.createElement("span");
       tr.textContent = (r.transport || []).join(", ");
       meta.appendChild(tr);
+
+      const sep2 = document.createElement("span");
+      sep2.textContent = "·";
+      meta.appendChild(sep2);
 
       const pub = document.createElement("span");
       pub.textContent = r.publisher?.name || "unknown";
       if (r.publisher?.verified) {
         const badge = document.createElement("span");
         badge.className = "badge badge-verified";
-        badge.textContent = "✓";
+        badge.textContent = "verified";
         pub.appendChild(document.createTextNode(" "));
         pub.appendChild(badge);
       }
       meta.appendChild(pub);
 
       if (r.tools_count) {
+        const sep3 = document.createElement("span");
+        sep3.textContent = "·";
+        meta.appendChild(sep3);
         const tb = document.createElement("span");
         tb.className = "badge badge-tools";
         tb.textContent = r.tools_count + " tools";
@@ -407,6 +436,17 @@ RESULTS_HTML = """<!DOCTYPE html>
       });
     });
   }
+
+  renderResults(TOOL_DATA);
+
+  // Also listen for postMessage from host (dual-mode)
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0") return;
+    if (msg.method === "notifications/tool_result") {
+      renderResults(msg.params);
+    }
+  });
 </script>
 </body>
 </html>"""
@@ -545,6 +585,23 @@ _installed_servers: dict[str, dict] = {}  # server_id → install metadata
 _server_cards: dict[str, ServerCard] = {}  # server_id → cached card
 _pending_connections: dict[str, dict] = {}  # token → pending connection details
 
+# Last tool result data for UI resource rendering. The MCP Apps spec says the
+# host fetches the resource via resources/read and renders it in an iframe.
+# Some hosts (like LibreChat nazq fork) don't reliably send postMessage with
+# tool data, so we inject the data directly into the HTML as a JS variable.
+_last_search_results: list[dict] | None = None
+_last_approval_data: dict | None = None
+
+# Physical approval mode — when set, pharos_approve requires a UI-originated
+# token that the AI agent cannot generate. This prevents the AI from
+# auto-approving connections in end-user chatbot scenarios (scenario 3).
+# Set PHAROS_REQUIRE_PHYSICAL_APPROVAL=true to enable physical approval
+# (prevents AI from calling pharos_approve directly). Default: false for CLI/dev,
+# set to true in Docker compose for end-user chatbot deployments.
+_REQUIRE_PHYSICAL_APPROVAL = os.environ.get(
+    "PHAROS_REQUIRE_PHYSICAL_APPROVAL", "false"
+).lower() in ("true", "1", "yes")
+
 # Signing key for pending connection tokens (HMAC-SHA256).
 # In production this would be a proper server secret; for local MCP it's
 # derived from the process ID + a static component.
@@ -579,8 +636,10 @@ async def pharos_search(
         query: Natural-language search query (e.g. "echo", "flight search", "file system")
         limit: Maximum number of results to return (default 10, max 50)
         remote_only: If True, only return servers with remote transports
-            (sse, streamable-http, http). Useful for environments that
-            cannot install local binaries (e.g. mobile agents, cloud-only).
+            (sse, streamable-http, http). Only set this to True when the
+            environment cannot install local binaries (e.g. mobile agents,
+            cloud-only). For desktop environments with local CLI access,
+            leave as False (default) to get all available servers.
 
     Returns:
         JSON array of matching servers with id, name, description, version,
@@ -621,6 +680,10 @@ async def pharos_search(
             "capabilities": card.capabilities,
             "endpoint": getattr(card, "endpoint", None),
         })
+
+    # Store for UI resource rendering
+    global _last_search_results
+    _last_search_results = output
 
     return json.dumps({"results": output, "count": len(output)})
 
@@ -807,46 +870,77 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
     # Build approval data for the UI
     approval_data = {
         "server": {
-            "id": card.id,
-            "display_name": card.display_name,
-            "version": card.version,
-            "transport": card.transport,
+            "id": str(card.id),
+            "display_name": str(card.display_name),
+            "description": str(card.description),
+            "version": str(card.version),
+            "transport": list(card.transport) if card.transport else [],
             "publisher": {
-                "name": card.publisher.name if card.publisher else "unknown",
-                "verified": card.publisher.verified if card.publisher else False,
+                "name": str(card.publisher.name) if card.publisher else "unknown",
+                "verified": bool(card.publisher.verified) if card.publisher else False,
             },
-            "endpoint": endpoint or "N/A",
+            "endpoint": str(endpoint) if endpoint else "N/A",
+            "capabilities": list(card.capabilities) if card.capabilities else [],
+            "tools_count": int(getattr(card, "tools_count", 0) or 0),
+            "pricing": "free",
+            "tags": list(card.tags) if card.tags else [],
+            "documentation_url": str(card.documentation_url) if card.documentation_url else None,
         },
         "purpose": purpose,
         "scopes": ["tools:call"],
-        "capabilities": card.capabilities,
+        "approval_token": raw_token,
     }
+
+    # Store for UI resource rendering
+    global _last_approval_data
+    _last_approval_data = approval_data
 
     return json.dumps({
         "status": "pending_approval",
         "server_id": server_id,
         "approval_token": raw_token,
         "expires_in": 300,
-        "message": f"Connection to '{card.display_name}' is pending. "
-                    "Ask the user to approve, then call pharos_approve "
-                    "with the approval_token to complete the connection.",
+        "message": f"Connection to '{card.display_name}' is pending user "
+                    "approval. An approval card has been rendered above. "
+                    "DO NOT call pharos_approve yourself — the user must "
+                    "physically click the Approve button. Tell the user: "
+                    "'Please click Approve in the PHAROS approval card to "
+                    "connect to this server.'",
         "approval_data": approval_data,
     })
 
 
 @mcp.tool()
-async def pharos_approve(approval_token: str) -> str:
+async def pharos_approve(approval_token: str, ui_origin: str = "") -> str:
     """Approve a pending MCP server connection.
 
     After pharos_connect returns a pending approval token, the user must
     confirm they want to connect. This tool completes the connection.
 
+    In end-user mode (PHAROS_REQUIRE_PHYSICAL_APPROVAL=true), this tool
+    can ONLY be called by the UI approval card (iframe postMessage), not
+    by the AI agent. The AI should tell the user to click the Approve
+    button in the approval card. If the AI calls this directly, it will
+    be rejected.
+
     Args:
         approval_token: The token returned by pharos_connect
+        ui_origin: Internal — set to 'ui-card-click' by the UI card.
+            AI agents should not set this parameter.
 
     Returns:
         JSON with connection status and available tools.
     """
+    # Physical approval enforcement — prevent AI from auto-approving
+    if _REQUIRE_PHYSICAL_APPROVAL and ui_origin != "ui-card-click":
+        return json.dumps({
+            "error": "Physical approval required. The user must click the "
+                     "Approve button in the approval card. AI agents cannot "
+                     "approve connections on behalf of users in this mode.",
+            "hint": "Tell the user to click the Approve button in the "
+                    "PHAROS approval card above. If no card is visible, "
+                    "ask them to scroll up or expand the pharos tool result.",
+        })
     # Look up the pending connection
     pending = _pending_connections.get(approval_token)
     if pending is None:
@@ -984,7 +1078,10 @@ MCP_APP_MIME = "text/html;profile=mcp-app"
 @mcp.resource("ui://pharos/approval", mime_type=MCP_APP_MIME)
 def approval_resource() -> str:
     """Approval UI card (MCP Apps). Rendered when user must approve a server connection."""
-    return APPROVAL_HTML
+    data = _last_approval_data or {}
+    return APPROVAL_HTML_TEMPLATE.replace(
+        "__APPROVAL_DATA__", json.dumps(data)
+    )
 
 
 @mcp.resource("ui://pharos/oauth", mime_type=MCP_APP_MIME)
@@ -996,7 +1093,10 @@ def oauth_resource() -> str:
 @mcp.resource("ui://pharos/results", mime_type=MCP_APP_MIME)
 def results_resource() -> str:
     """Search results gallery UI (MCP Apps). Rendered after pharos_search."""
-    return RESULTS_HTML
+    data = {"results": _last_search_results or []}
+    return RESULTS_HTML_TEMPLATE.replace(
+        "__RESULTS_DATA__", json.dumps(data)
+    )
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
