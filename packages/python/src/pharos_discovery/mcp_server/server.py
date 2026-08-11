@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -266,6 +267,7 @@ APPROVAL_HTML_TEMPLATE = """<!DOCTYPE html>
       params: {
         approved: approved,
         approval_token: TOOL_DATA?.approval_token || "",
+        approval_nonce: TOOL_DATA?.approval_nonce || "",
         timestamp: new Date().toISOString()
       }
     }, "*");
@@ -589,8 +591,15 @@ _pending_connections: dict[str, dict] = {}  # token → pending connection detai
 # host fetches the resource via resources/read and renders it in an iframe.
 # Some hosts (like LibreChat nazq fork) don't reliably send postMessage with
 # tool data, so we inject the data directly into the HTML as a JS variable.
-_last_search_results: list[dict] | None = None
-_last_approval_data: dict | None = None
+# Token-keyed caches prevent race conditions when multiple calls happen
+# concurrently — each call stores its data under its own unique key.
+_search_results_cache: dict[str, list[dict]] = {}  # search_id → results
+_approval_data_cache: dict[str, dict] = {}  # approval_token → data
+_current_search_id: str | None = None  # most recent (for resource handler)
+_current_approval_token: str | None = None  # most recent (for resource handler)
+
+# Max cache entries before auto-cleanup of oldest
+_MAX_CACHE_SIZE = 20
 
 # Physical approval mode — when set, pharos_approve requires a UI-originated
 # token that the AI agent cannot generate. This prevents the AI from
@@ -681,11 +690,17 @@ async def pharos_search(
             "endpoint": getattr(card, "endpoint", None),
         })
 
-    # Store for UI resource rendering
-    global _last_search_results
-    _last_search_results = output
+    # Store for UI resource rendering (token-scoped to prevent race conditions)
+    search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
+    _search_results_cache[search_id] = output
+    global _current_search_id
+    _current_search_id = search_id
+    # Prune oldest entries
+    if len(_search_results_cache) > _MAX_CACHE_SIZE:
+        oldest = next(iter(_search_results_cache))
+        del _search_results_cache[oldest]
 
-    return json.dumps({"results": output, "count": len(output)})
+    return json.dumps({"results": output, "count": len(output), "search_id": search_id})
 
 
 @mcp.tool()
@@ -857,6 +872,13 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
             "error": "Too many pending connections. Wait for existing tokens to expire (5 min) and try again.",
         })
 
+    # Generate a per-token approval nonce (UUID4).
+    # This nonce is injected into the HTML approval card but NEVER included
+    # in the tool response JSON. The AI cannot see it, cannot guess it,
+    # and cannot pass it to pharos_approve. Only the physical button click
+    # in the UI card sends it back.
+    approval_nonce = str(uuid.uuid4())
+
     # Store pending connection details
     _pending_connections[raw_token] = {
         "server_id": server_id,
@@ -865,9 +887,11 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
         "purpose": purpose,
         "signature": signature,
         "expires_at": expires_at,
+        "approval_nonce": approval_nonce,
     }
 
-    # Build approval data for the UI
+    # Build approval data for the UI (includes nonce — but this dict is
+    # only used for the HTML resource, NOT returned to the AI)
     approval_data = {
         "server": {
             "id": str(card.id),
@@ -889,12 +913,19 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
         "purpose": purpose,
         "scopes": ["tools:call"],
         "approval_token": raw_token,
+        "approval_nonce": approval_nonce,  # UI-only — never returned to AI
     }
 
-    # Store for UI resource rendering
-    global _last_approval_data
-    _last_approval_data = approval_data
+    # Store for UI resource rendering (token-scoped to prevent race conditions)
+    _approval_data_cache[raw_token] = approval_data
+    global _current_approval_token
+    _current_approval_token = raw_token
+    # Prune oldest entries
+    if len(_approval_data_cache) > _MAX_CACHE_SIZE:
+        oldest = next(iter(_approval_data_cache))
+        del _approval_data_cache[oldest]
 
+    # Return to AI — NO nonce field. AI only gets the token.
     return json.dumps({
         "status": "pending_approval",
         "server_id": server_id,
@@ -906,41 +937,33 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
                     "physically click the Approve button. Tell the user: "
                     "'Please click Approve in the PHAROS approval card to "
                     "connect to this server.'",
-        "approval_data": approval_data,
     })
 
 
 @mcp.tool()
-async def pharos_approve(approval_token: str, ui_origin: str = "") -> str:
+async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
     """Approve a pending MCP server connection.
 
     After pharos_connect returns a pending approval token, the user must
     confirm they want to connect. This tool completes the connection.
 
     In end-user mode (PHAROS_REQUIRE_PHYSICAL_APPROVAL=true), this tool
-    can ONLY be called by the UI approval card (iframe postMessage), not
-    by the AI agent. The AI should tell the user to click the Approve
-    button in the approval card. If the AI calls this directly, it will
-    be rejected.
+    requires a valid approval_nonce that was generated server-side and
+    injected into the HTML approval card. The nonce is never returned to
+    the AI in the tool response, so the AI cannot guess it (UUID4).
+    Only the physical button click in the UI card sends the nonce.
+
+    The AI should tell the user to click the Approve button. Do not
+    attempt to call this tool directly — it will fail without the nonce.
 
     Args:
         approval_token: The token returned by pharos_connect
-        ui_origin: Internal — set to 'ui-card-click' by the UI card.
-            AI agents should not set this parameter.
+        approval_nonce: Set by the UI approval card only. The AI does not
+            have access to this value and should not set it.
 
     Returns:
         JSON with connection status and available tools.
     """
-    # Physical approval enforcement — prevent AI from auto-approving
-    if _REQUIRE_PHYSICAL_APPROVAL and ui_origin != "ui-card-click":
-        return json.dumps({
-            "error": "Physical approval required. The user must click the "
-                     "Approve button in the approval card. AI agents cannot "
-                     "approve connections on behalf of users in this mode.",
-            "hint": "Tell the user to click the Approve button in the "
-                    "PHAROS approval card above. If no card is visible, "
-                    "ask them to scroll up or expand the pharos tool result.",
-        })
     # Look up the pending connection
     pending = _pending_connections.get(approval_token)
     if pending is None:
@@ -948,6 +971,23 @@ async def pharos_approve(approval_token: str, ui_origin: str = "") -> str:
             "error": "Invalid or unknown approval token. "
                      "Call pharos_connect first to get a new token.",
         })
+
+    # Physical approval enforcement — verify the per-token nonce.
+    # The nonce is a UUID4 generated server-side in pharos_connect.
+    # It's injected into the HTML card data but never returned to the AI
+    # in the tool response JSON. The AI cannot see it, cannot guess it
+    # (122 bits of entropy), and therefore cannot bypass physical approval.
+    if _REQUIRE_PHYSICAL_APPROVAL:
+        stored_nonce = pending.get("approval_nonce")
+        if not stored_nonce or approval_nonce != stored_nonce:
+            return json.dumps({
+                "error": "Physical approval required. The user must click the "
+                         "Approve button in the approval card. AI agents cannot "
+                         "approve connections on behalf of users in this mode.",
+                "hint": "Tell the user to click the Approve button in the "
+                        "PHAROS approval card above. If no card is visible, "
+                        "ask them to scroll up or expand the pharos tool result.",
+            })
 
     # Verify signature
     if not _verify_pending(approval_token, pending["server_id"], pending["signature"]):
@@ -1078,7 +1118,9 @@ MCP_APP_MIME = "text/html;profile=mcp-app"
 @mcp.resource("ui://pharos/approval", mime_type=MCP_APP_MIME)
 def approval_resource() -> str:
     """Approval UI card (MCP Apps). Rendered when user must approve a server connection."""
-    data = _last_approval_data or {}
+    # Use token-scoped data if available, fall back to most recent
+    token = _current_approval_token
+    data = _approval_data_cache.get(token, {}) if token else {}
     # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
     safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
     return APPROVAL_HTML_TEMPLATE.replace("__APPROVAL_DATA__", safe_json)
@@ -1093,7 +1135,10 @@ def oauth_resource() -> str:
 @mcp.resource("ui://pharos/results", mime_type=MCP_APP_MIME)
 def results_resource() -> str:
     """Search results gallery UI (MCP Apps). Rendered after pharos_search."""
-    data = {"results": _last_search_results or []}
+    # Use token-scoped data if available, fall back to most recent
+    search_id = _current_search_id
+    results = _search_results_cache.get(search_id, []) if search_id else []
+    data = {"results": results}
     # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
     safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
     return RESULTS_HTML_TEMPLATE.replace("__RESULTS_DATA__", safe_json)

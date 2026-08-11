@@ -292,7 +292,9 @@ class TestPharosConnect:
         assert data["status"] == "pending_approval"
         assert "approval_token" in data
         assert data["expires_in"] == 300
-        assert "approval_data" in data
+        # approval_data is NOT returned to the AI (contains nonce)
+        assert "approval_data" not in data
+        assert "approval_nonce" not in data
         # Connection should NOT be established yet
         assert "echo-server" not in srv._connections
         # get_server should NOT have been called (cached card)
@@ -310,6 +312,9 @@ class TestPharosConnect:
         data = json.loads(result)
         assert data["status"] == "pending_approval"
         token = data["approval_token"]
+        # Verify nonce was stored server-side but NOT returned to AI
+        assert "approval_nonce" not in data
+        assert "approval_nonce" in srv._pending_connections[token]
         # Step 2: approve completes the connection
         with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
             mock_mgr = AsyncMock()
@@ -322,6 +327,46 @@ class TestPharosConnect:
         assert data["status"] == "connected"
         assert data["server_id"] == "echo-server"
         assert data["tools_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_approve_rejected_without_nonce_in_physical_mode(self, mock_client, mock_server_card):
+        """pharos_approve should reject AI calls when physical approval is required."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_connect("echo-server")
+        data = json.loads(result)
+        token = data["approval_token"]
+        # Enable physical approval mode
+        with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
+            # AI calls approve WITHOUT the nonce (it doesn't have it)
+            result = await srv.pharos_approve(token)
+        data = json.loads(result)
+        assert "error" in data
+        assert "Physical approval required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_approve_succeeds_with_correct_nonce(self, mock_client, mock_server_card):
+        """pharos_approve should succeed when UI card sends the correct nonce."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_connect("echo-server")
+        data = json.loads(result)
+        token = data["approval_token"]
+        nonce = srv._pending_connections[token]["approval_nonce"]
+        with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
+            with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+                mock_mgr = AsyncMock()
+                mock_connection = AsyncMock()
+                mock_mgr.connect = AsyncMock(return_value=mock_connection)
+                MockMgr.return_value = mock_mgr
+                with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
+                    result = await srv.pharos_approve(token, approval_nonce=nonce)
+        data = json.loads(result)
+        assert data["status"] == "connected"
 
     @pytest.mark.asyncio
     async def test_approve_invalid_token(self):
