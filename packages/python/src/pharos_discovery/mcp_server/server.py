@@ -1079,9 +1079,9 @@ MCP_APP_MIME = "text/html;profile=mcp-app"
 def approval_resource() -> str:
     """Approval UI card (MCP Apps). Rendered when user must approve a server connection."""
     data = _last_approval_data or {}
-    return APPROVAL_HTML_TEMPLATE.replace(
-        "__APPROVAL_DATA__", json.dumps(data)
-    )
+    # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
+    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
+    return APPROVAL_HTML_TEMPLATE.replace("__APPROVAL_DATA__", safe_json)
 
 
 @mcp.resource("ui://pharos/oauth", mime_type=MCP_APP_MIME)
@@ -1094,9 +1094,9 @@ def oauth_resource() -> str:
 def results_resource() -> str:
     """Search results gallery UI (MCP Apps). Rendered after pharos_search."""
     data = {"results": _last_search_results or []}
-    return RESULTS_HTML_TEMPLATE.replace(
-        "__RESULTS_DATA__", json.dumps(data)
-    )
+    # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
+    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
+    return RESULTS_HTML_TEMPLATE.replace("__RESULTS_DATA__", safe_json)
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
