@@ -269,7 +269,7 @@ export class BrowserOAuthRenderer implements OAuthRenderer {
     this.timeout = timeout;
   }
 
-  async render(authorizeUrl: string, config: OAuthServerConfig): Promise<string> {
+  async render(_authorizeUrl: string, _config: OAuthServerConfig): Promise<string> {
     // In a real web-agent context, this would inject the iframe into the DOM
     // and listen for postMessage events. Here we generate the HTML and
     // raise an error indicating the host should handle it.
@@ -614,7 +614,7 @@ export class OAuthFlowHandler {
     const config = await this.getServerConfig(serverName);
 
     // 2. Build authorize URL
-    const { authorizeUrl, state, codeVerifier, redirectUri } =
+    const { authorizeUrl, state, codeVerifier } =
       await this.buildAuthorizeUrl(config, {
         extraParams: options.extraParams,
       });
