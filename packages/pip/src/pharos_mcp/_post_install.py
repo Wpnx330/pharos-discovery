@@ -79,7 +79,7 @@ def _write_cursor_config(config_path: Path):
     servers["pharos"] = {
         "command": "pharos-mcp",
         "env": {
-            "PHAROS_REGISTRY_URL": "https://getpharos.dev",
+            "PHAROS_REGISTRY_URL": "https://api.getpharos.dev",
         },
     }
     existing["mcpServers"] = servers
@@ -101,7 +101,7 @@ def _write_claude_config(config_path: Path):
     servers["pharos"] = {
         "command": "pharos-mcp",
         "env": {
-            "PHAROS_REGISTRY_URL": "https://getpharos.dev",
+            "PHAROS_REGISTRY_URL": "https://api.getpharos.dev",
         },
     }
     existing["mcpServers"] = servers

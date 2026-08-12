@@ -3,7 +3,7 @@
 
 This script demonstrates the full discovery lifecycle:
 
-1. Search the live Pharos registry (https://getpharos.dev) for MCP servers.
+1. Search the live Pharos registry (https://api.getpharos.dev) for MCP servers.
 2. Display the returned ServerCard.
 3. Run the approval flow (auto-approve in this demo).
 4. Connect to a local mock MCP server via the ConnectionManager.
@@ -57,7 +57,7 @@ class AutoApproveHandler:
 # Main demo
 # ---------------------------------------------------------------------------
 
-REGISTRY_URL = "https://getpharos.dev"
+REGISTRY_URL = "https://api.getpharos.dev"
 MOCK_MCP_URL = "http://127.0.0.1:8765/mcp"
 
 

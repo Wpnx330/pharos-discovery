@@ -1,5 +1,9 @@
 # Pharos Discovery SDK
 
+![Pharos Discovery SDK](github-social-preview.png)
+
+![Agent Integration Demo](demo.gif)
+
 Universal agent discovery framework for [MCP (Model Context Protocol)](https://modelcontextprotocol.io) servers — search, approve, and connect to MCP servers from any registry.
 
 ## Features
@@ -36,7 +40,7 @@ npm install @pharos/discovery
 ```python
 from pharos_discovery import RegistryClient, ApprovalEngine
 
-client = RegistryClient("https://getpharos.dev")
+client = RegistryClient("https://api.getpharos.dev")
 results = await client.search("filesystem")
 
 # Approve and connect
@@ -49,7 +53,7 @@ token = engine.sign_token(server_id="fs-server", scopes=["read"])
 ```typescript
 import { RegistryClient, ApprovalEngine } from "@pharos/discovery";
 
-const client = new RegistryClient("https://getpharos.dev");
+const client = new RegistryClient("https://api.getpharos.dev");
 const results = await client.search("filesystem");
 
 const engine = new ApprovalEngine({ secret: "your-hmac-secret" });
@@ -117,7 +121,7 @@ PHAROS_MCP_TRANSPORT=streamable-http PHAROS_MCP_PORT=8766 \
 
 | Env Var | Default | Description |
 |---|---|---|
-| `PHAROS_REGISTRY_URL` | `https://getpharos.dev` | Registry base URL |
+| `PHAROS_REGISTRY_URL` | `https://api.getpharos.dev` | Registry base URL |
 | `PHAROS_CLI` | `pharos` | Path to the `pharos` CLI binary (used by `pharos_install`) |
 | `PHAROS_MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, or `streamable-http` |
 | `PHAROS_MCP_HOST` | `0.0.0.0` | Bind host (SSE / streamable-http only) |

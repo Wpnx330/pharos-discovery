@@ -621,7 +621,7 @@ def _get_client() -> PharosClient:
     """Get or create the global PharosClient instance."""
     global _client
     if _client is None:
-        registry_url = os.environ.get("PHAROS_REGISTRY_URL", "https://getpharos.dev")
+        registry_url = os.environ.get("PHAROS_REGISTRY_URL", "https://api.getpharos.dev")
         _client = PharosClient(registry_url)
     return _client
 
