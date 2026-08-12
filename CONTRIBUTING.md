@@ -126,6 +126,10 @@ Open a GitHub issue with:
 - Steps to reproduce
 - Your runtime versions (`python --version`, `node --version`)
 
+## Author
+
+Built by [Chris Wykel](https://chriswykel.com) — reach me at chris@chriswykel.com.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the MIT license.

@@ -150,6 +150,10 @@ cd packages/typescript
 npx vitest run
 ```
 
+## Author
+
+Built by [Chris Wykel](https://chriswykel.com) — reach me at chris@chriswykel.com.
+
 ## License
 
 MIT © Chris Wykel
