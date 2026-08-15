@@ -311,14 +311,13 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; overflow: hidden; }
+  html, body { position: fixed; inset: 0; overflow: hidden; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
     display: flex;
     flex-direction: column;
-    height: 100vh;
   }
   .header {
     display: flex;
@@ -458,7 +457,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
 
       const desc = document.createElement("div");
       desc.className = "result-desc";
-      desc.textContent = r.description || "No description available.";
+      desc.textContent = stripMarkdown(r.description || "No description available.");
       summary.appendChild(desc);
 
       // Meta line (always visible)
@@ -512,7 +511,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       if (r.description && r.description.length > 60) {
         const dr = document.createElement("div");
         dr.className = "detail-row";
-        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml(r.description) + '</span>';
+        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml(stripMarkdown(r.description)) + '</span>';
         details.appendChild(dr);
       }
 
@@ -595,6 +594,34 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   function escapeHtml(s) {
     if (!s) return "";
     return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  function stripMarkdown(s) {
+    if (!s) return "";
+    let t = String(s);
+    // Remove code blocks (``` ... ```)
+    t = t.replace(/```[\s\S]*?```/g, " [code] ");
+    // Remove inline code `...`
+    t = t.replace(/`([^`]+)`/g, "$1");
+    // Remove headers
+    t = t.replace(/^#{1,6}\s+/gm, "");
+    // Remove bold/italic markers
+    t = t.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/__([^_]+)__/g, "$1");
+    t = t.replace(/\*([^*]+)\*/g, "$1").replace(/_([^_]+)_/g, "$1");
+    // Remove links [text](url) → text
+    t = t.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+    // Remove images ![alt](url)
+    t = t.replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1");
+    // Remove list markers
+    t = t.replace(/^[\s]*[-*+]\s+/gm, "");
+    t = t.replace(/^[\s]*\d+\.\s+/gm, "");
+    // Remove blockquotes
+    t = t.replace(/^>\s+/gm, "");
+    // Remove horizontal rules
+    t = t.replace(/^---+$/gm, "");
+    // Collapse whitespace
+    t = t.replace(/\n{2,}/g, "\n").trim();
+    return t;
   }
 
   renderResults(TOOL_DATA);
@@ -1266,6 +1293,194 @@ async def pharos_call_tool(
             "server_id": server_id,
             "tool": tool_name,
         })
+
+
+@mcp.tool()
+async def pharos_list_installed() -> str:
+    """List all MCP servers installed or registered on the local machine.
+
+    Returns servers installed via pharos_install (remote registrations)
+    as well as servers installed via the pharos CLI (by checking the
+    ~/.pharos directory for installed server configs).
+
+    Returns:
+        JSON array of installed servers with id, transport, status,
+        and install metadata.
+    """
+    results = []
+
+    # 1. Report in-memory remote registrations
+    for sid, meta in _installed_servers.items():
+        results.append({
+            "server_id": sid,
+            "transport": meta.get("transport", "unknown"),
+            "endpoint": meta.get("endpoint"),
+            "installed_at": meta.get("installed_at"),
+            "source": "mcp_registered",
+        })
+
+    # 2. Query the pharos CLI for locally installed servers
+    cli = _get_pharos_cli()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "list", "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "pharos list timed out", "installed": results})
+    except FileNotFoundError:
+        # CLI not installed — return only in-memory registrations
+        return json.dumps({"installed": results, "count": len(results),
+                           "note": "pharos CLI not found; only showing MCP-registered servers."})
+    except Exception as e:
+        return json.dumps({"error": f"pharos list failed: {e}", "installed": results})
+
+    # Parse CLI output
+    cli_output = ""
+    if proc.returncode == 0 and stdout:
+        cli_output = stdout.decode().strip()
+        try:
+            # Try JSON parse first (--json flag)
+            parsed = json.loads(cli_output)
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    sid = entry.get("name") or entry.get("id") or "unknown"
+                    results.append({
+                        "server_id": sid,
+                        "transport": entry.get("transport", "unknown"),
+                        "status": entry.get("status", "unknown"),
+                        "source": "cli",
+                    })
+            elif isinstance(parsed, dict) and "servers" in parsed:
+                for entry in parsed["servers"]:
+                    sid = entry.get("name") or entry.get("id") or "unknown"
+                    results.append({
+                        "server_id": sid,
+                        "transport": entry.get("transport", "unknown"),
+                        "status": entry.get("status", "unknown"),
+                        "source": "cli",
+                    })
+        except json.JSONDecodeError:
+            # CLI may not support --json; parse text output
+            for line in cli_output.splitlines():
+                line = line.strip()
+                if line and not line.startswith("NAME") and not line.startswith("-"):
+                    parts = line.split()
+                    if parts:
+                        results.append({
+                            "server_id": parts[0],
+                            "transport": parts[1] if len(parts) > 1 else "unknown",
+                            "status": parts[2] if len(parts) > 2 else "unknown",
+                            "source": "cli",
+                        })
+
+    return json.dumps({"installed": results, "count": len(results)})
+
+
+@mcp.tool()
+async def pharos_uninstall(server_id: str) -> str:
+    """Uninstall an MCP server from the local machine.
+
+    For remote-registered servers (installed via pharos_install), this
+    removes the in-memory registration. For CLI-installed servers, this
+    calls the pharos CLI to uninstall the server.
+
+    Args:
+        server_id: The server ID to uninstall
+
+    Returns:
+        JSON with uninstall status.
+    """
+    # Remove in-memory registration if present
+    removed_local = False
+    if server_id in _installed_servers:
+        del _installed_servers[server_id]
+        removed_local = True
+
+    # Disconnect if connected
+    if server_id in _connections:
+        try:
+            conn = _connections[server_id]
+            if hasattr(conn, "close"):
+                await conn.close()
+            del _connections[server_id]
+        except Exception:
+            pass
+
+    # Call pharos CLI to uninstall
+    cli = _get_pharos_cli()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "uninstall", server_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "Uninstall timed out", "server_id": server_id})
+    except FileNotFoundError:
+        if removed_local:
+            return json.dumps({"status": "unregistered", "server_id": server_id,
+                               "message": "Removed MCP registration. pharos CLI not found for full uninstall."})
+        return json.dumps({"error": "pharos CLI not found", "server_id": server_id})
+    except Exception as e:
+        return json.dumps({"error": f"Uninstall failed: {e}", "server_id": server_id})
+
+    if proc.returncode != 0:
+        err = stderr.decode().strip() if stderr else ""
+        if removed_local:
+            return json.dumps({"status": "partial", "server_id": server_id,
+                               "message": "Removed MCP registration, but CLI uninstall failed.",
+                               "cli_error": err})
+        return json.dumps({"error": "Uninstall failed", "stderr": err, "server_id": server_id})
+
+    return json.dumps({
+        "status": "uninstalled",
+        "server_id": server_id,
+        "output": stdout.decode().strip() if stdout else "",
+    })
+
+
+@mcp.tool()
+async def pharos_daemon_status() -> str:
+    """Check the status of the Pharos daemon.
+
+    The Pharos daemon manages local MCP server processes, including
+    auto-unload for idle servers and hot-reload of configurations.
+    This tool queries the daemon status via the pharos CLI.
+
+    Returns:
+        JSON with daemon running status, PID, uptime, and managed servers.
+    """
+    cli = _get_pharos_cli()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "daemon", "status",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "Daemon status timed out"})
+    except FileNotFoundError:
+        return json.dumps({"error": "pharos CLI not found",
+                           "hint": "Install the pharos CLI to use daemon features."})
+    except Exception as e:
+        return json.dumps({"error": f"Status check failed: {e}"})
+
+    output = stdout.decode().strip() if stdout else ""
+    err = stderr.decode().strip() if stderr else ""
+
+    # Parse common status outputs
+    is_running = "running" in output.lower() and "not running" not in output.lower()
+
+    return json.dumps({
+        "running": is_running,
+        "raw_output": output,
+        "raw_stderr": err if err else None,
+    })
 
 
 # ─── MCP Resources (MCP Apps UI) ──────────────────────────────────────────────
