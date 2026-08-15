@@ -311,29 +311,80 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; }
+  html, body { height: 100%; overflow: hidden; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
-    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
-  .header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
+  }
   .logo { font-size: 20px; }
   .title { font-size: 16px; font-weight: 600; }
+  .result-count { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+  #results {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+  }
   .result-card {
     background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 12px;
-    margin-bottom: 8px;
-    cursor: pointer;
+    margin-bottom: 6px;
+    overflow: hidden;
     transition: border-color 0.15s;
   }
   .result-card:hover { border-color: var(--accent); }
+  .result-card.expanded { border-color: var(--accent); }
+  .card-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .expand-icon {
+    font-size: 12px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    margin-top: 2px;
+    transition: transform 0.2s;
+  }
+  .result-card.expanded .expand-icon { transform: rotate(90deg); }
+  .card-summary { flex: 1; min-width: 0; }
   .result-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
-  .result-desc { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
-  .result-meta { display: flex; gap: 8px; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; align-items: center; }
+  .result-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .result-card.expanded .result-desc {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .result-meta {
+    display: flex;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-wrap: wrap;
+    align-items: center;
+    margin-top: 4px;
+  }
   .badge {
     display: inline-block;
     padding: 1px 6px;
@@ -343,6 +394,19 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .badge-verified { background: rgba(63, 185, 80, 0.15); color: var(--success); }
   .badge-tools { background: rgba(88, 166, 255, 0.1); color: var(--accent); }
+  .badge-tag { background: rgba(139, 148, 158, 0.1); color: var(--text-muted); }
+  .card-details {
+    display: none;
+    padding: 0 12px 12px 32px;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+  .result-card.expanded .card-details { display: block; }
+  .detail-row { display: flex; gap: 6px; margin-bottom: 2px; }
+  .detail-label { color: var(--text); font-weight: 500; min-width: 80px; }
+  .detail-value { word-break: break-word; }
+  .tag-list { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
   #empty { text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px; }
 </style>
 </head>
@@ -350,6 +414,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="header">
     <span class="logo">🔍</span>
     <span class="title">PHAROS Search Results</span>
+    <span class="result-count" id="count"></span>
   </div>
   <div id="results"></div>
   <div id="empty" style="display:none">No servers found. Try a different query.</div>
@@ -360,10 +425,13 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   function renderResults(data) {
     const results = data?.results || [];
     const container = document.getElementById("results");
+    const countEl = document.getElementById("count");
     if (!results.length) {
       document.getElementById("empty").style.display = "block";
+      countEl.textContent = "";
       return;
     }
+    countEl.textContent = results.length + " server" + (results.length > 1 ? "s" : "");
     container.innerHTML = "";
     results.forEach((r, i) => {
       const card = document.createElement("div");
@@ -371,16 +439,29 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       card.dataset.id = r.id;
       card.dataset.index = i;
 
+      // --- Collapsible header ---
+      const header = document.createElement("div");
+      header.className = "card-header";
+
+      const icon = document.createElement("span");
+      icon.className = "expand-icon";
+      icon.textContent = "▶";
+      header.appendChild(icon);
+
+      const summary = document.createElement("div");
+      summary.className = "card-summary";
+
       const name = document.createElement("div");
       name.className = "result-name";
       name.textContent = r.display_name || r.name || r.id;
-      card.appendChild(name);
+      summary.appendChild(name);
 
       const desc = document.createElement("div");
       desc.className = "result-desc";
-      desc.textContent = r.description || "";
-      card.appendChild(desc);
+      desc.textContent = r.description || "No description available.";
+      summary.appendChild(desc);
 
+      // Meta line (always visible)
       const meta = document.createElement("div");
       meta.className = "result-meta";
 
@@ -393,7 +474,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       meta.appendChild(sep1);
 
       const tr = document.createElement("span");
-      tr.textContent = (r.transport || []).join(", ");
+      tr.textContent = Array.isArray(r.transport) ? r.transport.join(", ") : (r.transport || "unknown");
       meta.appendChild(tr);
 
       const sep2 = document.createElement("span");
@@ -401,11 +482,11 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       meta.appendChild(sep2);
 
       const pub = document.createElement("span");
-      pub.textContent = r.publisher?.name || "unknown";
+      pub.textContent = r.publisher?.name || r.publisher?.id || "unknown";
       if (r.publisher?.verified) {
         const badge = document.createElement("span");
         badge.className = "badge badge-verified";
-        badge.textContent = "verified";
+        badge.textContent = "✓ verified";
         pub.appendChild(document.createTextNode(" "));
         pub.appendChild(badge);
       }
@@ -420,12 +501,82 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
         tb.textContent = r.tools_count + " tools";
         meta.appendChild(tb);
       }
-      card.appendChild(meta);
-      container.appendChild(card);
-    });
+      summary.appendChild(meta);
+      header.appendChild(summary);
+      card.appendChild(header);
 
-    document.querySelectorAll(".result-card").forEach(card => {
-      card.addEventListener("click", () => {
+      // --- Expandable details ---
+      const details = document.createElement("div");
+      details.className = "card-details";
+
+      if (r.description && r.description.length > 60) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml(r.description) + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.id) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">Server ID</span><span class="detail-value">' + escapeHtml(r.id) + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.endpoint) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">Endpoint</span><span class="detail-value">' + escapeHtml(r.endpoint) + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.license) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">License</span><span class="detail-value">' + escapeHtml(r.license) + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.pricing) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">Pricing</span><span class="detail-value">' + escapeHtml(r.pricing) + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.capabilities && r.capabilities.length) {
+        const dr = document.createElement("div");
+        dr.className = "detail-row";
+        dr.innerHTML = '<span class="detail-label">Capabilities</span><span class="detail-value">' + r.capabilities.map(escapeHtml).join(", ") + '</span>';
+        details.appendChild(dr);
+      }
+
+      if (r.tags && r.tags.length) {
+        const tagLabel = document.createElement("div");
+        tagLabel.className = "detail-row";
+        tagLabel.innerHTML = '<span class="detail-label">Tags</span>';
+        const tagList = document.createElement("div");
+        tagList.className = "tag-list";
+        r.tags.forEach(t => {
+          const tag = document.createElement("span");
+          tag.className = "badge badge-tag";
+          tag.textContent = t;
+          tagList.appendChild(tag);
+        });
+        tagLabel.appendChild(tagList);
+        details.appendChild(tagLabel);
+      }
+
+      card.appendChild(details);
+
+      // Toggle expand/collapse on header click
+      header.addEventListener("click", (e) => {
+        e.stopPropagation();
+        card.classList.toggle("expanded");
+      });
+
+      // Double-click selects the server (sends postMessage to host)
+      card.addEventListener("dblclick", () => {
         window.parent.postMessage({
           jsonrpc: "2.0",
           method: "notifications/tool_result",
@@ -436,7 +587,14 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
           }
         }, "*");
       });
+
+      container.appendChild(card);
     });
+  }
+
+  function escapeHtml(s) {
+    if (!s) return "";
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   }
 
   renderResults(TOOL_DATA);
