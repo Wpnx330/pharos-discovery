@@ -482,6 +482,55 @@ class TestUIResources:
         assert html.startswith("<!DOCTYPE html>")
         assert "</html>" in html
 
+    def test_results_html_error_handler_before_render(self):
+        """Error handler must be registered BEFORE renderResults() call.
+
+        If renderResults throws synchronously and the error listener is
+        registered after the call, the error is silently swallowed and
+        the #results div stays empty — the exact bug we fixed.
+        """
+        html = srv.results_resource()
+        script_start = html.index("<script>")
+        script_end = html.index("</script>")
+        script = html[script_start:script_end]
+
+        error_listener_pos = script.index("addEventListener('error'")
+        render_call_pos = script.index("renderResults(TOOL_DATA)")
+        assert error_listener_pos < render_call_pos, (
+            "window.addEventListener('error') must appear BEFORE renderResults(TOOL_DATA) "
+            "in the script, otherwise synchronous errors are silently swallowed"
+        )
+
+    def test_results_html_render_wrapped_in_try_catch(self):
+        """renderResults(TOOL_DATA) call must be wrapped in try/catch.
+
+        Belt-and-suspenders: even with the error listener registered first,
+        some browsers don't fire 'error' for same-script exceptions. The
+        try/catch ensures we always display the error in the #results div.
+        """
+        html = srv.results_resource()
+        script_start = html.index("<script>")
+        script_end = html.index("</script>")
+        script = html[script_start:script_end]
+
+        # Find the renderResults(TOOL_DATA) call and verify it's inside a try block
+        render_pos = script.index("renderResults(TOOL_DATA)")
+        before = script[:render_pos]
+        after = script[render_pos:]
+
+        # There must be a "try {" before the render call (the last one before it)
+        assert "try {" in before, "renderResults(TOOL_DATA) must be inside a try block"
+        # There must be a "catch" after the render call
+        assert "catch" in after, "renderResults(TOOL_DATA) must have a catch block after it"
+
+    def test_results_html_escapehtml_handles_null(self):
+        """escapeHtml must handle null/undefined without throwing."""
+        html = srv.results_resource()
+        # The fix changes `if (!s)` to `if (s === null || s === undefined)`
+        assert "s === null" in html or "s === undefined" in html, (
+            "escapeHtml should explicitly check for null/undefined, not falsy"
+        )
+
     def test_mime_type_constant(self):
         """MIME type should be the MCP Apps spec value."""
         assert srv.MCP_APP_MIME == "text/html;profile=mcp-app"

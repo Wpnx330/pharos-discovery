@@ -311,15 +311,14 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html { height: 100%; }
+  html, body { height: 100%; overflow: hidden; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
     display: flex;
     flex-direction: column;
-    min-height: 100%;
-    height: 100%;
+    height: 100vh;
   }
   .header {
     display: flex;
@@ -333,9 +332,8 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   .title { font-size: 16px; font-weight: 600; }
   .result-count { font-size: 12px; color: var(--text-muted); margin-left: auto; }
   #results {
-    flex: 1 1 auto;
+    flex: 1;
     overflow-y: auto;
-    min-height: 0;
     padding: 12px 16px;
   }
   .result-card {
@@ -460,7 +458,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
 
       const desc = document.createElement("div");
       desc.className = "result-desc";
-      desc.textContent = stripMarkdown(r.description || "No description available.");
+      desc.textContent = (r.description || "No description available.").replace(/[#*`>_~]/g, "").substring(0, 200);
       summary.appendChild(desc);
 
       // Meta line (always visible)
@@ -514,7 +512,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       if (r.description && r.description.length > 60) {
         const dr = document.createElement("div");
         dr.className = "detail-row";
-        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml(stripMarkdown(r.description)) + '</span>';
+        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml((r.description || "").replace(/[#*`>_~]/g, "").substring(0, 500)) + '</span>';
         details.appendChild(dr);
       }
 
@@ -595,52 +593,43 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   function escapeHtml(s) {
-    if (!s) return "";
+    if (s === null || s === undefined) return "";
     return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   }
 
-  function stripMarkdown(s) {
-    if (!s) return "";
-    let t = String(s);
-    // Remove code blocks (``` ... ```)
-    t = t.replace(/```[\s\S]*?```/g, " [code] ");
-    // Remove inline code `...`
-    t = t.replace(/`([^`]+)`/g, "$1");
-    // Remove headers
-    t = t.replace(/^#{1,6}\s+/gm, "");
-    // Remove bold/italic markers
-    t = t.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/__([^_]+)__/g, "$1");
-    t = t.replace(/\*([^*]+)\*/g, "$1").replace(/_([^_]+)_/g, "$1");
-    // Remove links [text](url) → text
-    t = t.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
-    // Remove images ![alt](url)
-    t = t.replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1");
-    // Remove list markers
-    t = t.replace(/^[\s]*[-*+]\s+/gm, "");
-    t = t.replace(/^[\s]*\d+\.\s+/gm, "");
-    // Remove blockquotes
-    t = t.replace(/^>\s+/gm, "");
-    // Remove horizontal rules
-    t = t.replace(/^---+$/gm, "");
-    // Collapse whitespace
-    t = t.replace(/\n{2,}/g, "\n").trim();
-    return t;
-  }
-
-  renderResults(TOOL_DATA);
+  // Error display — MUST be registered BEFORE renderResults() call,
+  // otherwise a synchronous throw in renderResults is silently swallowed
+  // and the #results div stays empty with no visible error.
+  window.addEventListener('error', function(e) {
+    var d = document.getElementById('results');
+    if (d) d.innerHTML = '<div style="color:#f85149;padding:12px;font-size:12px">Render error: ' + (e.message || 'unknown') + ' at ' + (e.filename || '?') + ':' + (e.lineno || '?') + '</div>';
+  });
 
   // Also listen for postMessage from host (dual-mode)
   window.addEventListener("message", (event) => {
     const msg = event.data;
     if (!msg || msg.jsonrpc !== "2.0") return;
     if (msg.method === "notifications/tool_result") {
-      renderResults(msg.params);
+      try { renderResults(msg.params); } catch(err) {
+        var d = document.getElementById('results');
+        if (d) d.innerHTML = '<div style="color:#f85149;padding:12px;font-size:12px">Render error (postMessage): ' + (err.message || String(err)) + '</div>';
+      }
     }
   });
+
+  // Render — wrapped in try/catch as belt-and-suspenders. The window
+  // 'error' listener above catches errors from this call, but an
+  // explicit try/catch ensures we can display the error even in
+  // browsers that don't fire 'error' for same-script exceptions.
+  try {
+    renderResults(TOOL_DATA);
+  } catch(err) {
+    var d = document.getElementById('results');
+    if (d) d.innerHTML = '<div style="color:#f85149;padding:12px;font-size:12px">Render error: ' + (err.message || String(err)) + '<br><pre style="margin-top:8px;white-space:pre-wrap;font-size:11px">' + (err.stack || '') + '</pre></div>';
+  }
 </script>
 </body>
 </html>"""
-
 OAUTH_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
