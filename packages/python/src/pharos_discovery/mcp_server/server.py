@@ -311,13 +311,15 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     --success: #3fb950;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { position: fixed; inset: 0; overflow: hidden; }
+  html { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
     display: flex;
     flex-direction: column;
+    min-height: 100%;
+    height: 100%;
   }
   .header {
     display: flex;
@@ -331,8 +333,9 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   .title { font-size: 16px; font-weight: 600; }
   .result-count { font-size: 12px; color: var(--text-muted); margin-left: auto; }
   #results {
-    flex: 1;
+    flex: 1 1 auto;
     overflow-y: auto;
+    min-height: 0;
     padding: 12px 16px;
   }
   .result-card {
