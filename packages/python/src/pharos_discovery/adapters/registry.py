@@ -46,9 +46,24 @@ def _normalize_to_server_card(
 
     # Publisher — live registry uses {namespace, verified}
     pub_raw = item.get("publisher") or {}
+    _pub_namespace = pub_raw.get("namespace") or pub_raw.get("id") or "unknown"
+    _pub_name = pub_raw.get("namespace") or pub_raw.get("name") or "unknown"
+
+    # Map "official-sync" to a user-friendly source label
+    _SOURCE_DISPLAY = {
+        "modelcontextprotocol.io": "mcp.io",
+        "mcp.so": "mcp.so",
+        "glama.ai": "glama.ai",
+        "smithery": "smithery",
+        "pharos": "pharos",
+    }
+    if _pub_name == "official-sync" and source_registry != "pharos":
+        display_source = _SOURCE_DISPLAY.get(source_registry, source_registry)
+        _pub_name = f"synced {display_source}"
+
     publisher = Publisher(
-        id=pub_raw.get("namespace") or pub_raw.get("id") or "unknown",
-        name=pub_raw.get("namespace") or pub_raw.get("name") or "unknown",
+        id=_pub_namespace,
+        name=_pub_name,
         verified=pub_raw.get("verified"),
         verification_method=pub_raw.get("verification_method"),
         contact=pub_raw.get("contact"),

@@ -427,15 +427,12 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     font-size: 12px;
     color: var(--text-muted);
     overflow: hidden;
-    max-height: 1.4em;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    max-height: 3.6em;
+    line-height: 1.4;
   }
   .result-card.expanded .result-desc {
-    white-space: normal;
-    overflow: visible;
-    max-height: none;
-    text-overflow: clip;
+    max-height: 400px;
+    overflow-y: auto;
   }
   .result-meta {
     display: flex;
@@ -455,6 +452,12 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .badge-verified { background: rgba(63, 185, 80, 0.15); color: var(--success); }
   .badge-tools { background: rgba(88, 166, 255, 0.1); color: var(--accent); }
+  .badge-version { background: rgba(88, 166, 255, 0.08); color: var(--accent); }
+  .badge-transport { background: rgba(139, 148, 158, 0.12); color: var(--text-muted); font-family: var(--font-mono, monospace); }
+  .badge-publisher { background: rgba(139, 148, 158, 0.12); color: var(--text-muted); }
+  .badge-downloads { background: rgba(63, 185, 80, 0.1); color: var(--success); }
+  .badge-category { background: rgba(139, 148, 158, 0.08); color: var(--text-muted); }
+  .badge-pricing { background: rgba(248, 81, 73, 0.1); color: var(--danger); }
   .badge-tag { background: rgba(139, 148, 158, 0.1); color: var(--text-muted); }
   .card-details {
     display: none;
@@ -468,6 +471,23 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   .detail-label { color: var(--text); font-weight: 500; min-width: 80px; }
   .detail-value { word-break: break-word; }
   .tag-list { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+
+  /* Markdown rendering in result-desc */
+  .result-desc img { max-height: 20px; width: auto; vertical-align: middle; display: inline-block; margin: 0 2px; opacity: 0.9; }
+  .result-desc a { color: var(--accent); text-decoration: none; }
+  .result-desc a:hover { text-decoration: underline; }
+  .result-desc code { font-family: 'SF Mono', 'Consolas', monospace; font-size: 0.9em; background: var(--card-bg); padding: 1px 4px; border-radius: 3px; }
+  .result-desc pre { font-family: 'SF Mono', 'Consolas', monospace; font-size: 12px; background: var(--card-bg); padding: 8px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+  .result-desc ul, .result-desc ol { margin: 4px 0; padding-left: 18px; }
+  .result-desc ul { list-style: disc; }
+  .result-desc ol { list-style: decimal; }
+  .result-desc p { margin: 2px 0; }
+  .result-desc h1 { font-size: 16px; font-weight: 700; margin: 6px 0 2px; }
+  .result-desc h2 { font-size: 15px; font-weight: 600; margin: 6px 0 2px; }
+  .result-desc h3 { font-size: 14px; font-weight: 600; margin: 4px 0 2px; }
+  .result-desc blockquote { border-left: 2px solid var(--border); padding-left: 10px; color: var(--text-muted); margin: 4px 0; }
+  .result-desc table { border-collapse: collapse; margin: 4px 0; }
+  .result-desc th, .result-desc td { border: 1px solid var(--border); padding: 4px 8px; font-size: 11px; }
   #empty { text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px; }
 </style>
 </head>
@@ -519,49 +539,81 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
 
       const desc = document.createElement("div");
       desc.className = "result-desc";
-      desc.innerHTML = (r.description || "<em>No description available.</em>").substring(0, 600);
+      desc.innerHTML = r.description || "<em>No description available.</em>";
       summary.appendChild(desc);
 
-      // Meta line (always visible)
+      // Meta line (always visible) — metadata bar
       const meta = document.createElement("div");
       meta.className = "result-meta";
 
+      // Version badge
       const ver = document.createElement("span");
-      ver.textContent = r.version || "v?";
+      ver.className = "badge badge-version";
+      const verStr = r.version || "v?";
+      ver.textContent = (verStr === "0.0.0") ? "v unknown" : "v" + verStr;
       meta.appendChild(ver);
 
-      const sep1 = document.createElement("span");
-      sep1.textContent = "·";
-      meta.appendChild(sep1);
-
+      // Transport badge
       const tr = document.createElement("span");
+      tr.className = "badge badge-transport";
       tr.textContent = Array.isArray(r.transport) ? r.transport.join(", ") : (r.transport || "unknown");
       meta.appendChild(tr);
 
-      const sep2 = document.createElement("span");
-      sep2.textContent = "·";
-      meta.appendChild(sep2);
-
+      // Publisher / source
       const pub = document.createElement("span");
+      pub.className = "badge badge-publisher";
       pub.textContent = r.publisher?.name || r.publisher?.id || "unknown";
-      if (r.publisher?.verified) {
-        const badge = document.createElement("span");
-        badge.className = "badge badge-verified";
-        badge.textContent = "✓ verified";
-        pub.appendChild(document.createTextNode(" "));
-        pub.appendChild(badge);
-      }
       meta.appendChild(pub);
 
+      if (r.publisher?.verified) {
+        const vBadge = document.createElement("span");
+        vBadge.className = "badge badge-verified";
+        vBadge.textContent = "verified";
+        meta.appendChild(vBadge);
+      }
+
+      // Tools count
       if (r.tools_count) {
-        const sep3 = document.createElement("span");
-        sep3.textContent = "·";
-        meta.appendChild(sep3);
         const tb = document.createElement("span");
         tb.className = "badge badge-tools";
-        tb.textContent = r.tools_count + " tools";
+        tb.textContent = String(r.tools_count) + " tools";
         meta.appendChild(tb);
       }
+
+      // Downloads
+      if (r.downloads !== null && r.downloads !== undefined) {
+        const dl = document.createElement("span");
+        dl.className = "badge badge-downloads";
+        dl.textContent = "\u2193 " + r.downloads;
+        meta.appendChild(dl);
+      }
+
+      // Category
+      if (r.category) {
+        const cat = document.createElement("span");
+        cat.className = "badge badge-category";
+        cat.textContent = r.category;
+        meta.appendChild(cat);
+      }
+
+      // Pricing
+      if (r.pricing && r.pricing !== "free") {
+        const pr = document.createElement("span");
+        pr.className = "badge badge-pricing";
+        pr.textContent = r.pricing;
+        meta.appendChild(pr);
+      }
+
+      // Tags (compact, first 5)
+      if (r.tags && r.tags.length) {
+        r.tags.slice(0, 5).forEach(t => {
+          const tag = document.createElement("span");
+          tag.className = "badge badge-tag";
+          tag.textContent = t;
+          meta.appendChild(tag);
+        });
+      }
+
       summary.appendChild(meta);
       header.appendChild(summary);
       card.appendChild(header);
@@ -569,13 +621,6 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       // --- Expandable details ---
       const details = document.createElement("div");
       details.className = "card-details";
-
-      if (r.description && r.description.length > 60) {
-        const dr = document.createElement("div");
-        dr.className = "detail-row";
-        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + (r.description || "<em>No description available.</em>") + '</span>';
-        details.appendChild(dr);
-      }
 
       if (r.id) {
         const dr = document.createElement("div");
@@ -598,34 +643,11 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
         details.appendChild(dr);
       }
 
-      if (r.pricing) {
-        const dr = document.createElement("div");
-        dr.className = "detail-row";
-        dr.innerHTML = '<span class="detail-label">Pricing</span><span class="detail-value">' + escapeHtml(r.pricing) + '</span>';
-        details.appendChild(dr);
-      }
-
       if (r.capabilities && r.capabilities.length) {
         const dr = document.createElement("div");
         dr.className = "detail-row";
         dr.innerHTML = '<span class="detail-label">Capabilities</span><span class="detail-value">' + r.capabilities.map(escapeHtml).join(", ") + '</span>';
         details.appendChild(dr);
-      }
-
-      if (r.tags && r.tags.length) {
-        const tagLabel = document.createElement("div");
-        tagLabel.className = "detail-row";
-        tagLabel.innerHTML = '<span class="detail-label">Tags</span>';
-        const tagList = document.createElement("div");
-        tagList.className = "tag-list";
-        r.tags.forEach(t => {
-          const tag = document.createElement("span");
-          tag.className = "badge badge-tag";
-          tag.textContent = t;
-          tagList.appendChild(tag);
-        });
-        tagLabel.appendChild(tagList);
-        details.appendChild(tagLabel);
       }
 
       card.appendChild(details);
@@ -2533,8 +2555,11 @@ else:
                 or raw.get("download_count")
                 or raw.get("weekly_downloads")
                 or raw.get("install_count")
+                or raw.get("downloads30d")
             )
             stars = raw.get("stars") or raw.get("github_stars")
+            category = raw.get("category") or raw.get("categories")
+            source_registry = getattr(card, "source_registry", None) or raw.get("source_registry")
 
             # Pricing — use the structured PricingSpec if present, otherwise
             # fall back to the raw registry field.
@@ -2567,6 +2592,8 @@ else:
                 "pricing": pricing_label,
                 "downloads": int(downloads) if downloads is not None else None,
                 "stars": int(stars) if stars is not None else None,
+                "source_registry": source_registry,
+                "category": category if category else None,
                 "score": float(score) if score is not None else None,
                 "documentation_url": getattr(card, "documentation_url", None),
                 "license": raw.get("license"),

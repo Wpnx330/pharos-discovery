@@ -1301,6 +1301,7 @@ class TestAppsModeTools:
         result_mock.card.tags = ["test", "echo"]
         result_mock.card.pricing = None
         result_mock.card.documentation_url = None
+        result_mock.card.source_registry = "pharos"
         result_mock.score = None
         result_mock.raw_item = {}
         client.search = AsyncMock(return_value=[result_mock])
