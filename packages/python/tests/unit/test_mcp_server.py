@@ -2,10 +2,11 @@
 Unit tests for the PHAROS Discovery MCP Server (server.py).
 
 Tests cover:
-- Tool registration and schemas
+- Tool registration and schemas (CLI mode)
+- Mode switching: MCP_APPS_MODE env var controls which tools are registered
 - pharos_search: query normalization, limit clamping, error handling
 - pharos_install: CLI not found, timeout, success
-- pharos_connect: already connected, server not found, approval flow
+- /approve endpoint: valid, invalid, expired, missing/wrong nonce
 - pharos_list_tools: not connected, connected
 - pharos_call_tool: not connected, call delegation
 - UI resources: MIME type, content
@@ -19,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 from typing import Any
 
@@ -37,11 +39,13 @@ def reset_global_state():
     srv._connections.clear()
     srv._installed_servers.clear()
     srv._server_cards.clear()
+    srv._pending_connections.clear()
     yield
     srv._client = None
     srv._connections.clear()
     srv._installed_servers.clear()
     srv._server_cards.clear()
+    srv._pending_connections.clear()
 
 
 @pytest.fixture
@@ -87,7 +91,7 @@ def mock_server_card():
 # ─── Tool Registration ─────────────────────────────────────────────────────────
 
 class TestToolRegistration:
-    """Verify all 5 tools and 3 resources are registered with the FastMCP server."""
+    """Verify tools and resources are registered with the FastMCP server."""
 
     def test_server_name(self):
         """Server should be named 'pharos-discovery'."""
@@ -95,9 +99,7 @@ class TestToolRegistration:
         assert srv.mcp is not None
 
     def test_pharos_search_registered(self):
-        """pharos_search should be a registered tool."""
-        # FastMCP stores tools in _tool_manager
-        # We verify by checking the function is decorated and callable
+        """pharos_search should be a registered tool (CLI mode)."""
         assert callable(srv.pharos_search)
         assert srv.pharos_search.__doc__ is not None
         assert "Search the PHAROS registry" in srv.pharos_search.__doc__
@@ -106,13 +108,15 @@ class TestToolRegistration:
         assert callable(srv.pharos_install)
         assert "Install an MCP server" in srv.pharos_install.__doc__
 
-    def test_pharos_connect_registered(self):
-        assert callable(srv.pharos_connect)
-        assert "Request a connection" in srv.pharos_connect.__doc__
+    def test_pharos_list_registered(self):
+        """pharos_list should be a registered tool (renamed from pharos_list_installed)."""
+        assert callable(srv.pharos_list)
+        assert "List all MCP servers installed" in srv.pharos_list.__doc__
 
-    def test_pharos_approve_registered(self):
-        assert callable(srv.pharos_approve)
-        assert "Approve a pending" in srv.pharos_approve.__doc__
+    def test_pharos_remove_registered(self):
+        """pharos_remove should be a registered tool (renamed from pharos_uninstall)."""
+        assert callable(srv.pharos_remove)
+        assert "Remove an MCP server" in srv.pharos_remove.__doc__
 
     def test_pharos_list_tools_registered(self):
         assert callable(srv.pharos_list_tools)
@@ -121,6 +125,33 @@ class TestToolRegistration:
     def test_pharos_call_tool_registered(self):
         assert callable(srv.pharos_call_tool)
         assert "Call a tool on a connected MCP server" in srv.pharos_call_tool.__doc__
+
+    def test_approve_endpoint_registered(self):
+        """approve_endpoint should be callable (it's a custom_route, not a tool)."""
+        assert callable(srv.approve_endpoint)
+        assert srv.approve_endpoint.__doc__ is not None
+        assert "approval" in srv.approve_endpoint.__doc__.lower()
+
+    def test_pharos_connect_removed(self):
+        """pharos_connect should NOT exist (removed, folded into pharos_install_apps)."""
+        assert not hasattr(srv, "pharos_connect")
+
+    def test_pharos_approve_removed(self):
+        """pharos_approve should NOT exist as a tool (converted to /approve endpoint)."""
+        assert not hasattr(srv, "pharos_approve")
+
+    def test_pharos_list_installed_removed(self):
+        """Old name pharos_list_installed should NOT exist (renamed to pharos_list)."""
+        assert not hasattr(srv, "pharos_list_installed")
+
+    def test_pharos_uninstall_removed(self):
+        """Old name pharos_uninstall should NOT exist (renamed to pharos_remove)."""
+        assert not hasattr(srv, "pharos_uninstall")
+
+    def test_mcp_apps_mode_flag_exists(self):
+        """MCP_APPS_MODE should be a boolean module-level constant."""
+        assert hasattr(srv, "MCP_APPS_MODE")
+        assert isinstance(srv.MCP_APPS_MODE, bool)
 
     def test_approval_resource_registered(self):
         assert callable(srv.approval_resource)
@@ -256,106 +287,83 @@ class TestPharosInstall:
         assert "timed out" in data["error"]
 
 
-# ─── pharos_connect ────────────────────────────────────────────────────────────
+# ─── /approve Endpoint ─────────────────────────────────────────────────────────
 
-class TestPharosConnect:
-    """Test the pharos_connect tool."""
+class TestApproveEndpoint:
+    """Test the /approve HTTP endpoint (converted from the former pharos_approve tool).
 
-    @pytest.mark.asyncio
-    async def test_connect_already_connected(self, mock_client, mock_server_card):
-        """Should return already_connected when connection exists."""
-        srv._connections["echo-server"] = MagicMock()
-        srv._server_cards["echo-server"] = mock_server_card
-        result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        assert data["status"] == "already_connected"
+    The endpoint receives a JSON body with approval_token and approval_nonce
+    from the iframe UI button click. It is NOT an MCP tool — the AI cannot
+    see or call it.
+    """
 
-    @pytest.mark.asyncio
-    async def test_connect_server_not_found(self, mock_client):
-        """Should return error when server is not found in registry."""
-        mock_client.get_server = AsyncMock(side_effect=Exception("not found"))
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("nonexistent")
-        data = json.loads(result)
-        assert "error" in data
-        assert "not found" in data["error"].lower()
+    def _make_request(self, body: dict) -> MagicMock:
+        """Create a mock Starlette Request with the given JSON body."""
+        request = AsyncMock()
+        request.json = AsyncMock(return_value=body)
+        return request
 
     @pytest.mark.asyncio
-    async def test_connect_returns_pending_approval(self, mock_client, mock_server_card):
-        """Should return pending_approval status with a token (not auto-connected)."""
+    async def test_approve_completes_connection(self, mock_server_card):
+        """approve_endpoint should complete the connection when given a valid token."""
         srv._server_cards["echo-server"] = mock_server_card
         srv._connections.clear()
         srv._pending_connections.clear()
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        assert data["status"] == "pending_approval"
-        assert "approval_token" in data
-        assert data["expires_in"] == 300
-        # approval_data is NOT returned to the AI (contains nonce)
-        assert "approval_data" not in data
-        assert "approval_nonce" not in data
-        # Connection should NOT be established yet
-        assert "echo-server" not in srv._connections
-        # get_server should NOT have been called (cached card)
-        mock_client.get_server.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_approve_completes_connection(self, mock_client, mock_server_card):
-        """pharos_approve should complete the connection after pharos_connect."""
-        srv._server_cards["echo-server"] = mock_server_card
-        srv._connections.clear()
-        srv._pending_connections.clear()
-        # Step 1: connect returns pending token
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        assert data["status"] == "pending_approval"
-        token = data["approval_token"]
-        # Verify nonce was stored server-side but NOT returned to AI
-        assert "approval_nonce" not in data
-        assert "approval_nonce" in srv._pending_connections[token]
-        # Step 2: approve completes the connection
+        # Set up a pending connection using the extracted helper
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        assert token is not None
+        # Approve via the HTTP endpoint
+        request = self._make_request({"approval_token": token, "approval_nonce": ""})
         with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
             mock_mgr = AsyncMock()
             mock_connection = AsyncMock()
             mock_mgr.connect = AsyncMock(return_value=mock_connection)
             MockMgr.return_value = mock_mgr
             with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
-                result = await srv.pharos_approve(token)
-        data = json.loads(result)
-        assert data["status"] == "connected"
-        assert data["server_id"] == "echo-server"
-        assert data["tools_count"] == 1
+                response = await srv.approve_endpoint(request)
+        # approve_endpoint returns a JSONResponse — check its body
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body["status"] == "connected"
+        assert body["server_id"] == "echo-server"
+        assert body["tools_count"] == 1
 
     @pytest.mark.asyncio
-    async def test_approve_rejected_without_nonce_in_physical_mode(self, mock_client, mock_server_card):
-        """pharos_approve should reject AI calls when physical approval is required."""
+    async def test_approve_rejected_without_nonce_in_physical_mode(self, mock_server_card):
+        """approve_endpoint should reject AI calls when physical approval is required."""
         srv._server_cards["echo-server"] = mock_server_card
-        srv._connections.clear()
         srv._pending_connections.clear()
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        token = data["approval_token"]
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
         # Enable physical approval mode
         with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
             # AI calls approve WITHOUT the nonce (it doesn't have it)
-            result = await srv.pharos_approve(token)
-        data = json.loads(result)
-        assert "error" in data
-        assert "Physical approval required" in data["error"]
+            request = self._make_request({"approval_token": token, "approval_nonce": ""})
+            response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "Physical approval required" in body["error"]
 
     @pytest.mark.asyncio
-    async def test_approve_succeeds_with_correct_nonce(self, mock_client, mock_server_card):
-        """pharos_approve should succeed when UI card sends the correct nonce."""
+    async def test_approve_succeeds_with_correct_nonce(self, mock_server_card):
+        """approve_endpoint should succeed when UI card sends the correct nonce."""
         srv._server_cards["echo-server"] = mock_server_card
-        srv._connections.clear()
         srv._pending_connections.clear()
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        token = data["approval_token"]
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
         nonce = srv._pending_connections[token]["approval_nonce"]
         with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
             with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
@@ -364,35 +372,75 @@ class TestPharosConnect:
                 mock_mgr.connect = AsyncMock(return_value=mock_connection)
                 MockMgr.return_value = mock_mgr
                 with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
-                    result = await srv.pharos_approve(token, approval_nonce=nonce)
-        data = json.loads(result)
-        assert data["status"] == "connected"
+                    request = self._make_request({
+                        "approval_token": token,
+                        "approval_nonce": nonce,
+                    })
+                    response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert body["status"] == "connected"
 
     @pytest.mark.asyncio
     async def test_approve_invalid_token(self):
-        """pharos_approve should reject unknown tokens."""
+        """approve_endpoint should reject unknown tokens."""
         srv._pending_connections.clear()
-        result = await srv.pharos_approve("bogus-token")
-        data = json.loads(result)
-        assert "error" in data
-        assert "Invalid" in data["error"]
+        request = self._make_request({"approval_token": "bogus-token"})
+        response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "Invalid" in body["error"]
 
     @pytest.mark.asyncio
-    async def test_approve_expired_token(self, mock_client, mock_server_card):
-        """pharos_approve should reject expired tokens."""
+    async def test_approve_expired_token(self, mock_server_card):
+        """approve_endpoint should reject expired tokens."""
         srv._server_cards["echo-server"] = mock_server_card
-        srv._connections.clear()
         srv._pending_connections.clear()
-        with patch.object(srv, "_get_client", return_value=mock_client):
-            result = await srv.pharos_connect("echo-server")
-        data = json.loads(result)
-        token = data["approval_token"]
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
         # Manually expire the token
         srv._pending_connections[token]["expires_at"] = int(time.time()) - 1
-        result = await srv.pharos_approve(token)
-        data = json.loads(result)
-        assert "error" in data
-        assert "expired" in data["error"].lower()
+        request = self._make_request({"approval_token": token})
+        response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "expired" in body["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_approve_invalid_json_body(self):
+        """approve_endpoint should return 400 on invalid JSON."""
+        request = AsyncMock()
+        request.json = AsyncMock(side_effect=Exception("parse error"))
+        response = await srv.approve_endpoint(request)
+        assert response.status_code == 400
+        body = json.loads(response.body)
+        assert "error" in body
+
+    @pytest.mark.asyncio
+    async def test_create_pending_connection_returns_none_when_cap_reached(self, mock_server_card):
+        """_create_pending_connection should return None when the pending cap is reached."""
+        srv._pending_connections.clear()
+        # Fill up to the 50-entry cap
+        for i in range(50):
+            srv._pending_connections[f"fake-token-{i}"] = {
+                "server_id": f"srv-{i}",
+                "card": mock_server_card,
+                "endpoint": None,
+                "purpose": "test",
+                "signature": "sig",
+                "expires_at": int(time.time()) + 9999,
+                "approval_nonce": str(uuid.uuid4()),
+            }
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        assert token is None
 
 
 # ─── pharos_list_tools ─────────────────────────────────────────────────────────

@@ -3,6 +3,24 @@ PHAROS Discovery MCP Server — main server module.
 
 Wraps PharosClient (the discovery SDK) and exposes its operations as MCP tools.
 Implements MCP Apps (2026-01-26) for visual approval and OAuth flows.
+
+Two operating modes are selected by the PHAROS_MCP_APPS environment variable:
+
+CLI mode (default, PHAROS_MCP_APPS unset/false):
+    Registers pharos_search, pharos_info, pharos_install, pharos_remove,
+    pharos_list, pharos_publish as direct tools — no iframe, no approval UI.
+
+Apps mode (PHAROS_MCP_APPS=true/1/yes):
+    Registers pharos_search_apps, pharos_info_apps, pharos_install_apps,
+    pharos_remove_apps, pharos_list_apps, pharos_publish_apps with
+    meta={"ui": {"resourceUri": "ui://pharos/<resource>"}} annotations so
+    the host renders results/approval in a sandboxed iframe.
+
+Non-A/B tools (pharos_start, pharos_stop, daemon tools, etc.) are
+registered unconditionally in both modes.
+
+The /approve HTTP endpoint (POST) handles approval confirmations from the
+iframe UI. It is NOT exposed as an MCP tool — the AI cannot see or call it.
 """
 
 from __future__ import annotations
@@ -17,6 +35,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Resource, TextResourceContents
 
@@ -30,6 +51,14 @@ from pharos_discovery.errors import (
     ConnectionFailed,
     HeadlessApprovalRequired,
 )
+
+# ─── Mode Detection ────────────────────────────────────────────────────────────
+
+# When PHAROS_MCP_APPS is set to true/1/yes, the server registers _apps variants
+# (pharos_search_apps, pharos_install_apps, etc.) with UI resource annotations
+# instead of the direct CLI-mode tools. This enables A/B switching between a
+# plain CLI experience and a full MCP Apps iframe experience.
+MCP_APPS_MODE = os.environ.get("PHAROS_MCP_APPS", "").lower() in ("true", "1", "yes")
 
 # ─── UI Resources (MCP Apps) ──────────────────────────────────────────────────
 
@@ -808,170 +837,9 @@ def _get_pharos_cli() -> str:
     return os.environ.get("PHAROS_CLI", "pharos")
 
 
-# ─── MCP Tools ────────────────────────────────────────────────────────────────
-
-@mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/results"}})
-async def pharos_search(
-    query: str,
-    limit: int = 10,
-    remote_only: bool = False,
-) -> str:
-    """Search the PHAROS registry for MCP servers matching the query.
-
-    Args:
-        query: Natural-language search query (e.g. "echo", "flight search", "file system")
-        limit: Maximum number of results to return (default 10, max 50)
-        remote_only: If True, only return servers with remote transports
-            (sse, streamable-http, http). Only set this to True when the
-            environment cannot install local binaries (e.g. mobile agents,
-            cloud-only). For desktop environments with local CLI access,
-            leave as False (default) to get all available servers.
-
-    Returns:
-        JSON array of matching servers with id, name, description, version,
-        transport, publisher, tools_count, and capabilities.
-    """
-    client = _get_client()
-    limit = min(max(limit, 1), 50)
-
-    filters: dict[str, Any] = {}
-    if remote_only:
-        filters["transport"] = ["sse", "streamable-http", "http"]
-
-    try:
-        results = await client.search(text=query, filters=filters or None, limit=limit)
-    except NoServersFound:
-        return json.dumps({"results": [], "message": "No servers found. Try a different query."})
-    except RegistryUnavailable as e:
-        return json.dumps({"error": f"Registry unavailable: {e}", "results": []})
-
-    # Cache cards for later use
-    for r in results:
-        _server_cards[r.card.id] = r.card
-
-    output = []
-    for r in results:
-        card = r.card
-        output.append({
-            "id": card.id,
-            "name": card.display_name,
-            "description": card.description,
-            "version": card.version,
-            "transport": card.transport,
-            "publisher": {
-                "name": card.publisher.name if card.publisher else "unknown",
-                "verified": card.publisher.verified if card.publisher else False,
-            },
-            "tools_count": getattr(card, "tools_count", 0),
-            "capabilities": card.capabilities,
-            "endpoint": getattr(card, "endpoint", None),
-        })
-
-    # Store for UI resource rendering (token-scoped to prevent race conditions)
-    search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
-    _search_results_cache[search_id] = output
-    global _current_search_id
-    _current_search_id = search_id
-    # Prune oldest entries
-    if len(_search_results_cache) > _MAX_CACHE_SIZE:
-        oldest = next(iter(_search_results_cache))
-        del _search_results_cache[oldest]
-
-    return json.dumps({"results": output, "count": len(output), "search_id": search_id})
-
-
-@mcp.tool()
-async def pharos_install(server_id: str) -> str:
-    """Install an MCP server from the PHAROS registry to the local machine.
-
-    For remote transports (sse, streamable-http, http), the server is registered
-    as a remote endpoint without requiring the pharos CLI. For stdio servers,
-    the pharos CLI must be installed locally to download and configure the package.
-
-    Args:
-        server_id: The server ID from search results (e.g. "test-echo-server")
-
-    Returns:
-        JSON with install status, version, and install path (stdio) or
-        endpoint URL (remote).
-    """
-    client = _get_client()
-
-    # Check transport from cached server card or fetch from registry
-    transport = None
-    endpoint = None
-    if server_id in _server_cards:
-        card = _server_cards[server_id]
-        transport = getattr(card, "transport", None)
-        endpoint = getattr(card, "endpoint", None)
-
-    # If we don't have the card cached, fetch it
-    if transport is None:
-        try:
-            card = await client.get_server(server_id)
-            transport = getattr(card, "transport", None)
-            endpoint = getattr(card, "endpoint", None)
-            _server_cards[server_id] = card
-        except Exception:
-            pass  # Fall through to CLI install attempt
-
-    # Remote transport: register endpoint without CLI
-    remote_transports = ("sse", "streamable-http", "http", "http+sse")
-    if transport and any(t in remote_transports for t in transport):
-        transport_str = ", ".join(transport)
-        if not endpoint:
-            return json.dumps({
-                "error": f"Server '{server_id}' has transport '{transport_str}' but no endpoint URL",
-                "server_id": server_id,
-            })
-        _installed_servers[server_id] = {
-            "installed_at": datetime.now(timezone.utc).isoformat(),
-            "transport": transport,
-            "endpoint": endpoint,
-        }
-        return json.dumps({
-            "status": "registered",
-            "server_id": server_id,
-            "transport": transport,
-            "endpoint": endpoint,
-            "message": f"Remote server registered. Use pharos_connect to connect.",
-        })
-
-    # stdio transport: use pharos CLI
-    cli = _get_pharos_cli()
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            cli, "install", server_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except asyncio.TimeoutError:
-        return json.dumps({"error": "Install timed out (120s)", "server_id": server_id})
-    except FileNotFoundError:
-        return json.dumps({
-            "error": f"pharos CLI not found at '{cli}'",
-            "server_id": server_id,
-            "hint": "For remote servers, use pharos_search(remote_only=True) to find servers that don't require local installation. To install stdio servers, install the pharos CLI first: pip install pharos-mcp",
-        })
-
-    if proc.returncode != 0:
-        return json.dumps({
-            "error": "Install failed",
-            "stderr": stderr.decode() if stderr else "",
-            "server_id": server_id,
-        })
-
-    _installed_servers[server_id] = {
-        "installed_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    return json.dumps({
-        "status": "installed",
-        "server_id": server_id,
-        "output": stdout.decode().strip() if stdout else "",
-    })
+# ─── Pending Approval Helpers ─────────────────────────────────────────────────
+# These functions were originally inside pharos_connect. They are kept here so
+# that pharos_install_apps (Phase 3) can reuse the approval token/nonce logic.
 
 
 def _sign_pending(token: str, server_id: str) -> str:
@@ -989,52 +857,17 @@ def _verify_pending(token: str, server_id: str, signature: str) -> bool:
     return _hmac.compare_digest(signature, expected)
 
 
-@mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
-async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
-    """Request a connection to a running MCP server.
+def _create_pending_connection(card: Any, server_id: str, endpoint: str | None,
+                                purpose: str) -> str | None:
+    """Create a pending approval entry and cache the approval UI data.
 
-    Returns an approval UI showing the server details, publisher verification,
-    requested scopes, and purpose. The user must review and approve the
-    connection by calling pharos_approve with the returned token.
+    Returns the raw approval token on success, or None if the pending
+    connections cap has been reached. The token is returned to the AI;
+    the nonce is injected into the HTML card but never exposed to the AI.
 
-    This is a two-step flow:
-    1. pharos_connect — returns server details + pending token (NOT connected yet)
-    2. pharos_approve — user confirms, connection is established
-
-    Args:
-        server_id: The server ID to connect to
-        purpose: Why the connection is being requested (shown to user)
-
-    Returns:
-        JSON with server details and a pending approval token.
+    This logic was extracted from the removed pharos_connect tool so that
+    pharos_install_apps (Phase 3) can reuse it.
     """
-    client = _get_client()
-
-    # Get the server card (from cache or registry)
-    if server_id in _server_cards:
-        card = _server_cards[server_id]
-    else:
-        try:
-            card = await client.get_server(server_id)
-            _server_cards[server_id] = card
-        except Exception as e:
-            return json.dumps({"error": f"Server not found: {server_id}", "detail": str(e)})
-
-    # Check if already connected
-    if server_id in _connections:
-        return json.dumps({
-            "status": "already_connected",
-            "server_id": server_id,
-            "message": "Already connected. Use pharos_list_tools to see available tools.",
-        })
-
-    # Resolve local endpoint if needed
-    endpoint = getattr(card, "endpoint", None)
-    if not endpoint and "http+sse" in (card.transport or []):
-        endpoint = await _resolve_local_endpoint(server_id)
-        if endpoint:
-            card.endpoint = endpoint  # type: ignore
-
     # Generate a pending connection token
     raw_token = f"pc-{server_id}-{int(time.time())}-{os.urandom(4).hex()}"
     signature = _sign_pending(raw_token, server_id)
@@ -1047,9 +880,7 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
     for k in expired:
         del _pending_connections[k]
     if len(_pending_connections) >= 50:
-        return json.dumps({
-            "error": "Too many pending connections. Wait for existing tokens to expire (5 min) and try again.",
-        })
+        return None
 
     # Generate a per-token approval nonce (UUID4).
     # This nonce is injected into the HTML approval card but NEVER included
@@ -1104,62 +935,484 @@ async def pharos_connect(server_id: str, purpose: str = "User request") -> str:
         oldest = next(iter(_approval_data_cache))
         del _approval_data_cache[oldest]
 
-    # Return to AI — NO nonce field. AI only gets the token.
-    return json.dumps({
-        "status": "pending_approval",
-        "server_id": server_id,
-        "approval_token": raw_token,
-        "expires_in": 300,
-        "message": f"Connection to '{card.display_name}' is pending user "
-                    "approval. An approval card has been rendered above. "
-                    "DO NOT call pharos_approve yourself — the user must "
-                    "physically click the Approve button. Tell the user: "
-                    "'Please click Approve in the PHAROS approval card to "
-                    "connect to this server.'",
-    })
+    return raw_token
 
 
-@mcp.tool()
-async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
-    """Approve a pending MCP server connection.
+# ─── MCP Tools ────────────────────────────────────────────────────────────────
+#
+# A/B tool registration: tools that have separate CLI and Apps variants are
+# registered conditionally based on MCP_APPS_MODE. Non-A/B tools (daemon,
+# list_tools, call_tool, etc.) are registered unconditionally below.
 
-    After pharos_connect returns a pending approval token, the user must
-    confirm they want to connect. This tool completes the connection.
+if not MCP_APPS_MODE:
 
-    In end-user mode (PHAROS_REQUIRE_PHYSICAL_APPROVAL=true), this tool
-    requires a valid approval_nonce that was generated server-side and
-    injected into the HTML approval card. The nonce is never returned to
-    the AI in the tool response, so the AI cannot guess it (UUID4).
-    Only the physical button click in the UI card sends the nonce.
+    @mcp.tool()
+    async def pharos_search(
+        query: str,
+        limit: int = 10,
+        remote_only: bool = False,
+    ) -> str:
+        """Search the PHAROS registry for MCP servers matching the query.
 
-    The AI should tell the user to click the Approve button. Do not
-    attempt to call this tool directly — it will fail without the nonce.
+        Args:
+            query: Natural-language search query (e.g. "echo", "flight search", "file system")
+            limit: Maximum number of results to return (default 10, max 50)
+            remote_only: If True, only return servers with remote transports
+                (sse, streamable-http, http). Only set this to True when the
+                environment cannot install local binaries (e.g. mobile agents,
+                cloud-only). For desktop environments with local CLI access,
+                leave as False (default) to get all available servers.
 
-    Args:
-        approval_token: The token returned by pharos_connect
-        approval_nonce: Set by the UI approval card only. The AI does not
-            have access to this value and should not set it.
+        Returns:
+            JSON array of matching servers with id, name, description, version,
+            transport, publisher, tools_count, and capabilities.
+        """
+        client = _get_client()
+        limit = min(max(limit, 1), 50)
 
-    Returns:
-        JSON with connection status and available tools.
+        filters: dict[str, Any] = {}
+        if remote_only:
+            filters["transport"] = ["sse", "streamable-http", "http"]
+
+        try:
+            results = await client.search(text=query, filters=filters or None, limit=limit)
+        except NoServersFound:
+            return json.dumps({"results": [], "message": "No servers found. Try a different query."})
+        except RegistryUnavailable as e:
+            return json.dumps({"error": f"Registry unavailable: {e}", "results": []})
+
+        # Cache cards for later use
+        for r in results:
+            _server_cards[r.card.id] = r.card
+
+        output = []
+        for r in results:
+            card = r.card
+            output.append({
+                "id": card.id,
+                "name": card.display_name,
+                "description": card.description,
+                "version": card.version,
+                "transport": card.transport,
+                "publisher": {
+                    "name": card.publisher.name if card.publisher else "unknown",
+                    "verified": card.publisher.verified if card.publisher else False,
+                },
+                "tools_count": getattr(card, "tools_count", 0),
+                "capabilities": card.capabilities,
+                "endpoint": getattr(card, "endpoint", None),
+            })
+
+        # Store for UI resource rendering (token-scoped to prevent race conditions)
+        search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
+        _search_results_cache[search_id] = output
+        global _current_search_id
+        _current_search_id = search_id
+        # Prune oldest entries
+        if len(_search_results_cache) > _MAX_CACHE_SIZE:
+            oldest = next(iter(_search_results_cache))
+            del _search_results_cache[oldest]
+
+        return json.dumps({"results": output, "count": len(output), "search_id": search_id})
+
+
+    @mcp.tool()
+    async def pharos_install(server_id: str) -> str:
+        """Install an MCP server from the PHAROS registry to the local machine.
+
+        For remote transports (sse, streamable-http, http), the server is registered
+        as a remote endpoint without requiring the pharos CLI. For stdio servers,
+        the pharos CLI must be installed locally to download and configure the package.
+
+        Args:
+            server_id: The server ID from search results (e.g. "test-echo-server")
+
+        Returns:
+            JSON with install status, version, and install path (stdio) or
+            endpoint URL (remote).
+        """
+        client = _get_client()
+
+        # Check transport from cached server card or fetch from registry
+        transport = None
+        endpoint = None
+        if server_id in _server_cards:
+            card = _server_cards[server_id]
+            transport = getattr(card, "transport", None)
+            endpoint = getattr(card, "endpoint", None)
+
+        # If we don't have the card cached, fetch it
+        if transport is None:
+            try:
+                card = await client.get_server(server_id)
+                transport = getattr(card, "transport", None)
+                endpoint = getattr(card, "endpoint", None)
+                _server_cards[server_id] = card
+            except Exception:
+                pass  # Fall through to CLI install attempt
+
+        # Remote transport: register endpoint without CLI
+        remote_transports = ("sse", "streamable-http", "http", "http+sse")
+        if transport and any(t in remote_transports for t in transport):
+            transport_str = ", ".join(transport)
+            if not endpoint:
+                return json.dumps({
+                    "error": f"Server '{server_id}' has transport '{transport_str}' but no endpoint URL",
+                    "server_id": server_id,
+                })
+            _installed_servers[server_id] = {
+                "installed_at": datetime.now(timezone.utc).isoformat(),
+                "transport": transport,
+                "endpoint": endpoint,
+            }
+            return json.dumps({
+                "status": "registered",
+                "server_id": server_id,
+                "transport": transport,
+                "endpoint": endpoint,
+                "message": "Remote server registered.",
+            })
+
+        # stdio transport: use pharos CLI
+        cli = _get_pharos_cli()
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "install", server_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            return json.dumps({"error": "Install timed out (120s)", "server_id": server_id})
+        except FileNotFoundError:
+            return json.dumps({
+                "error": f"pharos CLI not found at '{cli}'",
+                "server_id": server_id,
+                "hint": "For remote servers, use pharos_search(remote_only=True) to find servers that don't require local installation. To install stdio servers, install the pharos CLI first: pip install pharos-mcp",
+            })
+
+        if proc.returncode != 0:
+            return json.dumps({
+                "error": "Install failed",
+                "stderr": stderr.decode() if stderr else "",
+                "server_id": server_id,
+            })
+
+        _installed_servers[server_id] = {
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        return json.dumps({
+            "status": "installed",
+            "server_id": server_id,
+            "output": stdout.decode().strip() if stdout else "",
+        })
+
+
+    @mcp.tool()
+    async def pharos_list() -> str:
+        """List all MCP servers installed or registered on the local machine.
+
+        Returns servers installed via pharos_install (remote registrations)
+        as well as servers installed via the pharos CLI (by checking the
+        ~/.pharos directory for installed server configs).
+
+        Returns:
+            JSON array of installed servers with id, transport, status,
+            and install metadata.
+        """
+        results = []
+
+        # 1. Report in-memory remote registrations
+        for sid, meta in _installed_servers.items():
+            results.append({
+                "server_id": sid,
+                "transport": meta.get("transport", "unknown"),
+                "endpoint": meta.get("endpoint"),
+                "installed_at": meta.get("installed_at"),
+                "source": "mcp_registered",
+            })
+
+        # 2. Query the pharos CLI for locally installed servers
+        cli = _get_pharos_cli()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "list", "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            return json.dumps({"error": "pharos list timed out", "installed": results})
+        except FileNotFoundError:
+            # CLI not installed — return only in-memory registrations
+            return json.dumps({"installed": results, "count": len(results),
+                               "note": "pharos CLI not found; only showing MCP-registered servers."})
+        except Exception as e:
+            return json.dumps({"error": f"pharos list failed: {e}", "installed": results})
+
+        # Parse CLI output
+        cli_output = ""
+        if proc.returncode == 0 and stdout:
+            cli_output = stdout.decode().strip()
+            try:
+                # Try JSON parse first (--json flag)
+                parsed = json.loads(cli_output)
+                if isinstance(parsed, list):
+                    for entry in parsed:
+                        sid = entry.get("name") or entry.get("id") or "unknown"
+                        results.append({
+                            "server_id": sid,
+                            "transport": entry.get("transport", "unknown"),
+                            "status": entry.get("status", "unknown"),
+                            "source": "cli",
+                        })
+                elif isinstance(parsed, dict) and "servers" in parsed:
+                    for entry in parsed["servers"]:
+                        sid = entry.get("name") or entry.get("id") or "unknown"
+                        results.append({
+                            "server_id": sid,
+                            "transport": entry.get("transport", "unknown"),
+                            "status": entry.get("status", "unknown"),
+                            "source": "cli",
+                        })
+            except json.JSONDecodeError:
+                # CLI may not support --json; parse text output
+                for line in cli_output.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("NAME") and not line.startswith("-"):
+                        parts = line.split()
+                        if parts:
+                            results.append({
+                                "server_id": parts[0],
+                                "transport": parts[1] if len(parts) > 1 else "unknown",
+                                "status": parts[2] if len(parts) > 2 else "unknown",
+                                "source": "cli",
+                            })
+
+        return json.dumps({"installed": results, "count": len(results)})
+
+
+    @mcp.tool()
+    async def pharos_remove(server_id: str) -> str:
+        """Remove an MCP server from the local machine.
+
+        For remote-registered servers (installed via pharos_install), this
+        removes the in-memory registration. For CLI-installed servers, this
+        calls the pharos CLI to uninstall the server.
+
+        Args:
+            server_id: The server ID to remove
+
+        Returns:
+            JSON with removal status.
+        """
+        # Remove in-memory registration if present
+        removed_local = False
+        if server_id in _installed_servers:
+            del _installed_servers[server_id]
+            removed_local = True
+
+        # Disconnect if connected
+        if server_id in _connections:
+            try:
+                conn = _connections[server_id]
+                if hasattr(conn, "close"):
+                    await conn.close()
+                del _connections[server_id]
+            except Exception:
+                pass
+
+        # Call pharos CLI to uninstall
+        cli = _get_pharos_cli()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "uninstall", server_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            return json.dumps({"error": "Removal timed out", "server_id": server_id})
+        except FileNotFoundError:
+            if removed_local:
+                return json.dumps({"status": "unregistered", "server_id": server_id,
+                                   "message": "Removed MCP registration. pharos CLI not found for full uninstall."})
+            return json.dumps({"error": "pharos CLI not found", "server_id": server_id})
+        except Exception as e:
+            return json.dumps({"error": f"Removal failed: {e}", "server_id": server_id})
+
+        if proc.returncode != 0:
+            err = stderr.decode().strip() if stderr else ""
+            if removed_local:
+                return json.dumps({"status": "partial", "server_id": server_id,
+                                   "message": "Removed MCP registration, but CLI uninstall failed.",
+                                   "cli_error": err})
+            return json.dumps({"error": "Uninstall failed", "stderr": err, "server_id": server_id})
+
+        return json.dumps({
+            "status": "removed",
+            "server_id": server_id,
+            "output": stdout.decode().strip() if stdout else "",
+        })
+
+else:
+
+    # ─── Apps Mode: Placeholder _apps Variants ────────────────────────────────
+    #
+    # These are registered with meta={"ui": {"resourceUri": ...}} annotations
+    # so the host knows to render the tool result in a sandboxed iframe.
+    # The actual HTML/approval logic will be implemented in Phase 3.
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/results"}})
+    async def pharos_search_apps(
+        query: str,
+        limit: int = 10,
+        remote_only: bool = False,
+    ) -> str:
+        """Search the PHAROS registry for MCP servers (Apps mode).
+
+        Renders search results as an interactive iframe gallery. The user
+        can browse and select servers visually.
+
+        Args:
+            query: Natural-language search query
+            limit: Maximum number of results (default 10, max 50)
+            remote_only: If True, only return remote-transport servers
+
+        Returns:
+            JSON with search results and a search_id for the UI resource.
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_search_apps will be implemented in Phase 3"})
+
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/info"}})
+    async def pharos_info_apps(server_id: str) -> str:
+        """Get detailed information about an MCP server (Apps mode).
+
+        Renders the server card in an iframe with publisher details,
+        capabilities, and install button.
+
+        Args:
+            server_id: The server ID from search results
+
+        Returns:
+            JSON with server details for the UI resource.
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_info_apps will be implemented in Phase 3"})
+
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
+    async def pharos_install_apps(server_id: str, purpose: str = "User request") -> str:
+        """Install an MCP server with visual approval flow (Apps mode).
+
+        Renders an approval card in the iframe. The user must click
+        Approve before the server is installed and connected.
+
+        Args:
+            server_id: The server ID to install
+            purpose: Why the installation is being requested (shown to user)
+
+        Returns:
+            JSON with pending approval token (connection is NOT established
+            until the user clicks Approve in the iframe).
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_install_apps will be implemented in Phase 3"})
+
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/removal"}})
+    async def pharos_remove_apps(server_id: str) -> str:
+        """Remove an MCP server with visual confirmation (Apps mode).
+
+        Renders a removal confirmation card in the iframe. The user must
+        confirm before the server is removed.
+
+        Args:
+            server_id: The server ID to remove
+
+        Returns:
+            JSON with pending removal token.
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_remove_apps will be implemented in Phase 3"})
+
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/installed"}})
+    async def pharos_list_apps() -> str:
+        """List installed MCP servers as an interactive table (Apps mode).
+
+        Renders the installed servers in an iframe table with status
+        indicators and per-server actions.
+
+        Returns:
+            JSON with installed servers data for the UI resource.
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_list_apps will be implemented in Phase 3"})
+
+
+    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/publish"}})
+    async def pharos_publish_apps(server_card_path: str = "") -> str:
+        """Publish a server card to the registry with approval flow (Apps mode).
+
+        Renders a publishing confirmation card in the iframe showing the
+        server card details and publisher verification status.
+
+        Args:
+            server_card_path: Path to the server card JSON file to publish
+
+        Returns:
+            JSON with pending publish token.
+        """
+        return json.dumps({"status": "not_implemented", "mode": "apps",
+                           "message": "pharos_publish_apps will be implemented in Phase 3"})
+
+
+# ─── Approval HTTP Endpoint ────────────────────────────────────────────────────
+#
+# Converted from the former pharos_approve MCP tool. This is a custom HTTP route,
+# NOT an MCP tool — it does not appear in tools/list and the AI cannot see or
+# call it. Only the iframe UI (user button click) posts to this endpoint.
+
+@mcp.custom_route("/approve", methods=["POST"])
+async def approve_endpoint(request: Request) -> JSONResponse:
+    """Handle approval confirmations from the iframe UI.
+
+    Expects a JSON body with:
+        approval_token: The token returned by the install/connect tool
+        approval_nonce: The nonce injected into the HTML card (UI-only)
+
+    Returns JSON with connection status and available tools, or an error.
     """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    approval_token = body.get("approval_token", "")
+    approval_nonce = body.get("approval_nonce", "")
+
     # Look up the pending connection
     pending = _pending_connections.get(approval_token)
     if pending is None:
-        return json.dumps({
+        return JSONResponse({
             "error": "Invalid or unknown approval token. "
-                     "Call pharos_connect first to get a new token.",
+                     "Call the install/connect tool first to get a new token.",
         })
 
     # Physical approval enforcement — verify the per-token nonce.
-    # The nonce is a UUID4 generated server-side in pharos_connect.
+    # The nonce is a UUID4 generated server-side in _create_pending_connection.
     # It's injected into the HTML card data but never returned to the AI
     # in the tool response JSON. The AI cannot see it, cannot guess it
     # (122 bits of entropy), and therefore cannot bypass physical approval.
     if _REQUIRE_PHYSICAL_APPROVAL:
         stored_nonce = pending.get("approval_nonce")
         if not stored_nonce or approval_nonce != stored_nonce:
-            return json.dumps({
+            return JSONResponse({
                 "error": "Physical approval required. The user must click the "
                          "Approve button in the approval card. AI agents cannot "
                          "approve connections on behalf of users in this mode.",
@@ -1171,13 +1424,13 @@ async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
     # Verify signature
     if not _verify_pending(approval_token, pending["server_id"], pending["signature"]):
         del _pending_connections[approval_token]
-        return json.dumps({"error": "Invalid approval token signature."})
+        return JSONResponse({"error": "Invalid approval token signature."})
 
     # Check expiry
     if time.time() >= pending["expires_at"]:
         del _pending_connections[approval_token]
-        return json.dumps({
-            "error": "Approval token expired. Call pharos_connect again for a new token.",
+        return JSONResponse({
+            "error": "Approval token expired. Request a new token.",
         })
 
     server_id = pending["server_id"]
@@ -1189,7 +1442,7 @@ async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
 
     # Check if already connected (race condition guard)
     if server_id in _connections:
-        return json.dumps({
+        return JSONResponse({
             "status": "already_connected",
             "server_id": server_id,
             "message": "Already connected. Use pharos_list_tools to see available tools.",
@@ -1217,7 +1470,7 @@ async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
         # List initial tools
         tools = await _list_server_tools(server_id)
 
-        return json.dumps({
+        return JSONResponse({
             "status": "connected",
             "server_id": server_id,
             "endpoint": endpoint,
@@ -1225,10 +1478,12 @@ async def pharos_approve(approval_token: str, approval_nonce: str = "") -> str:
             "tools": tools,
         })
     except ConnectionFailed as e:
-        return json.dumps({"error": f"Connection failed: {e}", "server_id": server_id})
+        return JSONResponse({"error": f"Connection failed: {e}", "server_id": server_id})
     except Exception as e:
-        return json.dumps({"error": f"Connection error: {e}", "server_id": server_id})
+        return JSONResponse({"error": f"Connection error: {e}", "server_id": server_id})
 
+
+# ─── Non-A/B Tools (registered unconditionally in both modes) ──────────────────
 
 @mcp.tool()
 async def pharos_list_tools(server_id: str) -> str:
@@ -1242,7 +1497,7 @@ async def pharos_list_tools(server_id: str) -> str:
     """
     if server_id not in _connections:
         return json.dumps({
-            "error": f"Not connected to '{server_id}'. Use pharos_connect first.",
+            "error": f"Not connected to '{server_id}'. Install and approve the server first.",
         })
 
     tools = await _list_server_tools(server_id)
@@ -1267,7 +1522,7 @@ async def pharos_call_tool(
     """
     if server_id not in _connections:
         return json.dumps({
-            "error": f"Not connected to '{server_id}'. Use pharos_connect first.",
+            "error": f"Not connected to '{server_id}'. Install and approve the server first.",
         })
 
     connection = _connections[server_id]
@@ -1287,154 +1542,6 @@ async def pharos_call_tool(
             "server_id": server_id,
             "tool": tool_name,
         })
-
-
-@mcp.tool()
-async def pharos_list_installed() -> str:
-    """List all MCP servers installed or registered on the local machine.
-
-    Returns servers installed via pharos_install (remote registrations)
-    as well as servers installed via the pharos CLI (by checking the
-    ~/.pharos directory for installed server configs).
-
-    Returns:
-        JSON array of installed servers with id, transport, status,
-        and install metadata.
-    """
-    results = []
-
-    # 1. Report in-memory remote registrations
-    for sid, meta in _installed_servers.items():
-        results.append({
-            "server_id": sid,
-            "transport": meta.get("transport", "unknown"),
-            "endpoint": meta.get("endpoint"),
-            "installed_at": meta.get("installed_at"),
-            "source": "mcp_registered",
-        })
-
-    # 2. Query the pharos CLI for locally installed servers
-    cli = _get_pharos_cli()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            cli, "list", "--json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.TimeoutError:
-        return json.dumps({"error": "pharos list timed out", "installed": results})
-    except FileNotFoundError:
-        # CLI not installed — return only in-memory registrations
-        return json.dumps({"installed": results, "count": len(results),
-                           "note": "pharos CLI not found; only showing MCP-registered servers."})
-    except Exception as e:
-        return json.dumps({"error": f"pharos list failed: {e}", "installed": results})
-
-    # Parse CLI output
-    cli_output = ""
-    if proc.returncode == 0 and stdout:
-        cli_output = stdout.decode().strip()
-        try:
-            # Try JSON parse first (--json flag)
-            parsed = json.loads(cli_output)
-            if isinstance(parsed, list):
-                for entry in parsed:
-                    sid = entry.get("name") or entry.get("id") or "unknown"
-                    results.append({
-                        "server_id": sid,
-                        "transport": entry.get("transport", "unknown"),
-                        "status": entry.get("status", "unknown"),
-                        "source": "cli",
-                    })
-            elif isinstance(parsed, dict) and "servers" in parsed:
-                for entry in parsed["servers"]:
-                    sid = entry.get("name") or entry.get("id") or "unknown"
-                    results.append({
-                        "server_id": sid,
-                        "transport": entry.get("transport", "unknown"),
-                        "status": entry.get("status", "unknown"),
-                        "source": "cli",
-                    })
-        except json.JSONDecodeError:
-            # CLI may not support --json; parse text output
-            for line in cli_output.splitlines():
-                line = line.strip()
-                if line and not line.startswith("NAME") and not line.startswith("-"):
-                    parts = line.split()
-                    if parts:
-                        results.append({
-                            "server_id": parts[0],
-                            "transport": parts[1] if len(parts) > 1 else "unknown",
-                            "status": parts[2] if len(parts) > 2 else "unknown",
-                            "source": "cli",
-                        })
-
-    return json.dumps({"installed": results, "count": len(results)})
-
-
-@mcp.tool()
-async def pharos_uninstall(server_id: str) -> str:
-    """Uninstall an MCP server from the local machine.
-
-    For remote-registered servers (installed via pharos_install), this
-    removes the in-memory registration. For CLI-installed servers, this
-    calls the pharos CLI to uninstall the server.
-
-    Args:
-        server_id: The server ID to uninstall
-
-    Returns:
-        JSON with uninstall status.
-    """
-    # Remove in-memory registration if present
-    removed_local = False
-    if server_id in _installed_servers:
-        del _installed_servers[server_id]
-        removed_local = True
-
-    # Disconnect if connected
-    if server_id in _connections:
-        try:
-            conn = _connections[server_id]
-            if hasattr(conn, "close"):
-                await conn.close()
-            del _connections[server_id]
-        except Exception:
-            pass
-
-    # Call pharos CLI to uninstall
-    cli = _get_pharos_cli()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            cli, "uninstall", server_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        return json.dumps({"error": "Uninstall timed out", "server_id": server_id})
-    except FileNotFoundError:
-        if removed_local:
-            return json.dumps({"status": "unregistered", "server_id": server_id,
-                               "message": "Removed MCP registration. pharos CLI not found for full uninstall."})
-        return json.dumps({"error": "pharos CLI not found", "server_id": server_id})
-    except Exception as e:
-        return json.dumps({"error": f"Uninstall failed: {e}", "server_id": server_id})
-
-    if proc.returncode != 0:
-        err = stderr.decode().strip() if stderr else ""
-        if removed_local:
-            return json.dumps({"status": "partial", "server_id": server_id,
-                               "message": "Removed MCP registration, but CLI uninstall failed.",
-                               "cli_error": err})
-        return json.dumps({"error": "Uninstall failed", "stderr": err, "server_id": server_id})
-
-    return json.dumps({
-        "status": "uninstalled",
-        "server_id": server_id,
-        "output": stdout.decode().strip() if stdout else "",
-    })
 
 
 @mcp.tool()
