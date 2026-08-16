@@ -1331,6 +1331,23 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
   .detail-table td:first-child { width: 120px; color: var(--text-muted); }
   .detail-table td:last-child { font-family: var(--font-mono); font-size: 12px; }
   .actions { display: flex; gap: 8px; margin-top: 16px; }
+  .btn-danger {
+    background: var(--danger);
+    color: white;
+    border: 1px solid var(--danger);
+  }
+  .btn-danger:hover {
+    background: rgba(248, 81, 73, 0.8);
+    border-color: rgba(248, 81, 73, 0.8);
+  }
+  .btn-static {
+    cursor: default;
+    opacity: 0.85;
+    width: 100%;
+  }
+  .btn-static:hover {
+    filter: none;
+  }
 </style>
 </head>
 <body>
@@ -1373,6 +1390,70 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
     purposeBox.appendChild(purposeText);
     card.appendChild(purposeBox);
 
+    // Actions (before detail table)
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.id = "actions";
+    const denyBtn = document.createElement("button");
+    denyBtn.className = "btn btn-danger";
+    denyBtn.textContent = "Deny";
+    denyBtn.addEventListener("click", () => {
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "notifications/tool_result",
+        params: { approved: false }
+      }, "*");
+      const deniedStatic = document.createElement("button");
+      deniedStatic.className = "btn btn-danger btn-static";
+      deniedStatic.textContent = "Denied";
+      deniedStatic.disabled = true;
+      actions.replaceWith(deniedStatic);
+    });
+    actions.appendChild(denyBtn);
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "btn btn-success";
+    approveBtn.textContent = "Approve";
+    approveBtn.id = "approve-btn";
+    approveBtn.addEventListener("click", () => {
+      approveBtn.disabled = true;
+      denyBtn.disabled = true;
+      showStatus("Sending approval...", "ok");
+
+      fetch("/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          approval_token: DATA.approval_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        })
+      }).then(resp => resp.json()).then(body => {
+        if (body.error) {
+          showStatus("Error: " + body.error, "err");
+          approveBtn.disabled = false;
+          denyBtn.disabled = false;
+        } else {
+          showStatus("Approved. " + (body.tools_count || 0) + " tools available.", "ok");
+          const approvedStatic = document.createElement("button");
+          approvedStatic.className = "btn btn-success btn-static";
+          approvedStatic.textContent = "Approved";
+          approvedStatic.disabled = true;
+          actions.replaceWith(approvedStatic);
+          window.parent.postMessage({
+            jsonrpc: "2.0",
+            method: "notifications/tool_result",
+            params: { approved: true, server_id: body.server_id }
+          }, "*");
+        }
+      }).catch(err => {
+        showStatus("Request failed: " + (err.message || String(err)), "err");
+        approveBtn.disabled = false;
+        denyBtn.disabled = false;
+      });
+    });
+    actions.appendChild(approveBtn);
+    card.appendChild(actions);
+
     // Detail table
     const table = document.createElement("table");
     table.className = "detail-table";
@@ -1395,60 +1476,6 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
       table.appendChild(tr);
     });
     card.appendChild(table);
-
-    // Actions
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn";
-    cancelBtn.textContent = "Cancel";
-    cancelBtn.addEventListener("click", () => {
-      window.parent.postMessage({
-        jsonrpc: "2.0",
-        method: "notifications/tool_result",
-        params: { approved: false }
-      }, "*");
-      showStatus("Installation cancelled.", "err");
-    });
-    actions.appendChild(cancelBtn);
-
-    const approveBtn = document.createElement("button");
-    approveBtn.className = "btn btn-success";
-    approveBtn.textContent = "Approve";
-    approveBtn.id = "approve-btn";
-    approveBtn.addEventListener("click", () => {
-      approveBtn.disabled = true;
-      cancelBtn.disabled = true;
-      showStatus("Sending approval...", "ok");
-
-      fetch("/approve", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          approval_token: DATA.approval_token || "",
-          approval_nonce: DATA.approval_nonce || "",
-        })
-      }).then(resp => resp.json()).then(body => {
-        if (body.error) {
-          showStatus("Error: " + body.error, "err");
-          approveBtn.disabled = false;
-          cancelBtn.disabled = false;
-        } else {
-          showStatus("Approved. " + (body.tools_count || 0) + " tools available.", "ok");
-          window.parent.postMessage({
-            jsonrpc: "2.0",
-            method: "notifications/tool_result",
-            params: { approved: true, server_id: body.server_id }
-          }, "*");
-        }
-      }).catch(err => {
-        showStatus("Request failed: " + (err.message || String(err)), "err");
-        approveBtn.disabled = false;
-        cancelBtn.disabled = false;
-      });
-    });
-    actions.appendChild(approveBtn);
-    card.appendChild(actions);
   }
 
   function showStatus(msg, kind) {
@@ -2913,6 +2940,18 @@ else:
                 "status": "registered",
             })
 
+        # 1b. Report connected servers not already in results
+        for sid, conn in _connections.items():
+            if not any(r.get("server_id") == sid for r in results):
+                results.append({
+                    "server_id": sid,
+                    "transport": "connected",
+                    "endpoint": None,
+                    "installed_at": None,
+                    "source": "mcp_connected",
+                    "status": "connected",
+                })
+
         # 2. Query the pharos CLI for locally installed servers
         cli = _get_pharos_cli()
         try:
@@ -3184,6 +3223,14 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         mgr = ConnectionManager()
         connection = await mgr.connect(card, token)
         _connections[server_id] = connection
+
+        # Also register as installed so pharos_list_apps finds it
+        _installed_servers[server_id] = {
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+            "transport": getattr(card, "transport", None),
+            "endpoint": endpoint,
+            "source": "approved",
+        }
 
         # List initial tools
         tools = await _list_server_tools(server_id)
