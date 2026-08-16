@@ -822,10 +822,10 @@ _APPS_BASE_CSS = """
     padding: 16px;
   }
   .header { margin-bottom: 16px; }
-  .title { font-size: 18px; font-weight: 700; color: var(--text); }
+  .title { font-size: 22px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
   .subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); }
   .section-header {
-    font-size: 14px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--text);
     margin: 16px 0 8px 0;
