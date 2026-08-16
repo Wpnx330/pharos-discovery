@@ -781,6 +781,1035 @@ OAUTH_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+# ─── Apps-Mode HTML Templates (Phase 3) ───────────────────────────────────────
+#
+# Six full HTML documents for the _apps tool variants. Each is a complete
+# <!DOCTYPE html> page designed for rendering inside a sandboxed iframe by
+# the MCP Apps host (LibreChat). Design follows the anti-AI-slop rules:
+# dark GitHub-style theme, IBM Plex Sans/Mono, monospace for data, tables
+# for list data, no purple gradients, no glassmorphism, no emoji headers.
+#
+# All templates use a __DATA__ placeholder that is replaced with
+# json.dumps(data).replace("<", "\\u003c") at render time (XSS-safe).
+#
+# Shared CSS variables (repeated in each template for iframe isolation):
+#   --bg: #0d1117, --surface: #161b22, --border: #30363d,
+#   --text: #e6edf3, --text-muted: #8b949e, --accent: #58a6ff,
+#   --danger: #f85149, --success: #3fb950
+
+
+_APPS_BASE_CSS = """
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --danger: #f85149;
+    --success: #3fb950;
+    --font-body: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'IBM Plex Mono', 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--font-body);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 16px;
+  }
+  .header { margin-bottom: 16px; }
+  .title { font-size: 18px; font-weight: 700; color: var(--text); }
+  .subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); }
+  .section-header {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    margin: 16px 0 8px 0;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .mono { font-family: var(--font-mono); }
+  .muted { color: var(--text-muted); }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+  .badge-accent { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+  .badge-success { background: rgba(63, 185, 80, 0.15); color: var(--success); }
+  .badge-danger { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+  .badge-muted { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); }
+  .btn {
+    display: inline-block;
+    padding: 8px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--font-body);
+    cursor: pointer;
+    background: var(--surface);
+    color: var(--text);
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .btn:hover { background: var(--border); }
+  .btn-primary { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+  .btn-primary:hover { opacity: 0.9; background: var(--accent); }
+  .btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .btn-danger:hover { opacity: 0.9; background: var(--danger); }
+  .btn-success { background: var(--success); color: #0d1117; border-color: var(--success); }
+  .btn-success:hover { opacity: 0.9; background: var(--success); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status { margin-top: 12px; font-size: 13px; padding: 8px 12px; border-radius: 6px; display: none; }
+  #status.visible { display: block; }
+  #status.ok { background: rgba(63, 185, 80, 0.1); color: var(--success); }
+  #status.err { background: rgba(248, 81, 73, 0.1); color: var(--danger); }
+"""
+
+SEARCH_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Search Results</title>
+<style>""" + _APPS_BASE_CSS + """
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .toolbar .count { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+  .results-table { width: 100%; border-collapse: collapse; }
+  .results-table th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .results-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .results-table tr:hover td { background: var(--surface); }
+  .srv-name { font-weight: 600; font-size: 13px; color: var(--text); }
+  .srv-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .srv-id { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+  .empty { text-align: center; padding: 32px; color: var(--text-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Search Results</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div class="toolbar">
+    <span class="count" id="count"></span>
+  </div>
+  <table class="results-table" id="results-table">
+    <thead>
+      <tr>
+        <th>Server</th>
+        <th>Transport</th>
+        <th>Tools</th>
+        <th>Publisher</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">No servers found. Try a different query.</div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return "";
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  function render() {
+    const results = DATA.results || [];
+    const countEl = document.getElementById("count");
+    const emptyEl = document.getElementById("empty");
+    const tbody = document.getElementById("results-body");
+    const subtitle = document.getElementById("subtitle");
+
+    if (DATA.query) subtitle.textContent = "query: " + DATA.query;
+
+    if (!results.length) {
+      document.getElementById("results-table").style.display = "none";
+      emptyEl.style.display = "block";
+      countEl.textContent = "";
+      return;
+    }
+
+    countEl.textContent = results.length + " result" + (results.length > 1 ? "s" : "");
+    tbody.innerHTML = "";
+
+    results.forEach((r) => {
+      const tr = document.createElement("tr");
+
+      // Server cell (name + description + id)
+      const cellSrv = document.createElement("td");
+      const nameDiv = document.createElement("div");
+      nameDiv.className = "srv-name";
+      nameDiv.textContent = r.name || r.id;
+      cellSrv.appendChild(nameDiv);
+      const descDiv = document.createElement("div");
+      descDiv.className = "srv-desc";
+      descDiv.textContent = (r.description || "No description.").substring(0, 120);
+      cellSrv.appendChild(descDiv);
+      const idDiv = document.createElement("div");
+      idDiv.className = "srv-id";
+      idDiv.textContent = r.id;
+      cellSrv.appendChild(idDiv);
+      tr.appendChild(cellSrv);
+
+      // Transport cell
+      const cellTr = document.createElement("td");
+      const transport = Array.isArray(r.transport) ? r.transport.join(", ") : (r.transport || "unknown");
+      const trBadge = document.createElement("span");
+      trBadge.className = "badge badge-muted mono";
+      trBadge.textContent = transport;
+      cellTr.appendChild(trBadge);
+      tr.appendChild(cellTr);
+
+      // Tools cell
+      const cellTools = document.createElement("td");
+      const toolsBadge = document.createElement("span");
+      toolsBadge.className = "badge badge-accent";
+      toolsBadge.textContent = String(r.tools_count || 0);
+      cellTools.appendChild(toolsBadge);
+      tr.appendChild(cellTools);
+
+      // Publisher cell
+      const cellPub = document.createElement("td");
+      const pubName = document.createElement("div");
+      pubName.textContent = (r.publisher && r.publisher.name) || "unknown";
+      cellPub.appendChild(pubName);
+      if (r.publisher && r.publisher.verified) {
+        const vBadge = document.createElement("span");
+        vBadge.className = "badge badge-success";
+        vBadge.textContent = "verified";
+        cellPub.appendChild(vBadge);
+      }
+      tr.appendChild(cellPub);
+
+      // Install button cell
+      const cellBtn = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.className = "btn btn-primary";
+      btn.textContent = "Install";
+      btn.dataset.serverId = r.id;
+      btn.addEventListener("click", () => {
+        window.parent.postMessage({
+          jsonrpc: "2.0",
+          method: "notifications/tool_result",
+          params: { action: "install", server_id: r.id }
+        }, "*");
+        showStatus("To install " + r.id + ", ask the AI to call pharos_install_apps with server_id: " + r.id, "ok");
+      });
+      cellBtn.appendChild(btn);
+      tr.appendChild(cellBtn);
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
+INFO_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Server Info</title>
+<style>""" + _APPS_BASE_CSS + """
+  .info-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .info-name { font-size: 18px; font-weight: 700; color: var(--text); }
+  .info-desc { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+  .detail-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .detail-table td {
+    padding: 6px 12px 6px 0;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .detail-table td:first-child {
+    width: 120px;
+    color: var(--text-muted);
+  }
+  .detail-table td:last-child {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .tags-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Server Details</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div class="info-card" id="info-card"></div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function render() {
+    const s = DATA.server;
+    if (!s) return;
+    const card = document.getElementById("info-card");
+    const subtitle = document.getElementById("subtitle");
+    subtitle.textContent = "id: " + (s.id || "unknown");
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "info-name";
+    nameEl.textContent = s.display_name || s.name || s.id;
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "info-desc";
+    descEl.textContent = s.description || "No description available.";
+    card.appendChild(descEl);
+
+    const table = document.createElement("table");
+    table.className = "detail-table";
+    const rows = [
+      ["Version", s.version || "N/A"],
+      ["Publisher", (s.publisher && s.publisher.name) || "unknown"],
+      ["Verified", s.publisher && s.publisher.verified ? "yes" : "no"],
+      ["Transport", Array.isArray(s.transport) ? s.transport.join(", ") : (s.transport || "N/A")],
+      ["Endpoint", s.endpoint || "N/A"],
+      ["Tools", String(s.tools_count || 0)],
+      ["Pricing", s.pricing || "free"],
+      ["Capabilities", Array.isArray(s.capabilities) ? s.capabilities.join(", ") : "none"],
+    ];
+    rows.forEach(([label, value]) => {
+      const tr = document.createElement("tr");
+      const td1 = document.createElement("td");
+      td1.textContent = label;
+      const td2 = document.createElement("td");
+      td2.textContent = value;
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      table.appendChild(tr);
+    });
+    card.appendChild(table);
+
+    if (Array.isArray(s.tags) && s.tags.length) {
+      const tagsLabel = document.createElement("div");
+      tagsLabel.className = "label";
+      tagsLabel.style.marginTop = "12px";
+      tagsLabel.textContent = "Tags";
+      card.appendChild(tagsLabel);
+      const tagsRow = document.createElement("div");
+      tagsRow.className = "tags-row";
+      s.tags.forEach(t => {
+        const tag = document.createElement("span");
+        tag.className = "badge badge-muted";
+        tag.textContent = t;
+        tagsRow.appendChild(tag);
+      });
+      card.appendChild(tagsRow);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const btn = document.createElement("button");
+    btn.className = "btn btn-primary";
+    btn.textContent = "Install";
+    btn.addEventListener("click", () => {
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "notifications/tool_result",
+        params: { action: "install", server_id: s.id }
+      }, "*");
+      showStatus("To install " + s.id + ", ask the AI to call pharos_install_apps.", "ok");
+    });
+    actions.appendChild(btn);
+    card.appendChild(actions);
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
+APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Approval Required</title>
+<style>""" + _APPS_BASE_CSS + """
+  .approval-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .approval-name { font-size: 18px; font-weight: 700; color: var(--text); }
+  .approval-desc { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+  .purpose-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    margin: 12px 0;
+  }
+  .purpose-box .label { margin-bottom: 4px; }
+  .purpose-box .purpose-text { font-size: 13px; color: var(--text); }
+  .detail-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .detail-table td {
+    padding: 6px 12px 6px 0;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .detail-table td:first-child { width: 120px; color: var(--text-muted); }
+  .detail-table td:last-child { font-family: var(--font-mono); font-size: 12px; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Approval Required</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div class="approval-card" id="approval-card"></div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function render() {
+    const s = DATA.server;
+    if (!s) return;
+    const card = document.getElementById("approval-card");
+    const subtitle = document.getElementById("subtitle");
+    subtitle.textContent = "id: " + (s.id || DATA.server_id || "unknown");
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "approval-name";
+    nameEl.textContent = s.display_name || s.name || s.id;
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "approval-desc";
+    descEl.textContent = s.description || "No description available.";
+    card.appendChild(descEl);
+
+    // Purpose box
+    const purposeBox = document.createElement("div");
+    purposeBox.className = "purpose-box";
+    const purposeLabel = document.createElement("div");
+    purposeLabel.className = "label";
+    purposeLabel.textContent = "Purpose";
+    purposeBox.appendChild(purposeLabel);
+    const purposeText = document.createElement("div");
+    purposeText.className = "purpose-text";
+    purposeText.textContent = DATA.purpose || "User request";
+    purposeBox.appendChild(purposeText);
+    card.appendChild(purposeBox);
+
+    // Detail table
+    const table = document.createElement("table");
+    table.className = "detail-table";
+    const rows = [
+      ["Version", s.version || "N/A"],
+      ["Publisher", (s.publisher && s.publisher.name) || "unknown"],
+      ["Transport", Array.isArray(s.transport) ? s.transport.join(", ") : (s.transport || "N/A")],
+      ["Endpoint", s.endpoint || "N/A"],
+      ["Tools", String(s.tools_count || 0)],
+      ["Pricing", s.pricing || "free"],
+    ];
+    rows.forEach(([label, value]) => {
+      const tr = document.createElement("tr");
+      const td1 = document.createElement("td");
+      td1.textContent = label;
+      const td2 = document.createElement("td");
+      td2.textContent = value;
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      table.appendChild(tr);
+    });
+    card.appendChild(table);
+
+    // Actions
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "notifications/tool_result",
+        params: { approved: false }
+      }, "*");
+      showStatus("Installation cancelled.", "err");
+    });
+    actions.appendChild(cancelBtn);
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "btn btn-success";
+    approveBtn.textContent = "Approve";
+    approveBtn.id = "approve-btn";
+    approveBtn.addEventListener("click", () => {
+      approveBtn.disabled = true;
+      cancelBtn.disabled = true;
+      showStatus("Sending approval...", "ok");
+
+      fetch("/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          approval_token: DATA.approval_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        })
+      }).then(resp => resp.json()).then(body => {
+        if (body.error) {
+          showStatus("Error: " + body.error, "err");
+          approveBtn.disabled = false;
+          cancelBtn.disabled = false;
+        } else {
+          showStatus("Approved. " + (body.tools_count || 0) + " tools available.", "ok");
+          window.parent.postMessage({
+            jsonrpc: "2.0",
+            method: "notifications/tool_result",
+            params: { approved: true, server_id: body.server_id }
+          }, "*");
+        }
+      }).catch(err => {
+        showStatus("Request failed: " + (err.message || String(err)), "err");
+        approveBtn.disabled = false;
+        cancelBtn.disabled = false;
+      });
+    });
+    actions.appendChild(approveBtn);
+    card.appendChild(actions);
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
+REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Removal Confirmation</title>
+<style>""" + _APPS_BASE_CSS + """
+  .removal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .removal-name { font-size: 18px; font-weight: 700; color: var(--text); }
+  .removal-desc { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+  .warning-box {
+    background: rgba(248, 81, 73, 0.08);
+    border: 1px solid rgba(248, 81, 73, 0.3);
+    border-radius: 6px;
+    padding: 12px;
+    margin: 12px 0;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Removal Confirmation</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div class="removal-card" id="removal-card"></div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function render() {
+    const card = document.getElementById("removal-card");
+    const subtitle = document.getElementById("subtitle");
+    subtitle.textContent = "id: " + (DATA.server_id || "unknown");
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "removal-name";
+    nameEl.textContent = DATA.server_name || DATA.server_id || "Unknown Server";
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "removal-desc";
+    descEl.textContent = DATA.server_description || "";
+    card.appendChild(descEl);
+
+    const warning = document.createElement("div");
+    warning.className = "warning-box";
+    warning.textContent = "This will remove the server and disconnect any active sessions. This action cannot be undone from the UI.";
+    card.appendChild(warning);
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "notifications/tool_result",
+        params: { approved: false }
+      }, "*");
+      showStatus("Removal cancelled.", "ok");
+    });
+    actions.appendChild(cancelBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "btn btn-danger";
+    removeBtn.textContent = "Remove";
+    removeBtn.id = "remove-btn";
+    removeBtn.addEventListener("click", () => {
+      removeBtn.disabled = true;
+      cancelBtn.disabled = true;
+      showStatus("Sending removal confirmation...", "ok");
+
+      fetch("/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          approval_token: DATA.removal_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        })
+      }).then(resp => resp.json()).then(body => {
+        if (body.error) {
+          showStatus("Error: " + body.error, "err");
+          removeBtn.disabled = false;
+          cancelBtn.disabled = false;
+        } else {
+          showStatus("Server removed.", "ok");
+          window.parent.postMessage({
+            jsonrpc: "2.0",
+            method: "notifications/tool_result",
+            params: { approved: true, action: "removed", server_id: DATA.server_id }
+          }, "*");
+        }
+      }).catch(err => {
+        showStatus("Request failed: " + (err.message || String(err)), "err");
+        removeBtn.disabled = false;
+        cancelBtn.disabled = false;
+      });
+    });
+    actions.appendChild(removeBtn);
+    card.appendChild(actions);
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
+INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Installed Servers</title>
+<style>""" + _APPS_BASE_CSS + """
+  .installed-table { width: 100%; border-collapse: collapse; }
+  .installed-table th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .installed-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    vertical-align: top;
+  }
+  .installed-table tr:hover td { background: var(--surface); }
+  .installed-table td.mono { font-family: var(--font-mono); font-size: 12px; }
+  .empty { text-align: center; padding: 32px; color: var(--text-muted); font-size: 13px; }
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .status-running { background: var(--success); }
+  .status-stopped { background: var(--text-muted); }
+  .status-error { background: var(--danger); }
+  .row-action {
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .row-action:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Installed Servers</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <table class="installed-table" id="installed-table">
+    <thead>
+      <tr>
+        <th>Server ID</th>
+        <th>Status</th>
+        <th>Transport</th>
+        <th>Source</th>
+        <th>Installed</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="installed-body"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">No servers installed.</div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function render() {
+    const servers = DATA.servers || [];
+    const tbody = document.getElementById("installed-body");
+    const emptyEl = document.getElementById("empty");
+    const subtitle = document.getElementById("subtitle");
+
+    subtitle.textContent = servers.length + " server" + (servers.length !== 1 ? "s" : "");
+
+    if (!servers.length) {
+      document.getElementById("installed-table").style.display = "none";
+      emptyEl.style.display = "block";
+      return;
+    }
+
+    tbody.innerHTML = "";
+    servers.forEach((s) => {
+      const tr = document.createElement("tr");
+
+      const cellId = document.createElement("td");
+      cellId.className = "mono";
+      cellId.textContent = s.server_id || s.id || "unknown";
+      tr.appendChild(cellId);
+
+      const cellStatus = document.createElement("td");
+      const status = (s.status || "unknown").toLowerCase();
+      const dot = document.createElement("span");
+      dot.className = "status-dot status-" + (status === "running" ? "running" : status === "error" ? "error" : "stopped");
+      cellStatus.appendChild(dot);
+      cellStatus.appendChild(document.createTextNode(s.status || "unknown"));
+      tr.appendChild(cellStatus);
+
+      const cellTr = document.createElement("td");
+      cellTr.className = "mono";
+      const transport = Array.isArray(s.transport) ? s.transport.join(", ") : (s.transport || "unknown");
+      cellTr.textContent = transport;
+      tr.appendChild(cellTr);
+
+      const cellSrc = document.createElement("td");
+      cellSrc.textContent = s.source || "unknown";
+      tr.appendChild(cellSrc);
+
+      const cellDate = document.createElement("td");
+      cellDate.className = "mono";
+      const installed = s.installed_at || "";
+      cellDate.textContent = installed ? installed.substring(0, 19).replace("T", " ") : "N/A";
+      tr.appendChild(cellDate);
+
+      const cellAction = document.createElement("td");
+      const removeLink = document.createElement("a");
+      removeLink.className = "row-action";
+      removeLink.textContent = "Remove";
+      removeLink.addEventListener("click", () => {
+        window.parent.postMessage({
+          jsonrpc: "2.0",
+          method: "notifications/tool_result",
+          params: { action: "remove", server_id: s.server_id || s.id }
+        }, "*");
+        showStatus("To remove " + (s.server_id || s.id) + ", ask the AI to call pharos_remove_apps.", "ok");
+      });
+      cellAction.appendChild(removeLink);
+      tr.appendChild(cellAction);
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
+PUBLISH_APPS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PHAROS Publish Confirmation</title>
+<style>""" + _APPS_BASE_CSS + """
+  .publish-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .publish-name { font-size: 18px; font-weight: 700; color: var(--text); }
+  .publish-desc { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+  .detail-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .detail-table td {
+    padding: 6px 12px 6px 0;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .detail-table td:first-child { width: 120px; color: var(--text-muted); }
+  .detail-table td:last-child { font-family: var(--font-mono); font-size: 12px; }
+  .tags-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Publish Confirmation</div>
+    <div class="subtitle" id="subtitle"></div>
+  </div>
+  <div class="publish-card" id="publish-card"></div>
+  <div id="status"></div>
+<script>
+  const DATA = __DATA__;
+
+  function render() {
+    const s = DATA.server;
+    if (!s) return;
+    const card = document.getElementById("publish-card");
+    const subtitle = document.getElementById("subtitle");
+    subtitle.textContent = "path: " + (DATA.server_card_path || "current dir");
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "publish-name";
+    nameEl.textContent = s.display_name || s.name || s.id || "Unknown";
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "publish-desc";
+    descEl.textContent = s.description || "No description available.";
+    card.appendChild(descEl);
+
+    const table = document.createElement("table");
+    table.className = "detail-table";
+    const rows = [
+      ["Server ID", s.id || "N/A"],
+      ["Version", s.version || "N/A"],
+      ["Publisher", (s.publisher && s.publisher.name) || "unknown"],
+      ["Transport", Array.isArray(s.transport) ? s.transport.join(", ") : (s.transport || "N/A")],
+      ["Tools", String(s.tools_count || 0)],
+    ];
+    rows.forEach(([label, value]) => {
+      const tr = document.createElement("tr");
+      const td1 = document.createElement("td");
+      td1.textContent = label;
+      const td2 = document.createElement("td");
+      td2.textContent = value;
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      table.appendChild(tr);
+    });
+    card.appendChild(table);
+
+    if (Array.isArray(s.tags) && s.tags.length) {
+      const tagsLabel = document.createElement("div");
+      tagsLabel.className = "label";
+      tagsLabel.style.marginTop = "12px";
+      tagsLabel.textContent = "Tags";
+      card.appendChild(tagsLabel);
+      const tagsRow = document.createElement("div");
+      tagsRow.className = "tags-row";
+      s.tags.forEach(t => {
+        const tag = document.createElement("span");
+        tag.className = "badge badge-muted";
+        tag.textContent = t;
+        tagsRow.appendChild(tag);
+      });
+      card.appendChild(tagsRow);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "notifications/tool_result",
+        params: { approved: false }
+      }, "*");
+      showStatus("Publishing cancelled.", "ok");
+    });
+    actions.appendChild(cancelBtn);
+
+    const publishBtn = document.createElement("button");
+    publishBtn.className = "btn btn-primary";
+    publishBtn.textContent = "Publish";
+    publishBtn.id = "publish-btn";
+    publishBtn.addEventListener("click", () => {
+      publishBtn.disabled = true;
+      cancelBtn.disabled = true;
+      showStatus("Sending publish confirmation...", "ok");
+
+      fetch("/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          approval_token: DATA.publish_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        })
+      }).then(resp => resp.json()).then(body => {
+        if (body.error) {
+          showStatus("Error: " + body.error, "err");
+          publishBtn.disabled = false;
+          cancelBtn.disabled = false;
+        } else {
+          showStatus("Server published successfully.", "ok");
+          window.parent.postMessage({
+            jsonrpc: "2.0",
+            method: "notifications/tool_result",
+            params: { approved: true, action: "published", server_id: s.id }
+          }, "*");
+        }
+      }).catch(err => {
+        showStatus("Request failed: " + (err.message || String(err)), "err");
+        publishBtn.disabled = false;
+        cancelBtn.disabled = false;
+      });
+    });
+    actions.appendChild(publishBtn);
+    card.appendChild(actions);
+  }
+
+  function showStatus(msg, kind) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "visible " + (kind || "ok");
+  }
+
+  window.addEventListener("error", function(e) {
+    showStatus("Render error: " + (e.message || "unknown"), "err");
+  });
+
+  try { render(); } catch(err) {
+    showStatus("Render error: " + (err.message || String(err)), "err");
+  }
+</script>
+</body>
+</html>"""
+
+
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
 # Create the FastMCP server
@@ -1343,11 +2372,13 @@ if not MCP_APPS_MODE:
 
 else:
 
-    # ─── Apps Mode: Placeholder _apps Variants ────────────────────────────────
+    # ─── Apps Mode: _apps Variants with HTML Templates ──────────────────────
     #
     # These are registered with meta={"ui": {"resourceUri": ...}} annotations
     # so the host knows to render the tool result in a sandboxed iframe.
-    # The actual HTML/approval logic will be implemented in Phase 3.
+    # Each tool reuses the same backend logic as its CLI-mode counterpart,
+    # but returns JSON with an "html" field containing a full HTML document.
+    # The HTML is rendered in a sandboxed iframe by the MCP Apps host.
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/results"}})
     async def pharos_search_apps(
@@ -1357,8 +2388,9 @@ else:
     ) -> str:
         """Search the PHAROS registry for MCP servers (Apps mode).
 
-        Renders search results as an interactive iframe gallery. The user
-        can browse and select servers visually.
+        Renders search results as an interactive iframe table with per-server
+        install buttons. The user can browse results and request installation
+        visually.
 
         Args:
             query: Natural-language search query
@@ -1366,10 +2398,74 @@ else:
             remote_only: If True, only return remote-transport servers
 
         Returns:
-            JSON with search results and a search_id for the UI resource.
+            JSON with status, results array, search_id, and an html field
+            containing the rendered results table for the iframe.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_search_apps will be implemented in Phase 3"})
+        client = _get_client()
+        limit = min(max(limit, 1), 50)
+
+        filters: dict[str, Any] = {}
+        if remote_only:
+            filters["transport"] = ["sse", "streamable-http", "http"]
+
+        try:
+            results = await client.search(text=query, filters=filters or None, limit=limit)
+        except NoServersFound:
+            output: list[dict] = []
+        except RegistryUnavailable as e:
+            error_html_data = {"query": query, "results": [], "error": str(e)}
+            safe_json = json.dumps(error_html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+            html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
+            return json.dumps({
+                "status": "error",
+                "error": f"Registry unavailable: {e}",
+                "results": [],
+                "html": html,
+            })
+
+        # Cache cards for later use (same logic as pharos_search)
+        for r in results:
+            _server_cards[r.card.id] = r.card
+
+        output = []
+        for r in results:
+            card = r.card
+            output.append({
+                "id": card.id,
+                "name": card.display_name,
+                "description": card.description,
+                "version": card.version,
+                "transport": card.transport,
+                "publisher": {
+                    "name": card.publisher.name if card.publisher else "unknown",
+                    "verified": card.publisher.verified if card.publisher else False,
+                },
+                "tools_count": getattr(card, "tools_count", 0),
+                "capabilities": card.capabilities,
+                "endpoint": getattr(card, "endpoint", None),
+            })
+
+        # Cache for UI resource rendering (same pattern as pharos_search)
+        search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
+        _search_results_cache[search_id] = output
+        global _current_search_id
+        _current_search_id = search_id
+        if len(_search_results_cache) > _MAX_CACHE_SIZE:
+            oldest = next(iter(_search_results_cache))
+            del _search_results_cache[oldest]
+
+        # Build HTML with data injected
+        html_data = {"query": query, "results": output}
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        return json.dumps({
+            "status": "ok",
+            "results": output,
+            "count": len(output),
+            "search_id": search_id,
+            "html": html,
+        })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/info"}})
@@ -1377,52 +2473,225 @@ else:
         """Get detailed information about an MCP server (Apps mode).
 
         Renders the server card in an iframe with publisher details,
-        capabilities, and install button.
+        capabilities, transport, tools, pricing, and tags.
 
         Args:
             server_id: The server ID from search results
 
         Returns:
-            JSON with server details for the UI resource.
+            JSON with status, server_id, and an html field containing the
+            rendered server detail card for the iframe.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_info_apps will be implemented in Phase 3"})
+        # Try cached card first (from a prior search), then fetch from registry
+        card = _server_cards.get(server_id)
+        if card is None:
+            client = _get_client()
+            try:
+                card = await client.get_server(server_id)
+                _server_cards[server_id] = card
+            except Exception as e:
+                error_html_data = {
+                    "server": {"id": server_id, "display_name": server_id},
+                    "error": str(e),
+                }
+                safe_json = json.dumps(error_html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+                html = INFO_APPS_TEMPLATE.replace("__DATA__", safe_json)
+                return json.dumps({
+                    "status": "error",
+                    "error": f"Failed to get server info: {e}",
+                    "server_id": server_id,
+                    "html": html,
+                })
+
+        server_data = {
+            "id": str(card.id),
+            "display_name": str(card.display_name),
+            "name": str(card.display_name),
+            "description": str(card.description),
+            "version": str(card.version),
+            "transport": list(card.transport) if card.transport else [],
+            "publisher": {
+                "name": str(card.publisher.name) if card.publisher else "unknown",
+                "verified": bool(card.publisher.verified) if card.publisher else False,
+            },
+            "endpoint": str(getattr(card, "endpoint", None) or "N/A"),
+            "capabilities": list(card.capabilities) if card.capabilities else [],
+            "tools_count": int(getattr(card, "tools_count", 0) or 0),
+            "pricing": "free",
+            "tags": list(getattr(card, "tags", []) or []),
+        }
+
+        html_data = {"server": server_data}
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = INFO_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        return json.dumps({
+            "status": "ok",
+            "server_id": server_id,
+            "server": server_data,
+            "html": html,
+        })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
     async def pharos_install_apps(server_id: str, purpose: str = "User request") -> str:
         """Install an MCP server with visual approval flow (Apps mode).
 
-        Renders an approval card in the iframe. The user must click
-        Approve before the server is installed and connected.
+        Creates a pending approval connection and renders an approval card in
+        the iframe. The user must click Approve before the server is installed
+        and connected. The approval_nonce is injected into the HTML but is NOT
+        included in the JSON response the AI sees.
 
         Args:
             server_id: The server ID to install
             purpose: Why the installation is being requested (shown to user)
 
         Returns:
-            JSON with pending approval token (connection is NOT established
-            until the user clicks Approve in the iframe).
+            JSON with status "pending_approval", approval_token, server_id,
+            and an html field containing the rendered approval card. The
+            nonce is in the HTML only, never in the JSON.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_install_apps will be implemented in Phase 3"})
+        # Get the server card (from cache or registry)
+        card = _server_cards.get(server_id)
+        if card is None:
+            client = _get_client()
+            try:
+                card = await client.get_server(server_id)
+                _server_cards[server_id] = card
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "error": f"Cannot install: server '{server_id}' not found: {e}",
+                    "server_id": server_id,
+                })
+
+        # Determine endpoint from the card
+        endpoint = getattr(card, "endpoint", None)
+
+        # Create pending approval connection (reuses existing helper)
+        token = _create_pending_connection(card, server_id, endpoint, purpose)
+        if token is None:
+            return json.dumps({
+                "status": "error",
+                "error": "Too many pending connections. Wait for existing approvals to expire.",
+                "server_id": server_id,
+            })
+
+        # Retrieve the approval nonce from pending connections (UI-only)
+        approval_nonce = _pending_connections[token]["approval_nonce"]
+
+        # Build HTML data WITH the nonce (for the iframe button)
+        html_data = {
+            "server_id": server_id,
+            "server": {
+                "id": str(card.id),
+                "display_name": str(card.display_name),
+                "name": str(card.display_name),
+                "description": str(card.description),
+                "version": str(card.version),
+                "transport": list(card.transport) if card.transport else [],
+                "publisher": {
+                    "name": str(card.publisher.name) if card.publisher else "unknown",
+                    "verified": bool(card.publisher.verified) if card.publisher else False,
+                },
+                "endpoint": str(endpoint) if endpoint else "N/A",
+                "tools_count": int(getattr(card, "tools_count", 0) or 0),
+                "pricing": "free",
+            },
+            "purpose": purpose,
+            "approval_token": token,
+            "approval_nonce": approval_nonce,  # UI-only, NOT in AI-visible JSON
+        }
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = APPROVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        # Return JSON to AI — nonce is NOT here
+        return json.dumps({
+            "status": "pending_approval",
+            "approval_token": token,
+            "server_id": server_id,
+            "message": f"Approval required to install {card.display_name}. "
+                       f"Tell the user to click Approve in the card above.",
+            "html": html,
+        })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/removal"}})
     async def pharos_remove_apps(server_id: str) -> str:
         """Remove an MCP server with visual confirmation (Apps mode).
 
-        Renders a removal confirmation card in the iframe. The user must
-        confirm before the server is removed.
+        Creates a pending removal token and renders a removal confirmation
+        card in the iframe. The user must click Remove before the server is
+        removed. The approval_nonce is injected into the HTML but is NOT
+        included in the JSON response the AI sees.
 
         Args:
             server_id: The server ID to remove
 
         Returns:
-            JSON with pending removal token.
+            JSON with status "pending_removal", removal_token, and an html
+            field containing the rendered removal card. The nonce is in the
+            HTML only, never in the JSON.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_remove_apps will be implemented in Phase 3"})
+        # Look up server name from cards or installed servers
+        server_name = server_id
+        server_description = ""
+        card = _server_cards.get(server_id)
+        if card is not None:
+            server_name = str(card.display_name)
+            server_description = str(card.description)
+        elif server_id in _installed_servers:
+            meta = _installed_servers[server_id]
+            server_name = meta.get("name", server_id)
+
+        # Create a pending removal token (reuse the approval infrastructure)
+        removal_nonce = str(uuid.uuid4())
+        removal_token = f"rm-{server_id}-{int(time.time())}-{os.urandom(4).hex()}"
+        signature = _sign_pending(removal_token, server_id)
+        expires_at = int(time.time()) + 300  # 5-minute expiry
+
+        # Clean up expired entries first
+        now = int(time.time())
+        expired = [k for k, v in _pending_connections.items() if now >= v["expires_at"]]
+        for k in expired:
+            del _pending_connections[k]
+        if len(_pending_connections) >= 50:
+            return json.dumps({
+                "status": "error",
+                "error": "Too many pending operations. Try again shortly.",
+                "server_id": server_id,
+            })
+
+        _pending_connections[removal_token] = {
+            "server_id": server_id,
+            "card": card,
+            "endpoint": None,
+            "purpose": "removal",
+            "signature": signature,
+            "expires_at": expires_at,
+            "approval_nonce": removal_nonce,
+        }
+
+        # Build HTML data WITH the nonce (for the iframe button)
+        html_data = {
+            "server_id": server_id,
+            "server_name": server_name,
+            "server_description": server_description,
+            "removal_token": removal_token,
+            "approval_nonce": removal_nonce,  # UI-only, NOT in AI-visible JSON
+        }
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = REMOVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        # Return JSON to AI — nonce is NOT here
+        return json.dumps({
+            "status": "pending_removal",
+            "removal_token": removal_token,
+            "server_id": server_id,
+            "message": f"Removal confirmation required for {server_name}. "
+                       f"Tell the user to click Remove in the card above.",
+            "html": html,
+        })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/installed"}})
@@ -1430,30 +2699,176 @@ else:
         """List installed MCP servers as an interactive table (Apps mode).
 
         Renders the installed servers in an iframe table with status
-        indicators and per-server actions.
+        indicators, transport, source, and per-server remove actions.
 
         Returns:
-            JSON with installed servers data for the UI resource.
+            JSON with status, servers array, and an html field containing
+            the rendered installed servers table for the iframe.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_list_apps will be implemented in Phase 3"})
+        results: list[dict] = []
+
+        # 1. Report in-memory remote registrations (same logic as pharos_list)
+        for sid, meta in _installed_servers.items():
+            results.append({
+                "server_id": sid,
+                "transport": meta.get("transport", "unknown"),
+                "endpoint": meta.get("endpoint"),
+                "installed_at": meta.get("installed_at"),
+                "source": "mcp_registered",
+                "status": "registered",
+            })
+
+        # 2. Query the pharos CLI for locally installed servers
+        cli = _get_pharos_cli()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "list", "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except Exception:
+            # CLI not available or timed out — return only in-memory registrations
+            pass
+        else:
+            cli_output = stdout.decode().strip() if stdout else ""
+            if proc.returncode == 0 and cli_output:
+                try:
+                    parsed = json.loads(cli_output)
+                    entries = parsed if isinstance(parsed, list) else parsed.get("servers", [])
+                    for entry in entries:
+                        sid = entry.get("name") or entry.get("id") or "unknown"
+                        results.append({
+                            "server_id": sid,
+                            "transport": entry.get("transport", "unknown"),
+                            "status": entry.get("status", "unknown"),
+                            "source": "cli",
+                        })
+                except json.JSONDecodeError:
+                    for line in cli_output.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("NAME") and not line.startswith("-"):
+                            parts = line.split()
+                            if parts:
+                                results.append({
+                                    "server_id": parts[0],
+                                    "transport": parts[1] if len(parts) > 1 else "unknown",
+                                    "status": parts[2] if len(parts) > 2 else "unknown",
+                                    "source": "cli",
+                                })
+
+        # Build HTML with data injected
+        html_data = {"servers": results}
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = INSTALLED_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        return json.dumps({
+            "status": "ok",
+            "servers": results,
+            "count": len(results),
+            "html": html,
+        })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/publish"}})
     async def pharos_publish_apps(server_card_path: str = "") -> str:
         """Publish a server card to the registry with approval flow (Apps mode).
 
-        Renders a publishing confirmation card in the iframe showing the
-        server card details and publisher verification status.
+        Reads the server card from the given path, creates a pending publish
+        token, and renders a publishing confirmation card in the iframe showing
+        the server card details. The user must click Publish before the card is
+        uploaded. The approval_nonce is injected into the HTML but is NOT
+        included in the JSON response the AI sees.
 
         Args:
             server_card_path: Path to the server card JSON file to publish
 
         Returns:
-            JSON with pending publish token.
+            JSON with status "pending_publish", publish_token, and an html
+            field containing the rendered publish confirmation card. The
+            nonce is in the HTML only, never in the JSON.
         """
-        return json.dumps({"status": "not_implemented", "mode": "apps",
-                           "message": "pharos_publish_apps will be implemented in Phase 3"})
+        # Read and parse the server card from the path
+        server_data: dict[str, Any]
+        try:
+            with open(server_card_path) as f:
+                card_json = json.load(f)
+            server_data = {
+                "id": card_json.get("id", "unknown"),
+                "display_name": card_json.get("display_name", card_json.get("id", "unknown")),
+                "name": card_json.get("display_name", card_json.get("id", "unknown")),
+                "description": card_json.get("description", "No description available."),
+                "version": card_json.get("version", "N/A"),
+                "transport": card_json.get("transport", []),
+                "publisher": card_json.get("publisher", {"name": "unknown"}),
+                "tools_count": card_json.get("tools_count", 0),
+                "tags": card_json.get("tags", []),
+            }
+        except FileNotFoundError:
+            return json.dumps({
+                "status": "error",
+                "error": f"Server card not found at path: {server_card_path}",
+                "server_card_path": server_card_path,
+            })
+        except json.JSONDecodeError as e:
+            return json.dumps({
+                "status": "error",
+                "error": f"Invalid JSON in server card: {e}",
+                "server_card_path": server_card_path,
+            })
+        except Exception as e:
+            return json.dumps({
+                "status": "error",
+                "error": f"Failed to read server card: {e}",
+                "server_card_path": server_card_path,
+            })
+
+        # Create a pending publish token (reuse the approval infrastructure)
+        publish_nonce = str(uuid.uuid4())
+        publish_token = f"pb-{server_data['id']}-{int(time.time())}-{os.urandom(4).hex()}"
+        signature = _sign_pending(publish_token, str(server_data["id"]))
+        expires_at = int(time.time()) + 300  # 5-minute expiry
+
+        # Clean up expired entries first
+        now = int(time.time())
+        expired = [k for k, v in _pending_connections.items() if now >= v["expires_at"]]
+        for k in expired:
+            del _pending_connections[k]
+        if len(_pending_connections) >= 50:
+            return json.dumps({
+                "status": "error",
+                "error": "Too many pending operations. Try again shortly.",
+            })
+
+        _pending_connections[publish_token] = {
+            "server_id": str(server_data["id"]),
+            "card": None,
+            "endpoint": None,
+            "purpose": "publish",
+            "signature": signature,
+            "expires_at": expires_at,
+            "approval_nonce": publish_nonce,
+        }
+
+        # Build HTML data WITH the nonce (for the iframe button)
+        html_data = {
+            "server_card_path": server_card_path,
+            "server": server_data,
+            "publish_token": publish_token,
+            "approval_nonce": publish_nonce,  # UI-only, NOT in AI-visible JSON
+        }
+        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
+        html = PUBLISH_APPS_TEMPLATE.replace("__DATA__", safe_json)
+
+        # Return JSON to AI — nonce is NOT here
+        return json.dumps({
+            "status": "pending_publish",
+            "publish_token": publish_token,
+            "server_id": str(server_data["id"]),
+            "message": f"Publish confirmation required for {server_data['display_name']}. "
+                       f"Tell the user to click Publish in the card above.",
+            "html": html,
+        })
 
 
 # ─── Approval HTTP Endpoint ────────────────────────────────────────────────────

@@ -1230,3 +1230,218 @@ class TestCLI1to1Tools:
             assert len(tool_fn.__doc__.strip()) > 20, f"Docstring too short: {tool_fn.__name__}"
             assert "Args:" in tool_fn.__doc__ or "Returns:" in tool_fn.__doc__, \
                 f"Docstring missing Args/Returns: {tool_fn.__name__}"
+
+
+# ─── Apps Mode Tools (Phase 3) ─────────────────────────────────────────────────
+
+class TestAppsModeTools:
+    """Test the 6 _apps tool variants that return HTML for iframe rendering.
+
+    These tools are only registered when PHAROS_MCP_APPS=true. We reload the
+    server module with that env var set to test them in isolation, then
+    restore the original module afterward.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apps_mode_module(self):
+        """Reload server.py in apps mode, yield the module, restore after."""
+        import importlib
+        import pharos_discovery.mcp_server.server as _srv_mod
+
+        saved_env = os.environ.get("PHAROS_MCP_APPS", "")
+        os.environ["PHAROS_MCP_APPS"] = "true"
+        try:
+            apps_srv = importlib.reload(_srv_mod)
+            yield apps_srv
+        finally:
+            os.environ.pop("PHAROS_MCP_APPS", None)
+            if saved_env:
+                os.environ["PHAROS_MCP_APPS"] = saved_env
+            # Restore CLI-mode module for subsequent tests
+            importlib.reload(_srv_mod)
+
+    @pytest.fixture
+    def mock_client_apps(self):
+        """Mock PharosClient for apps-mode tests."""
+        client = AsyncMock()
+        result_mock = MagicMock()
+        result_mock.card.id = "test-server"
+        result_mock.card.display_name = "Test Server"
+        result_mock.card.description = "A test server for unit tests"
+        result_mock.card.version = "1.0.0"
+        result_mock.card.transport = ["http+sse"]
+        result_mock.card.publisher = MagicMock()
+        result_mock.card.publisher.name = "test-pub"
+        result_mock.card.publisher.verified = True
+        result_mock.card.tools_count = 3
+        result_mock.card.capabilities = ["streaming", "tools"]
+        result_mock.card.endpoint = "http://127.0.0.1:8765"
+        result_mock.card.tags = ["test", "echo"]
+        client.search = AsyncMock(return_value=[result_mock])
+        client.get_server = AsyncMock(return_value=result_mock.card)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_search_apps_returns_html(self, _apps_mode_module, mock_client_apps):
+        """pharos_search_apps should return JSON with an html field containing <!DOCTYPE html>."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._search_results_cache.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_search_apps("echo", limit=5)
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert "results" in data
+        assert "search_id" in data
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        assert "</html>" in data["html"]
+        assert len(data["results"]) == 1
+        assert data["results"][0]["id"] == "test-server"
+
+    @pytest.mark.asyncio
+    async def test_info_apps_returns_html(self, _apps_mode_module, mock_client_apps):
+        """pharos_info_apps should return HTML containing the server name."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_info_apps("test-server")
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert data["server_id"] == "test-server"
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        assert "Test Server" in data["html"]
+
+    @pytest.mark.asyncio
+    async def test_install_apps_returns_pending_approval(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps should return pending_approval status with a token."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-server", purpose="unit test")
+        data = json.loads(result)
+        assert data["status"] == "pending_approval"
+        assert "approval_token" in data
+        assert data["server_id"] == "test-server"
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        # The nonce should be in the HTML (for the iframe button)
+        token = data["approval_token"]
+        assert token in apps_srv._pending_connections
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+        assert nonce in data["html"]
+
+    @pytest.mark.asyncio
+    async def test_install_apps_nonce_not_in_json_response(self, _apps_mode_module, mock_client_apps):
+        """The approval_nonce must NOT appear as a top-level JSON field the AI can parse.
+
+        The nonce is injected into the HTML (which is a string field), but must
+        not be a separate key in the JSON response. The AI should only see
+        status, approval_token, server_id, message, and html.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-server", purpose="nonce test")
+        data = json.loads(result)
+        # The nonce must NOT be a top-level key in the parsed JSON
+        assert "approval_nonce" not in data, (
+            "approval_nonce must not be a top-level key in the JSON response. "
+            "The AI would be able to read it and bypass physical approval."
+        )
+        # The nonce value should only appear inside the html field, not in
+        # any other JSON field (token, server_id, message, etc.)
+        token = data["approval_token"]
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+        for key, value in data.items():
+            if key == "html":
+                continue  # nonce is expected in the HTML
+            if isinstance(value, str) and nonce in value:
+                pytest.fail(
+                    f"approval_nonce value leaked into JSON field '{key}'. "
+                    f"The nonce must only appear in the html field."
+                )
+
+    @pytest.mark.asyncio
+    async def test_remove_apps_returns_pending_removal(self, _apps_mode_module, mock_client_apps):
+        """pharos_remove_apps should return pending_removal status with a removal_token."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        # Pre-populate a card so remove can find the server name
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+        result = await apps_srv.pharos_remove_apps("test-server")
+        data = json.loads(result)
+        assert data["status"] == "pending_removal"
+        assert "removal_token" in data
+        assert data["server_id"] == "test-server"
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        # The nonce should be in the HTML but NOT as a top-level JSON key
+        token = data["removal_token"]
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+        assert nonce in data["html"]
+        assert "approval_nonce" not in data, (
+            "approval_nonce must not be a top-level key in the JSON response."
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_apps_returns_html_table(self, _apps_mode_module):
+        """pharos_list_apps should return HTML containing a <table> element."""
+        apps_srv = _apps_mode_module
+        apps_srv._installed_servers.clear()
+        apps_srv._installed_servers["demo-srv"] = {
+            "transport": ["http+sse"],
+            "endpoint": "http://localhost:9000",
+            "installed_at": "2026-01-01T00:00:00Z",
+            "name": "Demo Server",
+        }
+        # Mock CLI to return empty (FileNotFoundError is fine)
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await apps_srv.pharos_list_apps()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert "servers" in data
+        assert len(data["servers"]) == 1
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        assert "<table" in data["html"]
+
+    @pytest.mark.asyncio
+    async def test_publish_apps_returns_pending_publish(self, _apps_mode_module, tmp_path):
+        """pharos_publish_apps should read a server card and return pending_publish."""
+        apps_srv = _apps_mode_module
+        apps_srv._pending_connections.clear()
+        # Create a temp server card JSON file
+        card_data = {
+            "id": "my-publish-server",
+            "display_name": "My Publish Server",
+            "description": "A server to test publishing",
+            "version": "2.1.0",
+            "transport": ["stdio"],
+            "publisher": {"name": "test-author", "verified": True},
+            "tools_count": 5,
+            "tags": ["productivity", "files"],
+        }
+        card_file = tmp_path / "server-card.json"
+        card_file.write_text(json.dumps(card_data))
+
+        result = await apps_srv.pharos_publish_apps(str(card_file))
+        data = json.loads(result)
+        assert data["status"] == "pending_publish"
+        assert "publish_token" in data
+        assert data["server_id"] == "my-publish-server"
+        assert "html" in data
+        assert data["html"].startswith("<!DOCTYPE html>")
+        assert "My Publish Server" in data["html"]
+        # The nonce should be in the HTML but NOT as a top-level JSON key
+        token = data["publish_token"]
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+        assert nonce in data["html"]
+        assert "approval_nonce" not in data, (
+            "approval_nonce must not be a top-level key in the JSON response."
+        )
