@@ -787,7 +787,7 @@ class TestInstallTransportGuard:
     async def test_install_remote_sse_registers_without_cli(self):
         """Installing an SSE server should register endpoint without CLI."""
         card = MagicMock()
-        card.transport = "sse"
+        card.transport = ["http+sse"]
         card.endpoint = "https://example.com/sse"
         srv._server_cards["remote-srv"] = card
 
@@ -796,7 +796,7 @@ class TestInstallTransportGuard:
             data = json.loads(result)
 
             assert data["status"] == "registered"
-            assert data["transport"] == "sse"
+            assert data["transport"] == ["http+sse"]
             assert data["endpoint"] == "https://example.com/sse"
             mock_cli.assert_not_called()
 
@@ -804,7 +804,7 @@ class TestInstallTransportGuard:
     async def test_install_remote_streamable_http_registers_without_cli(self):
         """Installing a streamable-http server should register endpoint without CLI."""
         card = MagicMock()
-        card.transport = "streamable-http"
+        card.transport = ["streamable-http"]
         card.endpoint = "https://example.com/mcp"
         srv._server_cards["remote-http"] = card
 
@@ -812,14 +812,14 @@ class TestInstallTransportGuard:
         data = json.loads(result)
 
         assert data["status"] == "registered"
-        assert data["transport"] == "streamable-http"
+        assert data["transport"] == ["streamable-http"]
         assert data["endpoint"] == "https://example.com/mcp"
 
     @pytest.mark.asyncio
     async def test_install_remote_no_endpoint_returns_error(self):
         """Remote server without endpoint should return error."""
         card = MagicMock()
-        card.transport = "sse"
+        card.transport = ["http+sse"]
         card.endpoint = None
         srv._server_cards["bad-remote"] = card
 
@@ -833,7 +833,7 @@ class TestInstallTransportGuard:
     async def test_install_stdio_uses_cli(self):
         """Installing a stdio server should attempt CLI install."""
         card = MagicMock()
-        card.transport = "stdio"
+        card.transport = ["stdio"]
         card.endpoint = None
         srv._server_cards["stdio-srv"] = card
 

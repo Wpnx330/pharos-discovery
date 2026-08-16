@@ -916,10 +916,12 @@ async def pharos_install(server_id: str) -> str:
             pass  # Fall through to CLI install attempt
 
     # Remote transport: register endpoint without CLI
-    if transport and transport.lower() in ("sse", "streamable-http", "http"):
+    remote_transports = ("sse", "streamable-http", "http", "http+sse")
+    if transport and any(t in remote_transports for t in transport):
+        transport_str = ", ".join(transport)
         if not endpoint:
             return json.dumps({
-                "error": f"Server '{server_id}' has transport '{transport}' but no endpoint URL",
+                "error": f"Server '{server_id}' has transport '{transport_str}' but no endpoint URL",
                 "server_id": server_id,
             })
         _installed_servers[server_id] = {
