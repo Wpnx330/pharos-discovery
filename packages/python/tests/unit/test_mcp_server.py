@@ -410,6 +410,28 @@ class TestApproveEndpoint:
         assert "expired" in body["error"].lower()
 
     @pytest.mark.asyncio
+    async def test_approve_with_wrong_nonce(self, mock_server_card):
+        """approve_endpoint should reject when the nonce doesn't match the stored one."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._pending_connections.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        wrong_nonce = str(uuid.uuid4())
+        with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
+            request = self._make_request({
+                "approval_token": token,
+                "approval_nonce": wrong_nonce,
+            })
+            response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "Physical approval required" in body["error"]
+
+    @pytest.mark.asyncio
     async def test_approve_invalid_json_body(self):
         """approve_endpoint should return 400 on invalid JSON."""
         request = AsyncMock()
@@ -1445,3 +1467,177 @@ class TestAppsModeTools:
         assert "approval_nonce" not in data, (
             "approval_nonce must not be a top-level key in the JSON response."
         )
+
+
+# ─── Mode Switching (Phase 4) ──────────────────────────────────────────────────
+
+class TestModeSwitching:
+    """Tests for A/B mode switching via PHAROS_MCP_APPS env var.
+
+    The server module reads PHAROS_MCP_APPS at import time to decide whether
+    to register CLI-mode tools (pharos_search, pharos_install, …) or Apps-mode
+    tools (pharos_search_apps, pharos_install_apps, …). Non-A/B tools
+    (pharos_daemon_status, pharos_list_tools, etc.) and the /approve custom
+    route are registered unconditionally in both modes.
+
+    Each test uses importlib.reload to re-evaluate server.py with the desired
+    env var setting. Because importlib.reload does NOT delete stale module
+    attributes left over from a prior mode, _reload_clean() explicitly removes
+    the A/B tool names before reloading so hasattr() reflects only the new
+    mode's registrations. CLI mode is restored in the finally block so
+    subsequent tests see the default module state.
+    """
+
+    # CLI-mode-only tool names (absent in apps mode)
+    _CLI_TOOLS = [
+        "pharos_search", "pharos_install", "pharos_info",
+        "pharos_remove", "pharos_list", "pharos_publish",
+    ]
+    # Apps-mode-only tool names (absent in CLI mode)
+    _APPS_TOOLS = [
+        "pharos_search_apps", "pharos_info_apps", "pharos_install_apps",
+        "pharos_remove_apps", "pharos_list_apps", "pharos_publish_apps",
+    ]
+
+    @staticmethod
+    def _reload_clean(module):
+        """Reload module after deleting stale A/B tool attributes.
+
+        importlib.reload re-executes module code but does not remove
+        attributes that are no longer assigned, so a function defined in
+        CLI mode would still pass hasattr() after reloading in apps mode.
+        We explicitly del the A/B tool names before reloading to get a
+        clean slate.
+        """
+        import importlib
+        for name in TestModeSwitching._CLI_TOOLS + TestModeSwitching._APPS_TOOLS:
+            if hasattr(module, name):
+                delattr(module, name)
+        return importlib.reload(module)
+
+    @pytest.fixture(autouse=True)
+    def _restore_cli_mode(self):
+        """Ensure PHAROS_MCP_APPS is unset and CLI-mode module is restored after each test."""
+        saved_env = os.environ.get("PHAROS_MCP_APPS", "")
+        yield
+        os.environ.pop("PHAROS_MCP_APPS", None)
+        if saved_env:
+            os.environ["PHAROS_MCP_APPS"] = saved_env
+        self._reload_clean(srv)
+
+    def test_cli_mode_default(self):
+        """Without PHAROS_MCP_APPS, CLI-mode tools are registered."""
+        os.environ.pop("PHAROS_MCP_APPS", None)
+        cli_srv = self._reload_clean(srv)
+        assert hasattr(cli_srv, "pharos_search"), "pharos_search should exist in CLI mode"
+        assert callable(cli_srv.pharos_search)
+        assert hasattr(cli_srv, "pharos_install"), "pharos_install should exist in CLI mode"
+        assert hasattr(cli_srv, "pharos_info"), "pharos_info should exist in CLI mode"
+        assert hasattr(cli_srv, "pharos_remove"), "pharos_remove should exist in CLI mode"
+        assert hasattr(cli_srv, "pharos_list"), "pharos_list should exist in CLI mode"
+        assert hasattr(cli_srv, "pharos_publish"), "pharos_publish should exist in CLI mode"
+        assert not hasattr(cli_srv, "pharos_search_apps"), (
+            "pharos_search_apps should NOT exist in CLI mode"
+        )
+        assert not hasattr(cli_srv, "pharos_install_apps"), (
+            "pharos_install_apps should NOT exist in CLI mode"
+        )
+
+    def test_apps_mode_enabled(self):
+        """With PHAROS_MCP_APPS=true, _apps tools are registered."""
+        os.environ["PHAROS_MCP_APPS"] = "true"
+        apps_srv = self._reload_clean(srv)
+        assert hasattr(apps_srv, "pharos_search_apps"), (
+            "pharos_search_apps should exist in apps mode"
+        )
+        assert callable(apps_srv.pharos_search_apps)
+        assert hasattr(apps_srv, "pharos_info_apps"), "pharos_info_apps should exist in apps mode"
+        assert hasattr(apps_srv, "pharos_install_apps"), (
+            "pharos_install_apps should exist in apps mode"
+        )
+        assert hasattr(apps_srv, "pharos_remove_apps"), (
+            "pharos_remove_apps should exist in apps mode"
+        )
+        assert hasattr(apps_srv, "pharos_list_apps"), "pharos_list_apps should exist in apps mode"
+        assert hasattr(apps_srv, "pharos_publish_apps"), (
+            "pharos_publish_apps should exist in apps mode"
+        )
+        assert not hasattr(apps_srv, "pharos_search"), (
+            "pharos_search should NOT exist in apps mode"
+        )
+        assert not hasattr(apps_srv, "pharos_install"), (
+            "pharos_install should NOT exist in apps mode"
+        )
+
+    def test_apps_mode_with_1(self):
+        """PHAROS_MCP_APPS=1 also enables apps mode."""
+        os.environ["PHAROS_MCP_APPS"] = "1"
+        apps_srv = self._reload_clean(srv)
+        assert hasattr(apps_srv, "pharos_search_apps"), (
+            "PHAROS_MCP_APPS=1 should enable apps mode (pharos_search_apps missing)"
+        )
+        assert not hasattr(apps_srv, "pharos_search"), (
+            "PHAROS_MCP_APPS=1 should hide CLI-mode pharos_search"
+        )
+
+    def test_apps_mode_with_yes(self):
+        """PHAROS_MCP_APPS=yes also enables apps mode."""
+        os.environ["PHAROS_MCP_APPS"] = "yes"
+        apps_srv = self._reload_clean(srv)
+        assert hasattr(apps_srv, "pharos_search_apps"), (
+            "PHAROS_MCP_APPS=yes should enable apps mode (pharos_search_apps missing)"
+        )
+        assert not hasattr(apps_srv, "pharos_search"), (
+            "PHAROS_MCP_APPS=yes should hide CLI-mode pharos_search"
+        )
+
+    def test_non_ab_tools_exist_in_both_modes(self):
+        """Tools like pharos_daemon_status exist in both modes."""
+        non_ab_tools = [
+            "pharos_daemon_status",
+            "pharos_daemon_start",
+            "pharos_daemon_stop",
+            "pharos_daemon_restart",
+            "pharos_daemon_log",
+            "pharos_daemon_autostart",
+            "pharos_list_tools",
+            "pharos_call_tool",
+            "pharos_start",
+            "pharos_stop",
+            "pharos_health",
+            "pharos_version",
+        ]
+
+        # CLI mode
+        os.environ.pop("PHAROS_MCP_APPS", None)
+        cli_srv = self._reload_clean(srv)
+        for tool_name in non_ab_tools:
+            assert hasattr(cli_srv, tool_name), (
+                f"Non-A/B tool {tool_name} should exist in CLI mode"
+            )
+
+        # Apps mode
+        os.environ["PHAROS_MCP_APPS"] = "true"
+        apps_srv = self._reload_clean(srv)
+        for tool_name in non_ab_tools:
+            assert hasattr(apps_srv, tool_name), (
+                f"Non-A/B tool {tool_name} should exist in apps mode"
+            )
+
+    def test_approve_endpoint_exists_in_both_modes(self):
+        """The /approve custom_route exists regardless of mode."""
+        # CLI mode
+        os.environ.pop("PHAROS_MCP_APPS", None)
+        cli_srv = self._reload_clean(srv)
+        assert hasattr(cli_srv, "approve_endpoint"), (
+            "approve_endpoint should exist in CLI mode"
+        )
+        assert callable(cli_srv.approve_endpoint)
+
+        # Apps mode
+        os.environ["PHAROS_MCP_APPS"] = "true"
+        apps_srv = self._reload_clean(srv)
+        assert hasattr(apps_srv, "approve_endpoint"), (
+            "approve_endpoint should exist in apps mode"
+        )
+        assert callable(apps_srv.approve_endpoint)
