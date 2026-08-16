@@ -1299,6 +1299,10 @@ class TestAppsModeTools:
         result_mock.card.capabilities = ["streaming", "tools"]
         result_mock.card.endpoint = "http://127.0.0.1:8765"
         result_mock.card.tags = ["test", "echo"]
+        result_mock.card.pricing = None
+        result_mock.card.documentation_url = None
+        result_mock.score = None
+        result_mock.raw_item = {}
         client.search = AsyncMock(return_value=[result_mock])
         client.get_server = AsyncMock(return_value=result_mock.card)
         return client

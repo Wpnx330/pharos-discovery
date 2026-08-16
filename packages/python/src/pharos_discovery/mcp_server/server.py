@@ -60,6 +60,36 @@ from pharos_discovery.errors import (
 # plain CLI experience and a full MCP Apps iframe experience.
 MCP_APPS_MODE = os.environ.get("PHAROS_MCP_APPS", "").lower() in ("true", "1", "yes")
 
+
+import re as _re
+
+
+from markdown_it import MarkdownIt
+
+_md_parser = MarkdownIt("commonmark", {"html": False, "linkify": True, "breaks": True})
+
+def _render_markdown(text: str) -> str:
+    """Parse GitHub-flavored markdown into safe HTML for iframe display.
+
+    Uses markdown-it-py (already installed). Renders badges as <img>, links as
+    clickable <a>, headers, lists, code blocks — full formatting. HTML input
+    is disabled (html=False) so raw HTML tags in READMEs are escaped, not
+    injected. Links get target=_blank rel=noopener via a render rule.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    # Add target=_blank to all links
+    def _link_open(self, tokens, idx, options, env):
+        tokens[idx].attrSet("target", "_blank")
+        tokens[idx].attrSet("rel", "noopener noreferrer")
+        return self.renderToken(tokens, idx, options, env)
+
+    _md_parser.add_render_rule("link_open", _link_open)
+
+    html = _md_parser.render(text)
+    return html.strip()
+
 # ─── UI Resources (MCP Apps) ──────────────────────────────────────────────────
 
 # The MCP Apps extension (io.modelcontextprotocol/ui, stable 2026-01-26) lets
@@ -397,12 +427,14 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
     font-size: 12px;
     color: var(--text-muted);
     overflow: hidden;
+    max-height: 1.4em;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .result-card.expanded .result-desc {
     white-space: normal;
     overflow: visible;
+    max-height: none;
     text-overflow: clip;
   }
   .result-meta {
@@ -487,7 +519,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
 
       const desc = document.createElement("div");
       desc.className = "result-desc";
-      desc.textContent = (r.description || "No description available.").replace(/[#*`>_~]/g, "").substring(0, 200);
+      desc.innerHTML = (r.description || "<em>No description available.</em>").substring(0, 600);
       summary.appendChild(desc);
 
       // Meta line (always visible)
@@ -541,7 +573,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
       if (r.description && r.description.length > 60) {
         const dr = document.createElement("div");
         dr.className = "detail-row";
-        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + escapeHtml((r.description || "").replace(/[#*`>_~]/g, "").substring(0, 500)) + '</span>';
+        dr.innerHTML = '<span class="detail-label">Description</span><span class="detail-value">' + (r.description || "<em>No description available.</em>") + '</span>';
         details.appendChild(dr);
       }
 
@@ -878,6 +910,61 @@ _APPS_BASE_CSS = """
   #status.visible { display: block; }
   #status.ok { background: rgba(63, 185, 80, 0.1); color: var(--success); }
   #status.err { background: rgba(248, 81, 73, 0.1); color: var(--danger); }
+
+  /* Rendered markdown inside description fields */
+  .result-desc img, .info-desc img, .approval-desc img,
+  .removal-desc img, .publish-desc img, .srv-desc img,
+  .detail-value img {
+    max-height: 20px; width: auto; vertical-align: middle; display: inline-block;
+    margin: 0 2px; opacity: 0.9;
+  }
+  .result-card.expanded .result-desc img,
+  .detail-value img { max-height: 28px; }
+  .result-desc a, .info-desc a, .approval-desc a,
+  .removal-desc a, .publish-desc a, .srv-desc a,
+  .detail-value a {
+    color: var(--accent); text-decoration: none;
+  }
+  .result-desc a:hover, .info-desc a:hover, .approval-desc a:hover,
+  .removal-desc a:hover, .publish-desc a:hover, .srv-desc a:hover,
+  .detail-value a:hover { text-decoration: underline; }
+  .result-desc code, .info-desc code, .approval-desc code,
+  .removal-desc code, .publish-desc code, .srv-desc code,
+  .detail-value code {
+    font-family: var(--font-mono); font-size: 0.9em;
+    background: var(--surface); padding: 1px 4px; border-radius: 3px;
+  }
+  .result-desc pre, .info-desc pre, .approval-desc pre,
+  .removal-desc pre, .publish-desc pre, .srv-desc pre {
+    font-family: var(--font-mono); font-size: 12px;
+    background: var(--surface); padding: 8px; border-radius: 6px;
+    overflow-x: auto; margin: 6px 0;
+  }
+  .result-desc ul, .info-desc ul, .approval-desc ul,
+  .removal-desc ul, .publish-desc ul, .srv-desc ul {
+    margin: 4px 0; padding-left: 18px; list-style: disc;
+  }
+  .result-desc p, .info-desc p, .approval-desc p,
+  .removal-desc p, .publish-desc p, .srv-desc p {
+    margin: 2px 0;
+  }
+  .result-desc h1, .info-desc h1, .approval-desc h1,
+  .removal-desc h1, .publish-desc h1, .srv-desc h1 {
+    font-size: 16px; font-weight: 700; margin: 6px 0 2px;
+  }
+  .result-desc h2, .info-desc h2, .approval-desc h2,
+  .removal-desc h2, .publish-desc h2, .srv-desc h2 {
+    font-size: 15px; font-weight: 600; margin: 6px 0 2px;
+  }
+  .result-desc h3, .info-desc h3, .approval-desc h3,
+  .removal-desc h3, .publish-desc h3, .srv-desc h3 {
+    font-size: 14px; font-weight: 600; margin: 4px 0 2px;
+  }
+  .result-desc blockquote, .info-desc blockquote, .approval-desc blockquote,
+  .removal-desc blockquote, .publish-desc blockquote, .srv-desc blockquote {
+    border-left: 2px solid var(--border); padding-left: 10px;
+    color: var(--text-muted); margin: 4px 0;
+  }
 """
 
 SEARCH_APPS_TEMPLATE = """<!DOCTYPE html>
@@ -972,7 +1059,7 @@ SEARCH_APPS_TEMPLATE = """<!DOCTYPE html>
       cellSrv.appendChild(nameDiv);
       const descDiv = document.createElement("div");
       descDiv.className = "srv-desc";
-      descDiv.textContent = (r.description || "No description.").substring(0, 120);
+      descDiv.innerHTML = (r.description || "<em>No description.</em>").substring(0, 300);
       cellSrv.appendChild(descDiv);
       const idDiv = document.createElement("div");
       idDiv.className = "srv-id";
@@ -1108,7 +1195,7 @@ INFO_APPS_TEMPLATE = """<!DOCTYPE html>
 
     const descEl = document.createElement("div");
     descEl.className = "info-desc";
-    descEl.textContent = s.description || "No description available.";
+    descEl.innerHTML = s.description || "<em>No description available.</em>";
     card.appendChild(descEl);
 
     const table = document.createElement("table");
@@ -1248,7 +1335,7 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
 
     const descEl = document.createElement("div");
     descEl.className = "approval-desc";
-    descEl.textContent = s.description || "No description available.";
+    descEl.innerHTML = s.description || "<em>No description available.</em>";
     card.appendChild(descEl);
 
     // Purpose box
@@ -1410,7 +1497,7 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
 
     const descEl = document.createElement("div");
     descEl.className = "removal-desc";
-    descEl.textContent = DATA.server_description || "";
+    descEl.innerHTML = DATA.server_description || "<em>No description.</em>";
     card.appendChild(descEl);
 
     const warning = document.createElement("div");
@@ -1697,7 +1784,7 @@ PUBLISH_APPS_TEMPLATE = """<!DOCTYPE html>
 
     const descEl = document.createElement("div");
     descEl.className = "publish-desc";
-    descEl.textContent = s.description || "No description available.";
+    descEl.innerHTML = s.description || "<em>No description available.</em>";
     card.appendChild(descEl);
 
     const table = document.createElement("table");
@@ -2430,19 +2517,52 @@ else:
         output = []
         for r in results:
             card = r.card
+            raw = getattr(r, "raw_item", {}) or {}
+
+            # Extract extra fields from the raw registry item that are not
+            # part of the ServerCard model (downloads, readme, etc.).
+            downloads = (
+                raw.get("downloads")
+                or raw.get("download_count")
+                or raw.get("weekly_downloads")
+                or raw.get("install_count")
+            )
+            stars = raw.get("stars") or raw.get("github_stars")
+
+            # Pricing — use the structured PricingSpec if present, otherwise
+            # fall back to the raw registry field.
+            pricing_label = "free"
+            if card.pricing is not None:
+                pricing_label = card.pricing.model
+            elif raw.get("pricing"):
+                if isinstance(raw["pricing"], str):
+                    pricing_label = raw["pricing"]
+                elif isinstance(raw["pricing"], dict) and raw["pricing"].get("model"):
+                    pricing_label = raw["pricing"]["model"]
+
+            # Score from search relevance (if the registry provides one)
+            score = getattr(r, "score", None)
+
             output.append({
                 "id": card.id,
                 "name": card.display_name,
-                "description": card.description,
+                "description": _render_markdown(card.description),
                 "version": card.version,
-                "transport": card.transport,
+                "transport": list(card.transport) if card.transport else [],
                 "publisher": {
                     "name": card.publisher.name if card.publisher else "unknown",
-                    "verified": card.publisher.verified if card.publisher else False,
+                    "verified": bool(card.publisher.verified) if card.publisher else False,
                 },
-                "tools_count": getattr(card, "tools_count", 0),
-                "capabilities": card.capabilities,
+                "tools_count": int(getattr(card, "tools_count", 0) or 0),
+                "capabilities": list(card.capabilities) if card.capabilities else [],
                 "endpoint": getattr(card, "endpoint", None),
+                "tags": list(getattr(card, "tags", []) or []),
+                "pricing": pricing_label,
+                "downloads": int(downloads) if downloads is not None else None,
+                "stars": int(stars) if stars is not None else None,
+                "score": float(score) if score is not None else None,
+                "documentation_url": getattr(card, "documentation_url", None),
+                "license": raw.get("license"),
             })
 
         # Cache for UI resource rendering (same pattern as pharos_search)

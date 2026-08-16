@@ -11,9 +11,15 @@ from pharos_discovery.models import AuthSpec, Publisher, ServerCard
 class SearchResult:
     """Wrapper for a search result item."""
 
-    def __init__(self, card: ServerCard, score: float | None = None):
+    def __init__(
+        self,
+        card: ServerCard,
+        score: float | None = None,
+        raw_item: dict[str, Any] | None = None,
+    ):
         self.card = card
         self.score = score
+        self.raw_item = raw_item or {}
 
 
 def _normalize_to_server_card(
@@ -234,7 +240,7 @@ class PharosRegistryAdapter:
         for item in items:
             card = _normalize_to_server_card(item, self._base_url)
             score = item.get("_score") or item.get("score")
-            results.append(SearchResult(card=card, score=score))
+            results.append(SearchResult(card=card, score=score, raw_item=item))
 
         return results
 
