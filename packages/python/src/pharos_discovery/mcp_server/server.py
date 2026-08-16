@@ -837,6 +837,52 @@ def _get_pharos_cli() -> str:
     return os.environ.get("PHAROS_CLI", "pharos")
 
 
+async def _run_pharos_cli(*args: str) -> str:
+    """Run the pharos CLI with the given arguments and return a JSON result string.
+
+    Spawns ``pharos <args>``, awaits completion with a 30-second timeout, and
+    returns ``json.dumps({"status": "ok"|"error", "stdout": ..., "stderr": ...})``.
+    On timeout returns an error dict with a ``"timeout"`` key; on binary-not-found
+    returns an error dict with a hint to install the CLI.
+    """
+    cli = _get_pharos_cli()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        return json.dumps({
+            "status": "error",
+            "error": "Command timed out (30s)",
+            "timeout": True,
+        })
+    except FileNotFoundError:
+        return json.dumps({
+            "status": "error",
+            "error": f"pharos CLI not found at '{cli}'",
+            "hint": "Install the pharos CLI to use this feature.",
+        })
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "error": f"Command failed: {e}",
+        })
+
+    stdout_str = stdout.decode().strip() if stdout else ""
+    stderr_str = stderr.decode().strip() if stderr else ""
+    status = "ok" if proc.returncode == 0 else "error"
+
+    return json.dumps({
+        "status": status,
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "returncode": proc.returncode,
+    })
+
+
 # ─── Pending Approval Helpers ─────────────────────────────────────────────────
 # These functions were originally inside pharos_connect. They are kept here so
 # that pharos_install_apps (Phase 3) can reuse the approval token/nonce logic.
@@ -1257,6 +1303,44 @@ if not MCP_APPS_MODE:
             "output": stdout.decode().strip() if stdout else "",
         })
 
+
+    @mcp.tool()
+    async def pharos_info(server_id: str) -> str:
+        """Get detailed information about a specific MCP server.
+
+        Shells out to ``pharos info <server_id>`` to retrieve the full server
+        card including publisher, capabilities, transport, and endpoint details.
+
+        Args:
+            server_id: The server ID to look up (e.g. "test-echo-server")
+
+        Returns:
+            JSON with server details from the registry, or an error if the
+            server is not found or the CLI is unavailable.
+        """
+        return await _run_pharos_cli("info", server_id)
+
+
+    @mcp.tool()
+    async def pharos_publish(server_card_path: str = "") -> str:
+        """Publish a server card to the PHAROS registry.
+
+        Shells out to ``pharos publish [dir]`` to upload the server card from
+        the given directory (or the current directory if no path is provided)
+        to the registry. The publisher must be authenticated.
+
+        Args:
+            server_card_path: Path to the directory containing the server card
+                JSON file. Defaults to the current directory if empty.
+
+        Returns:
+            JSON with publish status, including the published server ID and
+            version, or an error if publication fails.
+        """
+        if server_card_path:
+            return await _run_pharos_cli("publish", server_card_path)
+        return await _run_pharos_cli("publish")
+
 else:
 
     # ─── Apps Mode: Placeholder _apps Variants ────────────────────────────────
@@ -1582,6 +1666,334 @@ async def pharos_daemon_status() -> str:
         "raw_output": output,
         "raw_stderr": err if err else None,
     })
+
+
+@mcp.tool()
+async def pharos_start(server_id: str) -> str:
+    """Start a stopped MCP server.
+
+    Shells out to ``pharos start <server_id>``. Stdio servers auto-start when
+    an MCP client connects, so this is primarily for remote (SSE/streamable-http)
+    servers that have been explicitly stopped.
+
+    Args:
+        server_id: The server ID to start
+
+    Returns:
+        JSON with start status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("start", server_id)
+
+
+@mcp.tool()
+async def pharos_stop(server_id: str) -> str:
+    """Stop a running MCP server.
+
+    Shells out to ``pharos stop <server_id>`` to gracefully stop a server
+    process managed by the Pharos daemon.
+
+    Args:
+        server_id: The server ID to stop
+
+    Returns:
+        JSON with stop status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("stop", server_id)
+
+
+@mcp.tool()
+async def pharos_daemon_start() -> str:
+    """Start the Pharos daemon.
+
+    Shells out to ``pharos daemon start``. The daemon manages local MCP server
+    processes, auto-unload for idle servers, and hot-reload of configurations.
+
+    Returns:
+        JSON with start status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("daemon", "start")
+
+
+@mcp.tool()
+async def pharos_daemon_stop() -> str:
+    """Stop the Pharos daemon.
+
+    Shells out to ``pharos daemon stop``. Stopping the daemon does not remove
+    installed servers but will stop any daemon-managed server processes.
+
+    Returns:
+        JSON with stop status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("daemon", "stop")
+
+
+@mcp.tool()
+async def pharos_daemon_restart() -> str:
+    """Restart the Pharos daemon.
+
+    Shells out to ``pharos daemon restart``. Useful for picking up configuration
+    changes or recovering from a wedged state without a full stop/start cycle.
+
+    Returns:
+        JSON with restart status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("daemon", "restart")
+
+
+@mcp.tool()
+async def pharos_daemon_log() -> str:
+    """Get the Pharos daemon log output.
+
+    Shells out to ``pharos daemon log`` to retrieve recent daemon log lines.
+    Useful for debugging daemon or server lifecycle issues.
+
+    Returns:
+        JSON with the log text in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("daemon", "log")
+
+
+@mcp.tool()
+async def pharos_daemon_autostart() -> str:
+    """Enable Pharos daemon autostart on system boot.
+
+    Shells out to ``pharos daemon autostart`` to configure the daemon to launch
+    automatically when the system starts.
+
+    Returns:
+        JSON with autostart configuration status, stdout, and stderr.
+    """
+    return await _run_pharos_cli("daemon", "autostart")
+
+
+@mcp.tool()
+async def pharos_unpublish(server_id: str) -> str:
+    """Unpublish a server from the PHAROS registry.
+
+    Shells out to ``pharos unpublish <server_id>`` to remove a published server
+    card from the registry. The server remains installed locally but will no
+    longer be discoverable by other users.
+
+    Args:
+        server_id: The server ID to unpublish from the registry
+
+    Returns:
+        JSON with unpublish status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("unpublish", server_id)
+
+
+@mcp.tool()
+async def pharos_health() -> str:
+    """Check the health of the PHAROS registry.
+
+    Shells out to ``pharos health`` to verify that the registry endpoint is
+    reachable and responding. Useful as a connectivity preflight check.
+
+    Returns:
+        JSON with health status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("health")
+
+
+@mcp.tool()
+async def pharos_doctor() -> str:
+    """Run diagnostics on the local Pharos installation.
+
+    Shells out to ``pharos doctor`` which checks the CLI version, daemon status,
+    registry connectivity, and installed server integrity. Use this when
+    something is not working to get a diagnostic report.
+
+    Returns:
+        JSON with diagnostic output in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("doctor")
+
+
+@mcp.tool()
+async def pharos_whoami() -> str:
+    """Show the currently authenticated PHAROS user.
+
+    Shells out to ``pharos whoami`` to display the authenticated publisher
+    identity. Use this to verify login status before publishing or unpublishing.
+
+    Returns:
+        JSON with user identity info in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("whoami")
+
+
+@mcp.tool()
+async def pharos_version() -> str:
+    """Show the installed Pharos CLI version.
+
+    Shells out to ``pharos version`` to retrieve the CLI binary version string.
+    Useful for debugging and compatibility checks.
+
+    Returns:
+        JSON with the version string in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("version")
+
+
+@mcp.tool()
+async def pharos_audit() -> str:
+    """Run a security audit on installed MCP servers.
+
+    Shells out to ``pharos audit`` to scan installed servers for known
+    vulnerabilities, outdated versions, and suspicious permissions. Run this
+    periodically or after installing new servers.
+
+    Returns:
+        JSON with audit results in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("audit")
+
+
+@mcp.tool()
+async def pharos_lock() -> str:
+    """Lock MCP server dependencies to their current versions.
+
+    Shells out to ``pharos lock`` to generate or update a lockfile that pins
+    installed server versions. Prevents unexpected upgrades from breaking
+    integrations.
+
+    Returns:
+        JSON with lock status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("lock")
+
+
+@mcp.tool()
+async def pharos_update(server_id: str) -> str:
+    """Update an installed MCP server to its latest version.
+
+    Shells out to ``pharos update <server_id>`` to download and install the
+    latest published version of the specified server.
+
+    Args:
+        server_id: The server ID to update
+
+    Returns:
+        JSON with update status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("update", server_id)
+
+
+@mcp.tool()
+async def pharos_purge(server_id: str) -> str:
+    """Purge a server and all its configuration from the local machine.
+
+    Shells out to ``pharos purge <server_id>`` to remove the server binary,
+    configuration files, and cached data. This is more thorough than
+    ``pharos_remove`` and cannot be undone.
+
+    Args:
+        server_id: The server ID to purge
+
+    Returns:
+        JSON with purge status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("purge", server_id)
+
+
+@mcp.tool()
+async def pharos_import() -> str:
+    """Import Pharos configuration from stdin.
+
+    Shells out to ``pharos import`` to read a JSON configuration blob from
+    stdin and merge it into the local Pharos config. Useful for restoring
+    backups or sharing server configurations between machines.
+
+    Returns:
+        JSON with import status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("import")
+
+
+@mcp.tool()
+async def pharos_config(key: str, value: str = "") -> str:
+    """Get or set a Pharos configuration value.
+
+    Shells out to ``pharos config <key> [value]``. When only a key is provided,
+    returns the current value. When both key and value are provided, sets the
+    configuration value.
+
+    Args:
+        key: The configuration key to get or set
+        value: The value to set. If empty (default), the current value is returned.
+
+    Returns:
+        JSON with the config value (on get) or set confirmation, plus status
+        and stderr.
+    """
+    if value:
+        return await _run_pharos_cli("config", key, value)
+    return await _run_pharos_cli("config", key)
+
+
+@mcp.tool()
+async def pharos_configure(server_id: str) -> str:
+    """Configure OAuth credentials for an MCP server.
+
+    Shells out to ``pharos configure <server_id>`` to set up or update the
+    OAuth client credentials needed to connect to servers requiring
+    authentication.
+
+    Args:
+        server_id: The server ID to configure OAuth for
+
+    Returns:
+        JSON with configuration status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("configure", server_id)
+
+
+@mcp.tool()
+async def pharos_add_client(client_id: str) -> str:
+    """Add an MCP client configuration to Pharos.
+
+    Shells out to ``pharos add-client <client_id>`` to register a new MCP
+    client (e.g. Claude Desktop, VS Code) with the Pharos daemon so it knows
+    which clients to serve.
+
+    Args:
+        client_id: The client identifier to register
+
+    Returns:
+        JSON with add status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("add-client", client_id)
+
+
+@mcp.tool()
+async def pharos_remove_client(client_id: str) -> str:
+    """Remove an MCP client configuration from Pharos.
+
+    Shells out to ``pharos remove-client <client_id>`` to deregister an MCP
+    client. The client will no longer be able to connect to daemon-managed
+    servers.
+
+    Args:
+        client_id: The client identifier to remove
+
+    Returns:
+        JSON with removal status, stdout, and stderr from the CLI.
+    """
+    return await _run_pharos_cli("remove-client", client_id)
+
+
+@mcp.tool()
+async def pharos_list_clients() -> str:
+    """List all configured MCP clients.
+
+    Shells out to ``pharos list-clients`` to show all MCP clients registered
+    with the Pharos daemon and their connection status.
+
+    Returns:
+        JSON with the client list in stdout, plus status and stderr.
+    """
+    return await _run_pharos_cli("list-clients")
 
 
 # ─── MCP Resources (MCP Apps UI) ──────────────────────────────────────────────

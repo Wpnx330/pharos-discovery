@@ -929,3 +929,304 @@ class TestInstallTransportGuard:
             # Should fall through to CLI attempt and get FileNotFoundError
             assert "error" in data
             assert "pharos CLI not found" in data["error"]
+
+
+# ─── 1:1 CLI Tools ─────────────────────────────────────────────────────────────
+
+class TestCLI1to1Tools:
+    """Tests for 1:1 CLI tools that shell out to the pharos binary.
+
+    These tools use the _run_pharos_cli helper to spawn the pharos CLI and
+    return a JSON result string. We test:
+    1. Successful execution (exit code 0, stdout has data)
+    2. Failed execution (non-zero exit code, stderr has error)
+    3. Timeout (asyncio.wait_for raises TimeoutError)
+    """
+
+    def _make_mock_proc(self, stdout_bytes, stderr_bytes, returncode=0):
+        """Create a mock subprocess with the given output and exit code."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = returncode
+        mock_proc.communicate = AsyncMock(
+            return_value=(stdout_bytes, stderr_bytes)
+        )
+        return mock_proc
+
+    # ── Success cases ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_start_shells_out_to_cli(self):
+        """pharos_start should shell out to 'pharos start <server_id>' and return ok."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(
+                b'{"status": "started"}', b"", returncode=0
+            )
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_start("my-server")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            assert "started" in data["stdout"]
+            mock_exec.assert_called_once()
+            call_args = mock_exec.call_args[0]
+            assert "start" in call_args
+            assert "my-server" in call_args
+
+    @pytest.mark.asyncio
+    async def test_stop_shells_out_to_cli(self):
+        """pharos_stop should shell out to 'pharos stop <server_id>' and return ok."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"stopped", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_stop("my-server")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            assert data["stdout"] == "stopped"
+            call_args = mock_exec.call_args[0]
+            assert "stop" in call_args
+            assert "my-server" in call_args
+
+    @pytest.mark.asyncio
+    async def test_daemon_start_shells_out(self):
+        """pharos_daemon_start should shell out to 'pharos daemon start'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"daemon started", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_daemon_start()
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "daemon" in call_args
+            assert "start" in call_args
+
+    @pytest.mark.asyncio
+    async def test_version_shells_out(self):
+        """pharos_version should shell out to 'pharos version'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"pharos 1.5.0", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_version()
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            assert "1.5.0" in data["stdout"]
+            call_args = mock_exec.call_args[0]
+            assert "version" in call_args
+
+    @pytest.mark.asyncio
+    async def test_doctor_shells_out(self):
+        """pharos_doctor should shell out to 'pharos doctor'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"All checks passed", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_doctor()
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            assert "All checks passed" in data["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_info_shells_out(self):
+        """pharos_info should shell out to 'pharos info <server_id>'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(
+                b'{"id": "echo-server", "name": "Echo"}', b"", returncode=0
+            )
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_info("echo-server")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "info" in call_args
+            assert "echo-server" in call_args
+
+    @pytest.mark.asyncio
+    async def test_publish_with_path_shells_out(self):
+        """pharos_publish with a path should shell out to 'pharos publish <path>'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"Published successfully", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_publish("/path/to/card")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "publish" in call_args
+            assert "/path/to/card" in call_args
+
+    @pytest.mark.asyncio
+    async def test_publish_without_path_shells_out(self):
+        """pharos_publish without a path should shell out to 'pharos publish' with no dir arg."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"Published successfully", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_publish()
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "publish" in call_args
+            # No directory argument — only the binary path and "publish"
+            assert len(call_args) == 2
+
+    @pytest.mark.asyncio
+    async def test_config_get_shells_out(self):
+        """pharos_config with only a key should shell out to 'pharos config <key>'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(
+                b"registry_url=https://api.example.com", b"", returncode=0
+            )
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_config("registry_url")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "config" in call_args
+            assert "registry_url" in call_args
+
+    @pytest.mark.asyncio
+    async def test_config_set_shells_out(self):
+        """pharos_config with key and value should shell out to 'pharos config <key> <value>'."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(b"Set", b"", returncode=0)
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_config("registry_url", "https://new.example.com")
+            data = json.loads(result)
+            assert data["status"] == "ok"
+            call_args = mock_exec.call_args[0]
+            assert "config" in call_args
+            assert "registry_url" in call_args
+            assert "https://new.example.com" in call_args
+
+    # ── Error cases ────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_failing_cli_returns_error_status(self):
+        """A non-zero exit code should produce status='error' with stderr."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(
+                b"", b"server not found", returncode=1
+            )
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_start("nonexistent-server")
+            data = json.loads(result)
+            assert data["status"] == "error"
+            assert data["stderr"] == "server not found"
+            assert data["returncode"] == 1
+
+    @pytest.mark.asyncio
+    async def test_update_failure_shells_out(self):
+        """pharos_update failure should return error status with stderr."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = self._make_mock_proc(
+                b"", b"update failed: network error", returncode=2
+            )
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_update("my-server")
+            data = json.loads(result)
+            assert data["status"] == "error"
+            assert "network error" in data["stderr"]
+            call_args = mock_exec.call_args[0]
+            assert "update" in call_args
+            assert "my-server" in call_args
+
+    # ── Timeout case ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_error_with_timeout_flag(self):
+        """A timeout should produce status='error' with timeout=True."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_doctor()
+            data = json.loads(result)
+            assert data["status"] == "error"
+            assert data.get("timeout") is True
+            assert "timed out" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_start_timeout_returns_error_with_timeout_flag(self):
+        """pharos_start timeout should produce status='error' with timeout=True."""
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+            mock_exec.return_value = mock_proc
+
+            result = await srv.pharos_start("slow-server")
+            data = json.loads(result)
+            assert data["status"] == "error"
+            assert data.get("timeout") is True
+
+    # ── CLI not found ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cli_not_found_returns_error(self):
+        """FileNotFoundError should produce a helpful error with a hint."""
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_health()
+            data = json.loads(result)
+            assert data["status"] == "error"
+            assert "not found" in data["error"].lower()
+            assert "hint" in data
+
+    # ── Tool registration ─────────────────────────────────────────────────
+
+    def test_all_1to1_tools_are_callable(self):
+        """All 22 non-A/B tools plus pharos_info/publish should be registered."""
+        tools = [
+            "pharos_start", "pharos_stop",
+            "pharos_daemon_start", "pharos_daemon_stop",
+            "pharos_daemon_restart", "pharos_daemon_log",
+            "pharos_daemon_autostart",
+            "pharos_unpublish", "pharos_health", "pharos_doctor",
+            "pharos_whoami", "pharos_version", "pharos_audit",
+            "pharos_lock", "pharos_update", "pharos_purge",
+            "pharos_import", "pharos_config", "pharos_configure",
+            "pharos_add_client", "pharos_remove_client", "pharos_list_clients",
+        ]
+        for tool_name in tools:
+            assert hasattr(srv, tool_name), f"Missing tool: {tool_name}"
+            assert callable(getattr(srv, tool_name))
+
+    def test_cli_mode_info_and_publish_are_callable(self):
+        """pharos_info and pharos_publish should be registered in CLI mode."""
+        assert hasattr(srv, "pharos_info")
+        assert callable(srv.pharos_info)
+        assert hasattr(srv, "pharos_publish")
+        assert callable(srv.pharos_publish)
+
+    def test_run_pharos_cli_helper_exists(self):
+        """The _run_pharos_cli helper should be defined."""
+        assert hasattr(srv, "_run_pharos_cli")
+        assert callable(srv._run_pharos_cli)
+
+    # ── Docstring quality ─────────────────────────────────────────────────
+
+    def test_tools_have_docstrings(self):
+        """Every 1:1 tool should have a non-empty docstring."""
+        tools = [
+            srv.pharos_start, srv.pharos_stop,
+            srv.pharos_daemon_start, srv.pharos_daemon_stop,
+            srv.pharos_daemon_restart, srv.pharos_daemon_log,
+            srv.pharos_daemon_autostart,
+            srv.pharos_unpublish, srv.pharos_health, srv.pharos_doctor,
+            srv.pharos_whoami, srv.pharos_version, srv.pharos_audit,
+            srv.pharos_lock, srv.pharos_update, srv.pharos_purge,
+            srv.pharos_import, srv.pharos_config, srv.pharos_configure,
+            srv.pharos_add_client, srv.pharos_remove_client, srv.pharos_list_clients,
+            srv.pharos_info, srv.pharos_publish,
+        ]
+        for tool_fn in tools:
+            assert tool_fn.__doc__ is not None, f"Missing docstring: {tool_fn.__name__}"
+            assert len(tool_fn.__doc__.strip()) > 20, f"Docstring too short: {tool_fn.__name__}"
+            assert "Args:" in tool_fn.__doc__ or "Returns:" in tool_fn.__doc__, \
+                f"Docstring missing Args/Returns: {tool_fn.__name__}"
