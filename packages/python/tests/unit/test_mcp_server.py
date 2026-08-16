@@ -1309,7 +1309,7 @@ class TestAppsModeTools:
 
     @pytest.mark.asyncio
     async def test_search_apps_returns_html(self, _apps_mode_module, mock_client_apps):
-        """pharos_search_apps should return JSON with an html field containing <!DOCTYPE html>."""
+        """pharos_search_apps should return compact JSON (no HTML) for AI consumption."""
         apps_srv = _apps_mode_module
         apps_srv._server_cards.clear()
         apps_srv._search_results_cache.clear()
@@ -1319,11 +1319,13 @@ class TestAppsModeTools:
         assert data["status"] == "ok"
         assert "results" in data
         assert "search_id" in data
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        assert "</html>" in data["html"]
+        assert "html" not in data  # HTML must NOT be in AI-visible response
         assert len(data["results"]) == 1
         assert data["results"][0]["id"] == "test-server"
+        # Compact fields only — no description HTML, no tags, no license
+        assert "name" in data["results"][0]
+        assert "version" in data["results"][0]
+        assert "description" not in data["results"][0]
 
     @pytest.mark.asyncio
     async def test_info_apps_returns_html(self, _apps_mode_module, mock_client_apps):
@@ -1335,9 +1337,8 @@ class TestAppsModeTools:
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["server_id"] == "test-server"
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        assert "Test Server" in data["html"]
+        assert "html" not in data
+        assert data["server"]["name"] == "Test Server"
 
     @pytest.mark.asyncio
     async def test_install_apps_returns_pending_approval(self, _apps_mode_module, mock_client_apps):
@@ -1351,13 +1352,11 @@ class TestAppsModeTools:
         assert data["status"] == "pending_approval"
         assert "approval_token" in data
         assert data["server_id"] == "test-server"
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        # The nonce should be in the HTML (for the iframe button)
+        assert "html" not in data
+        # The nonce should NOT be in the AI-visible JSON
         token = data["approval_token"]
         assert token in apps_srv._pending_connections
-        nonce = apps_srv._pending_connections[token]["approval_nonce"]
-        assert nonce in data["html"]
+        assert "approval_nonce" not in data
 
     @pytest.mark.asyncio
     async def test_install_apps_nonce_not_in_json_response(self, _apps_mode_module, mock_client_apps):
@@ -1378,17 +1377,14 @@ class TestAppsModeTools:
             "approval_nonce must not be a top-level key in the JSON response. "
             "The AI would be able to read it and bypass physical approval."
         )
-        # The nonce value should only appear inside the html field, not in
-        # any other JSON field (token, server_id, message, etc.)
+        # The nonce value should not appear anywhere in the JSON response
         token = data["approval_token"]
         nonce = apps_srv._pending_connections[token]["approval_nonce"]
         for key, value in data.items():
-            if key == "html":
-                continue  # nonce is expected in the HTML
             if isinstance(value, str) and nonce in value:
                 pytest.fail(
                     f"approval_nonce value leaked into JSON field '{key}'. "
-                    f"The nonce must only appear in the html field."
+                    f"The nonce must not appear in any AI-visible field."
                 )
 
     @pytest.mark.asyncio
@@ -1405,15 +1401,14 @@ class TestAppsModeTools:
         assert data["status"] == "pending_removal"
         assert "removal_token" in data
         assert data["server_id"] == "test-server"
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        # The nonce should be in the HTML but NOT as a top-level JSON key
+        assert "html" not in data
+        # The nonce should NOT be in the AI-visible JSON
         token = data["removal_token"]
         nonce = apps_srv._pending_connections[token]["approval_nonce"]
-        assert nonce in data["html"]
-        assert "approval_nonce" not in data, (
-            "approval_nonce must not be a top-level key in the JSON response."
-        )
+        assert "approval_nonce" not in data
+        for key, value in data.items():
+            if isinstance(value, str) and nonce in value:
+                pytest.fail(f"nonce leaked into JSON field '{key}'")
 
     @pytest.mark.asyncio
     async def test_list_apps_returns_html_table(self, _apps_mode_module):
@@ -1433,9 +1428,8 @@ class TestAppsModeTools:
         assert data["status"] == "ok"
         assert "servers" in data
         assert len(data["servers"]) == 1
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        assert "<table" in data["html"]
+        assert "html" not in data
+        assert "name" in data["servers"][0]
 
     @pytest.mark.asyncio
     async def test_publish_apps_returns_pending_publish(self, _apps_mode_module, tmp_path):
@@ -1461,16 +1455,14 @@ class TestAppsModeTools:
         assert data["status"] == "pending_publish"
         assert "publish_token" in data
         assert data["server_id"] == "my-publish-server"
-        assert "html" in data
-        assert data["html"].startswith("<!DOCTYPE html>")
-        assert "My Publish Server" in data["html"]
-        # The nonce should be in the HTML but NOT as a top-level JSON key
+        assert "html" not in data
+        # The nonce should NOT be in the AI-visible JSON
         token = data["publish_token"]
         nonce = apps_srv._pending_connections[token]["approval_nonce"]
-        assert nonce in data["html"]
-        assert "approval_nonce" not in data, (
-            "approval_nonce must not be a top-level key in the JSON response."
-        )
+        assert "approval_nonce" not in data
+        for key, value in data.items():
+            if isinstance(value, str) and nonce in value:
+                pytest.fail(f"nonce leaked into JSON field '{key}'")
 
 
 # ─── Mode Switching (Phase 4) ──────────────────────────────────────────────────
