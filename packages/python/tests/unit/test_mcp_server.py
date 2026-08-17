@@ -1704,9 +1704,9 @@ class TestAppsModeTools:
         apps_srv._approval_results.clear()
 
         # Create a card with http+sse transport but no endpoint. The install
-        # path always fetches fresh from the registry (the _server_cards cache
-        # is not trusted for installs), so the mock client's get_server must
-        # return this bad card for the no-endpoint error to surface.
+        # path uses the cached card first (cache-first, like pharos_info_apps),
+        # so seeding the cache with this bad card is sufficient for the
+        # no-endpoint error to surface — the registry is never hit.
         bad_card = MagicMock()
         bad_card.id = "no-endpoint-server"
         bad_card.display_name = "No Endpoint Server"
@@ -1724,9 +1724,9 @@ class TestAppsModeTools:
         bad_card.documentation_url = None
         bad_card.source_registry = "pharos"
         bad_card.stdio_command = None
-        # Seed the cache with the bad card to prove it is bypassed...
+        # Seed the cache with the bad card; cache-first means this is used.
         apps_srv._server_cards["no-endpoint-server"] = bad_card
-        # ...and have the registry return the same bad card.
+        # Registry mock should NOT be called (cache hit).
         mock_client_apps.get_server = AsyncMock(return_value=bad_card)
 
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
@@ -1739,42 +1739,76 @@ class TestAppsModeTools:
         # No approval card should have been created
         assert "approval_token" not in data
         assert len(apps_srv._pending_connections) == 0
+        # Cache-first: registry must NOT have been called.
+        mock_client_apps.get_server.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_install_apps_bypasses_stale_cache(self, _apps_mode_module, mock_client_apps):
-        """pharos_install_apps must fetch the server card fresh from the registry,
-        ignoring a stale cached card.
+    async def test_install_apps_uses_cached_card(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps uses the cached ServerCard first, only fetching
+        from the registry on a cache miss.
 
-        Regression: a publisher adds an endpoint after the initial search. The
-        _server_cards cache still holds the old (endpoint=None) card. Install
-        must not trust the cache — it must re-fetch and succeed.
+        Many registry servers have display names with spaces/emojis that
+        cannot be looked up via /v1/packages/{name} (HTTP 400). The search
+        endpoint works because the name is a query param, so the card from
+        search is the only reliable source. Install must trust the cache
+        when present, mirroring pharos_info_apps.
         """
         apps_srv = _apps_mode_module
         apps_srv._server_cards.clear()
         apps_srv._pending_connections.clear()
         apps_srv._approval_results.clear()
 
-        # Stale cached card: remote transport, no endpoint.
-        stale_card = MagicMock()
-        stale_card.id = "test-server"
-        stale_card.display_name = "Test Server"
-        stale_card.description = "A test server for unit tests"
-        stale_card.version = "1.0.0"
-        stale_card.transport = ["http+sse"]
-        stale_card.publisher = MagicMock()
-        stale_card.publisher.name = "test-pub"
-        stale_card.publisher.verified = True
-        stale_card.tools_count = 3
-        stale_card.capabilities = ["streaming", "tools"]
-        stale_card.endpoint = None  # stale: no endpoint
-        stale_card.tags = ["test", "echo"]
-        stale_card.pricing = None
-        stale_card.documentation_url = None
-        stale_card.source_registry = "pharos"
-        stale_card.stdio_command = None
-        apps_srv._server_cards["test-server"] = stale_card
+        # Cached card: has an endpoint, so install should proceed.
+        cached_card = MagicMock()
+        cached_card.id = "test-server"
+        cached_card.display_name = "Test Server"
+        cached_card.description = "A test server for unit tests"
+        cached_card.version = "1.0.0"
+        cached_card.transport = ["http+sse"]
+        cached_card.publisher = MagicMock()
+        cached_card.publisher.name = "test-pub"
+        cached_card.publisher.verified = True
+        cached_card.tools_count = 3
+        cached_card.capabilities = ["streaming", "tools"]
+        cached_card.endpoint = "http://127.0.0.1:8765"
+        cached_card.tags = ["test", "echo"]
+        cached_card.pricing = None
+        cached_card.documentation_url = None
+        cached_card.source_registry = "pharos"
+        cached_card.stdio_command = None
+        apps_srv._server_cards["test-server"] = cached_card
 
-        # Fresh card from the registry: now HAS an endpoint.
+        # If the registry were called, this would raise — proving it's NOT.
+        mock_client_apps.get_server = AsyncMock(
+            side_effect=AssertionError("registry should not be called on cache hit")
+        )
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-server", purpose="test")
+
+        data = json.loads(result)
+        # Install proceeds using the cached card.
+        assert data["status"] == "pending_approval", (
+            f"Expected pending_approval, got: {data}"
+        )
+        assert data["server_id"] == "test-server"
+        # The registry must NOT have been called (cache hit).
+        mock_client_apps.get_server.assert_not_awaited()
+        # The cached card is still in the cache (unchanged).
+        assert apps_srv._server_cards["test-server"] is cached_card
+
+    @pytest.mark.asyncio
+    async def test_install_apps_falls_back_to_registry_on_cache_miss(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """pharos_install_apps fetches from the registry when the server_id
+        is not in the _server_cards cache (cache miss)."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        # Fresh card from the registry: has an endpoint.
         fresh_card = MagicMock()
         fresh_card.id = "test-server"
         fresh_card.display_name = "Test Server"
@@ -1786,7 +1820,7 @@ class TestAppsModeTools:
         fresh_card.publisher.verified = True
         fresh_card.tools_count = 3
         fresh_card.capabilities = ["streaming", "tools"]
-        fresh_card.endpoint = "http://127.0.0.1:8765"  # fresh: endpoint present
+        fresh_card.endpoint = "http://127.0.0.1:8765"
         fresh_card.tags = ["test", "echo"]
         fresh_card.pricing = None
         fresh_card.documentation_url = None
@@ -1794,19 +1828,19 @@ class TestAppsModeTools:
         fresh_card.stdio_command = None
         mock_client_apps.get_server = AsyncMock(return_value=fresh_card)
 
+        # Cache is empty — registry must be hit.
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
             result = await apps_srv.pharos_install_apps("test-server", purpose="test")
 
         data = json.loads(result)
-        # Install proceeds (fresh card has an endpoint) instead of erroring.
         assert data["status"] == "pending_approval", (
             f"Expected pending_approval, got: {data}"
         )
         assert data["server_id"] == "test-server"
-        # The cache must be updated with the fresh card.
-        assert apps_srv._server_cards["test-server"] is fresh_card
-        # And get_server must have been called (proving the registry was hit).
+        # Registry was called (cache miss).
         mock_client_apps.get_server.assert_awaited_once_with("test-server")
+        # Cache now populated with the fresh card.
+        assert apps_srv._server_cards["test-server"] is fresh_card
 
     @pytest.mark.asyncio
     async def test_check_approval_invalid_token(self, _apps_mode_module, mock_client_apps):
