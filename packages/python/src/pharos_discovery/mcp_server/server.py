@@ -102,7 +102,7 @@ def _render_markdown(text: str) -> str:
 #   ui://pharos/oauth     — OAuth consent screen
 #   ui://pharos/results   — search results gallery (clickable cards)
 
-RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
+RESULTS_APPS_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -250,7 +250,7 @@ RESULTS_HTML_TEMPLATE = """<!DOCTYPE html>
   <div id="empty" style="display:none">No servers found. Try a different query.</div>
 <script>
   // Data injected by server — works even if host doesn't send postMessage
-  const TOOL_DATA = __RESULTS_DATA__;
+  const TOOL_DATA = __DATA__;
 
   function renderResults(data) {
     const results = data?.results || [];
@@ -1079,7 +1079,19 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
   }
   .detail-table td:first-child { width: 120px; color: var(--text-muted); }
   .detail-table td:last-child { font-family: var(--font-mono); font-size: 12px; }
-  .actions { display: flex; gap: 8px; margin-top: 16px; }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .header-text { flex: 1; min-width: 0; }
+  .header-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
   .btn-danger {
     background: var(--danger);
     color: white;
@@ -1092,7 +1104,6 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
   .btn-static {
     cursor: default;
     opacity: 0.85;
-    width: 100%;
   }
   .btn-static:hover {
     filter: none;
@@ -1101,8 +1112,11 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
   <div class="header">
-    <div class="title">Approval Required</div>
-    <div class="subtitle" id="subtitle"></div>
+    <div class="header-text">
+      <div class="title">Approval Required</div>
+      <div class="subtitle" id="subtitle"></div>
+    </div>
+    <div class="header-actions" id="header-actions"></div>
   </div>
   <div class="approval-card" id="approval-card"></div>
   <div id="status"></div>
@@ -1114,35 +1128,10 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
     if (!s) return;
     const card = document.getElementById("approval-card");
     const subtitle = document.getElementById("subtitle");
+    const headerActions = document.getElementById("header-actions");
     subtitle.textContent = "id: " + (s.id || DATA.server_id || "unknown");
 
-    const nameEl = document.createElement("div");
-    nameEl.className = "approval-name";
-    nameEl.textContent = s.display_name || s.name || s.id;
-    card.appendChild(nameEl);
-
-    const descEl = document.createElement("div");
-    descEl.className = "approval-desc";
-    descEl.innerHTML = s.description || "<em>No description available.</em>";
-    card.appendChild(descEl);
-
-    // Purpose box
-    const purposeBox = document.createElement("div");
-    purposeBox.className = "purpose-box";
-    const purposeLabel = document.createElement("div");
-    purposeLabel.className = "label";
-    purposeLabel.textContent = "Purpose";
-    purposeBox.appendChild(purposeLabel);
-    const purposeText = document.createElement("div");
-    purposeText.className = "purpose-text";
-    purposeText.textContent = DATA.purpose || "User request";
-    purposeBox.appendChild(purposeText);
-    card.appendChild(purposeBox);
-
-    // Actions (before detail table)
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    actions.id = "actions";
+    // Buttons in header (right-aligned, visible without scrolling)
     const denyBtn = document.createElement("button");
     denyBtn.className = "btn btn-danger";
     denyBtn.textContent = "Deny";
@@ -1152,13 +1141,14 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
         method: "notifications/tool_result",
         params: { approved: false }
       }, "*");
+      headerActions.innerHTML = "";
       const deniedStatic = document.createElement("button");
       deniedStatic.className = "btn btn-danger btn-static";
       deniedStatic.textContent = "Denied";
       deniedStatic.disabled = true;
-      actions.replaceWith(deniedStatic);
+      headerActions.appendChild(deniedStatic);
     });
-    actions.appendChild(denyBtn);
+    headerActions.appendChild(denyBtn);
 
     const approveBtn = document.createElement("button");
     approveBtn.className = "btn btn-success";
@@ -1183,11 +1173,12 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
           denyBtn.disabled = false;
         } else {
           showStatus("Approved. " + (body.tools_count || 0) + " tools available.", "ok");
+          headerActions.innerHTML = "";
           const approvedStatic = document.createElement("button");
           approvedStatic.className = "btn btn-success btn-static";
           approvedStatic.textContent = "Approved";
           approvedStatic.disabled = true;
-          actions.replaceWith(approvedStatic);
+          headerActions.appendChild(approvedStatic);
           window.parent.postMessage({
             jsonrpc: "2.0",
             method: "notifications/tool_result",
@@ -1200,8 +1191,31 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
         denyBtn.disabled = false;
       });
     });
-    actions.appendChild(approveBtn);
-    card.appendChild(actions);
+    headerActions.appendChild(approveBtn);
+
+    // Card content
+    const nameEl = document.createElement("div");
+    nameEl.className = "approval-name";
+    nameEl.textContent = s.display_name || s.name || s.id;
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "approval-desc";
+    descEl.innerHTML = s.description || "<em>No description available.</em>";
+    card.appendChild(descEl);
+
+    // Purpose box
+    const purposeBox = document.createElement("div");
+    purposeBox.className = "purpose-box";
+    const purposeLabel = document.createElement("div");
+    purposeLabel.className = "label";
+    purposeLabel.textContent = "Purpose";
+    purposeBox.appendChild(purposeLabel);
+    const purposeText = document.createElement("div");
+    purposeText.className = "purpose-text";
+    purposeText.textContent = DATA.purpose || "User request";
+    purposeBox.appendChild(purposeText);
+    card.appendChild(purposeBox);
 
     // Detail table
     const table = document.createElement("table");
@@ -3470,7 +3484,7 @@ def results_resource() -> str:
     data = {"results": results}
     # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
     safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return RESULTS_HTML_TEMPLATE.replace("__RESULTS_DATA__", safe_json)
+    return RESULTS_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
 
 @mcp.resource("ui://pharos/info", mime_type=MCP_APP_MIME)
