@@ -1822,6 +1822,35 @@ _current_publish_token: str | None = None  # most recent publish token
 # Max cache entries before auto-cleanup of oldest
 _MAX_CACHE_SIZE = 20
 
+
+def _new_ui_token(prefix: str) -> str:
+    """URL-safe per-call token used in ui:// resource URIs."""
+    return f"{prefix}-{int(time.time())}-{os.urandom(8).hex()}"
+
+
+def _ui_resource_uri(kind: str, token: str) -> str:
+    """Build a per-call MCP Apps resource URI.
+
+    LibreChat keys iframe fetches on resourceUri. A static URI such as
+    ``ui://pharos/approval`` is fetched once and then reused, so every later
+    install/search/info card shows the first result. Including a unique token
+    forces the host to refetch the matching cache entry.
+    """
+    return f"ui://pharos/{kind}/{token}"
+
+
+def _inject_template(template: str, data: object) -> str:
+    """Serialize *data* into an HTML template, XSS-safe for ``</script>``."""
+    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
+    return template.replace("__DATA__", safe_json)
+
+
+def _cache_put(cache: dict, key: str, value: object) -> None:
+    cache[key] = value
+    if len(cache) > _MAX_CACHE_SIZE:
+        oldest = next(iter(cache))
+        del cache[oldest]
+
 # Physical approval mode — when set, pharos_approve requires a UI-originated
 # token that the AI agent cannot generate. This prevents the AI from
 # auto-approving connections in end-user chatbot scenarios (scenario 3).
@@ -1945,8 +1974,8 @@ def _create_pending_connection(card: Any, server_id: str, endpoint: str | None,
     This logic was extracted from the removed pharos_connect tool so that
     pharos_install_apps (Phase 3) can reuse it.
     """
-    # Generate a pending connection token
-    raw_token = f"pc-{server_id}-{int(time.time())}-{os.urandom(4).hex()}"
+    # Generate a pending connection token (URL-safe — no raw server_id)
+    raw_token = _new_ui_token("pc")
     signature = _sign_pending(raw_token, server_id)
     expires_at = int(time.time()) + 300  # 5-minute expiry
 
@@ -2415,23 +2444,17 @@ else:
         try:
             results = await client.search(text=query, filters=filters or None, limit=limit)
         except NoServersFound:
-            search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
-            _search_results_cache[search_id] = []
+            search_id = _new_ui_token("sr")
+            _cache_put(_search_results_cache, search_id, [])
             _current_search_id = search_id
-            no_results_data = {"query": query, "results": [], "error": None}
-            safe_json = json.dumps(no_results_data).replace("<", "\\u003c").replace(">", "\\u003e")
-            html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
             return json.dumps({
                 "status": "no_results",
                 "results": [],
                 "count": 0,
                 "search_id": search_id,
-                "html": html,
+                "ui_resource_uri": _ui_resource_uri("results", search_id),
             })
         except RegistryUnavailable as e:
-            error_html_data = {"query": query, "results": [], "error": str(e)}
-            safe_json = json.dumps(error_html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-            html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
             return json.dumps({
                 "status": "error",
                 "error": f"Registry unavailable: {e}",
@@ -2499,22 +2522,15 @@ else:
             })
 
         # Cache for UI resource rendering (same pattern as pharos_search)
-        search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
-        _search_results_cache[search_id] = output
+        search_id = _new_ui_token("sr")
+        _cache_put(_search_results_cache, search_id, output)
         _current_search_id = search_id
-        if len(_search_results_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_search_results_cache))
-            del _search_results_cache[oldest]
-
-        # Build HTML with data injected
-        html_data = {"query": query, "results": output}
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
         return json.dumps({
             "status": "ok",
             "count": len(output),
             "search_id": search_id,
+            "ui_resource_uri": _ui_resource_uri("results", search_id),
             "results": [
                 {
                     "id": r["id"],
@@ -2553,12 +2569,6 @@ else:
                 card = await client.get_server(server_id)
                 _server_cards[server_id] = card
             except Exception as e:
-                error_html_data = {
-                    "server": {"id": server_id, "display_name": server_id},
-                    "error": str(e),
-                }
-                safe_json = json.dumps(error_html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-                html = INFO_APPS_TEMPLATE.replace("__DATA__", safe_json)
                 return json.dumps({
                     "status": "error",
                     "error": f"Failed to get server info: {e}",
@@ -2584,20 +2594,17 @@ else:
         }
 
         html_data = {"server": server_data}
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = INFO_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
-        # Cache for UI resource rendering
-        _info_data_cache[server_id] = html_data
+        # Cache under a unique token so consecutive info cards do not collide
+        info_token = _new_ui_token("info")
+        _cache_put(_info_data_cache, info_token, html_data)
         global _current_info_id
-        _current_info_id = server_id
-        if len(_info_data_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_info_data_cache))
-            del _info_data_cache[oldest]
+        _current_info_id = info_token
 
         return json.dumps({
             "status": "ok",
             "server_id": server_id,
+            "ui_resource_uri": _ui_resource_uri("info", info_token),
             "server": {
                 "id": server_data["id"],
                 "name": server_data["display_name"],
@@ -2714,16 +2721,11 @@ else:
             "approval_token": token,
             "approval_nonce": approval_nonce,  # UI-only, NOT in AI-visible JSON
         }
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = APPROVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
         # Cache for UI resource rendering
-        _approval_data_cache[token] = html_data
+        _cache_put(_approval_data_cache, token, html_data)
         global _current_approval_token
         _current_approval_token = token
-        if len(_approval_data_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_approval_data_cache))
-            del _approval_data_cache[oldest]
 
         # Initialize the approval result tracker. The /approve and /deny
         # endpoints will set _approval_results[token] when the user acts.
@@ -2739,6 +2741,7 @@ else:
         return json.dumps({
             "status": "pending_approval",
             "approval_token": token,
+            "ui_resource_uri": _ui_resource_uri("approval", token),
             "server_id": server_id,
             "server_name": str(card.display_name),
             "message": (
@@ -2887,7 +2890,7 @@ else:
 
         # Create a pending removal token (reuse the approval infrastructure)
         removal_nonce = str(uuid.uuid4())
-        removal_token = f"rm-{server_id}-{int(time.time())}-{os.urandom(4).hex()}"
+        removal_token = _new_ui_token("rm")
         signature = _sign_pending(removal_token, server_id)
         expires_at = int(time.time()) + 300  # 5-minute expiry
 
@@ -2921,16 +2924,11 @@ else:
             "removal_token": removal_token,
             "approval_nonce": removal_nonce,  # UI-only, NOT in AI-visible JSON
         }
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = REMOVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
         # Cache for UI resource rendering
-        _removal_data_cache[removal_token] = html_data
+        _cache_put(_removal_data_cache, removal_token, html_data)
         global _current_removal_token
         _current_removal_token = removal_token
-        if len(_removal_data_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_removal_data_cache))
-            del _removal_data_cache[oldest]
 
         # Initialize the removal result tracker (same as install).
         # The /approve endpoint will set result="removed" and /deny will set
@@ -2948,6 +2946,7 @@ else:
         return json.dumps({
             "status": "pending_removal",
             "removal_token": removal_token,
+            "ui_resource_uri": _ui_resource_uri("removal", removal_token),
             "server_id": server_id,
             "message": (
                 f"Removal confirmation card rendered for {server_name}. "
@@ -3130,23 +3129,16 @@ else:
                                     "source": "cli",
                                 })
 
-        # Build HTML with data injected
-        html_data = {"servers": results}
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = INSTALLED_APPS_TEMPLATE.replace("__DATA__", safe_json)
-
         # Cache for UI resource rendering
-        installed_key = f"inst-{int(time.time())}-{os.urandom(4).hex()}"
-        _installed_data_cache[installed_key] = results
+        installed_key = _new_ui_token("inst")
+        _cache_put(_installed_data_cache, installed_key, results)
         global _current_installed_key
         _current_installed_key = installed_key
-        if len(_installed_data_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_installed_data_cache))
-            del _installed_data_cache[oldest]
 
         return json.dumps({
             "status": "ok",
             "count": len(results),
+            "ui_resource_uri": _ui_resource_uri("installed", installed_key),
             "servers": [
                 {
                     "id": s.get("id", s.get("server_id", "unknown")),
@@ -3215,7 +3207,7 @@ else:
 
         # Create a pending publish token (reuse the approval infrastructure)
         publish_nonce = str(uuid.uuid4())
-        publish_token = f"pb-{server_data['id']}-{int(time.time())}-{os.urandom(4).hex()}"
+        publish_token = _new_ui_token("pb")
         signature = _sign_pending(publish_token, str(server_data["id"]))
         expires_at = int(time.time()) + 300  # 5-minute expiry
 
@@ -3247,21 +3239,17 @@ else:
             "publish_token": publish_token,
             "approval_nonce": publish_nonce,  # UI-only, NOT in AI-visible JSON
         }
-        safe_json = json.dumps(html_data).replace("<", "\\u003c").replace(">", "\\u003e")
-        html = PUBLISH_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
         # Cache for UI resource rendering
-        _publish_data_cache[publish_token] = html_data
+        _cache_put(_publish_data_cache, publish_token, html_data)
         global _current_publish_token
         _current_publish_token = publish_token
-        if len(_publish_data_cache) > _MAX_CACHE_SIZE:
-            oldest = next(iter(_publish_data_cache))
-            del _publish_data_cache[oldest]
 
         # Return JSON to AI — nonce is NOT here
         return json.dumps({
             "status": "pending_publish",
             "publish_token": publish_token,
+            "ui_resource_uri": _ui_resource_uri("publish", publish_token),
             "server_id": str(server_data["id"]),
             "message": f"Publish confirmation required for {server_data['display_name']}. "
                        f"Tell the user to click Publish in the card above.",
@@ -4020,15 +4008,23 @@ async def pharos_list_clients() -> str:
 MCP_APP_MIME = "text/html;profile=mcp-app"
 
 
+def approval_resource(token: str | None = None) -> str:
+    """Approval UI card (MCP Apps). *token* selects a specific install card."""
+    key = token or _current_approval_token
+    data = _approval_data_cache.get(key, {}) if key else {}
+    return _inject_template(APPROVAL_APPS_TEMPLATE, data)
+
+
 @mcp.resource("ui://pharos/approval", mime_type=MCP_APP_MIME)
-def approval_resource() -> str:
-    """Approval UI card (MCP Apps). Rendered when user must approve a server connection."""
-    # Use token-scoped data if available, fall back to most recent
-    token = _current_approval_token
-    data = _approval_data_cache.get(token, {}) if token else {}
-    # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return APPROVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def approval_resource_static() -> str:
+    """Legacy static approval URI (most recent card)."""
+    return approval_resource()
+
+
+@mcp.resource("ui://pharos/approval/{token}", mime_type=MCP_APP_MIME)
+def approval_resource_by_token(token: str) -> str:
+    """Per-install approval card."""
+    return approval_resource(token)
 
 
 @mcp.resource("ui://pharos/oauth", mime_type=MCP_APP_MIME)
@@ -4037,53 +4033,89 @@ def oauth_resource() -> str:
     return OAUTH_HTML
 
 
+def results_resource(token: str | None = None) -> str:
+    """Search results gallery UI (MCP Apps)."""
+    key = token or _current_search_id
+    results = _search_results_cache.get(key, []) if key else []
+    return _inject_template(RESULTS_APPS_TEMPLATE, {"results": results})
+
+
 @mcp.resource("ui://pharos/results", mime_type=MCP_APP_MIME)
-def results_resource() -> str:
-    """Search results gallery UI (MCP Apps). Rendered after pharos_search."""
-    # Use token-scoped data if available, fall back to most recent
-    search_id = _current_search_id
-    results = _search_results_cache.get(search_id, []) if search_id else []
-    data = {"results": results}
-    # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return RESULTS_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def results_resource_static() -> str:
+    return results_resource()
+
+
+@mcp.resource("ui://pharos/results/{token}", mime_type=MCP_APP_MIME)
+def results_resource_by_token(token: str) -> str:
+    return results_resource(token)
+
+
+def info_resource(token: str | None = None) -> str:
+    """Server info card UI (MCP Apps)."""
+    key = token or _current_info_id
+    data = _info_data_cache.get(key, {}) if key else {}
+    return _inject_template(INFO_APPS_TEMPLATE, data)
 
 
 @mcp.resource("ui://pharos/info", mime_type=MCP_APP_MIME)
-def info_resource() -> str:
-    """Server info card UI (MCP Apps). Rendered after pharos_info_apps."""
-    server_id = _current_info_id
-    data = _info_data_cache.get(server_id, {}) if server_id else {}
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return INFO_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def info_resource_static() -> str:
+    return info_resource()
+
+
+@mcp.resource("ui://pharos/info/{token}", mime_type=MCP_APP_MIME)
+def info_resource_by_token(token: str) -> str:
+    return info_resource(token)
+
+
+def removal_resource(token: str | None = None) -> str:
+    """Removal confirmation UI (MCP Apps)."""
+    key = token or _current_removal_token
+    data = _removal_data_cache.get(key, {}) if key else {}
+    return _inject_template(REMOVAL_APPS_TEMPLATE, data)
 
 
 @mcp.resource("ui://pharos/removal", mime_type=MCP_APP_MIME)
-def removal_resource() -> str:
-    """Removal confirmation UI (MCP Apps). Rendered after pharos_remove_apps."""
-    token = _current_removal_token
-    data = _removal_data_cache.get(token, {}) if token else {}
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return REMOVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def removal_resource_static() -> str:
+    return removal_resource()
+
+
+@mcp.resource("ui://pharos/removal/{token}", mime_type=MCP_APP_MIME)
+def removal_resource_by_token(token: str) -> str:
+    return removal_resource(token)
+
+
+def installed_resource(token: str | None = None) -> str:
+    """Installed servers table UI (MCP Apps)."""
+    key = token or _current_installed_key
+    servers = _installed_data_cache.get(key, []) if key else []
+    return _inject_template(INSTALLED_APPS_TEMPLATE, {"servers": servers})
 
 
 @mcp.resource("ui://pharos/installed", mime_type=MCP_APP_MIME)
-def installed_resource() -> str:
-    """Installed servers table UI (MCP Apps). Rendered after pharos_list_apps."""
-    key = _current_installed_key
-    servers = _installed_data_cache.get(key, []) if key else []
-    data = {"servers": servers}
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return INSTALLED_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def installed_resource_static() -> str:
+    return installed_resource()
+
+
+@mcp.resource("ui://pharos/installed/{token}", mime_type=MCP_APP_MIME)
+def installed_resource_by_token(token: str) -> str:
+    return installed_resource(token)
+
+
+def publish_resource(token: str | None = None) -> str:
+    """Publish confirmation UI (MCP Apps)."""
+    key = token or _current_publish_token
+    data = _publish_data_cache.get(key, {}) if key else {}
+    return _inject_template(PUBLISH_APPS_TEMPLATE, data)
 
 
 @mcp.resource("ui://pharos/publish", mime_type=MCP_APP_MIME)
-def publish_resource() -> str:
-    """Publish confirmation UI (MCP Apps). Rendered after pharos_publish_apps."""
-    token = _current_publish_token
-    data = _publish_data_cache.get(token, {}) if token else {}
-    safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return PUBLISH_APPS_TEMPLATE.replace("__DATA__", safe_json)
+def publish_resource_static() -> str:
+    return publish_resource()
+
+
+@mcp.resource("ui://pharos/publish/{token}", mime_type=MCP_APP_MIME)
+def publish_resource_by_token(token: str) -> str:
+    return publish_resource(token)
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────

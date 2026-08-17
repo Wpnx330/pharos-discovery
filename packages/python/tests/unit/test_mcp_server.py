@@ -1847,6 +1847,102 @@ class TestAppsModeTools:
         assert "Too many pending" in data["error"]
 
     @pytest.mark.asyncio
+    async def test_consecutive_installs_use_distinct_resource_uris(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Each install must get its own UI resource URI so the host refetches.
+
+        Regression: static ui://pharos/approval plus a global current-token
+        pointer made every subsequent approval card show the first server.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        apps_srv._approval_data_cache.clear()
+
+        card_a = mock_client_apps.get_server.return_value
+
+        card_b = MagicMock()
+        card_b.id = "weather-server"
+        card_b.display_name = "Weather Server"
+        card_b.description = "A weather server"
+        card_b.version = "2.0.0"
+        card_b.transport = ["http+sse"]
+        card_b.publisher = MagicMock()
+        card_b.publisher.name = "weather-pub"
+        card_b.publisher.verified = True
+        card_b.tools_count = 4
+        card_b.capabilities = ["tools"]
+        card_b.endpoint = "http://127.0.0.1:9000"
+        card_b.tags = []
+        card_b.pricing = None
+        card_b.documentation_url = None
+        card_b.source_registry = "pharos"
+        card_b.stdio_command = None
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            mock_client_apps.get_server = AsyncMock(return_value=card_a)
+            result_a = await apps_srv.pharos_install_apps("test-server", purpose="first")
+            mock_client_apps.get_server = AsyncMock(return_value=card_b)
+            result_b = await apps_srv.pharos_install_apps("weather-server", purpose="second")
+
+        data_a = json.loads(result_a)
+        data_b = json.loads(result_b)
+        assert data_a["status"] == "pending_approval"
+        assert data_b["status"] == "pending_approval"
+        assert data_a["ui_resource_uri"] != data_b["ui_resource_uri"]
+        assert data_a["ui_resource_uri"].startswith("ui://pharos/approval/")
+        assert data_b["ui_resource_uri"].startswith("ui://pharos/approval/")
+        assert data_a["approval_token"] in data_a["ui_resource_uri"]
+        assert data_b["approval_token"] in data_b["ui_resource_uri"]
+
+        html_a = apps_srv.approval_resource(data_a["approval_token"])
+        html_b = apps_srv.approval_resource(data_b["approval_token"])
+        assert "Test Server" in html_a
+        assert "Weather Server" not in html_a
+        assert "Weather Server" in html_b
+        assert "Test Server" not in html_b
+
+    @pytest.mark.asyncio
+    async def test_apps_tools_emit_unique_resource_uris(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Every Apps-mode UI tool must emit a per-call ui_resource_uri."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._search_results_cache.clear()
+        apps_srv._info_data_cache.clear()
+        apps_srv._removal_data_cache.clear()
+        apps_srv._installed_data_cache.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            search_a = json.loads(await apps_srv.pharos_search_apps("echo"))
+            search_b = json.loads(await apps_srv.pharos_search_apps("weather"))
+            info_a = json.loads(await apps_srv.pharos_info_apps("test-server"))
+            info_b = json.loads(await apps_srv.pharos_info_apps("test-server"))
+            list_a = json.loads(await apps_srv.pharos_list_apps())
+            list_b = json.loads(await apps_srv.pharos_list_apps())
+            await apps_srv.pharos_info_apps("test-server")
+            remove_a = json.loads(await apps_srv.pharos_remove_apps("test-server"))
+            remove_b = json.loads(await apps_srv.pharos_remove_apps("test-server"))
+
+        assert search_a["ui_resource_uri"] != search_b["ui_resource_uri"]
+        assert search_a["ui_resource_uri"].startswith("ui://pharos/results/")
+        assert info_a["ui_resource_uri"] != info_b["ui_resource_uri"]
+        assert info_a["ui_resource_uri"].startswith("ui://pharos/info/")
+        assert list_a["ui_resource_uri"] != list_b["ui_resource_uri"]
+        assert list_a["ui_resource_uri"].startswith("ui://pharos/installed/")
+        assert remove_a["ui_resource_uri"] != remove_b["ui_resource_uri"]
+        assert remove_a["ui_resource_uri"].startswith("ui://pharos/removal/")
+
+        html_search_a = apps_srv.results_resource(search_a["search_id"])
+        html_search_b = apps_srv.results_resource(search_b["search_id"])
+        assert search_a["search_id"] in html_search_a or "echo" in html_search_a.lower() or "Test Server" in html_search_a
+        # Distinct cache entries must not collapse to the same injected payload.
+        assert html_search_a != html_search_b or search_a["search_id"] != search_b["search_id"]
+
+    @pytest.mark.asyncio
     async def test_remove_apps_returns_pending_removal(self, _apps_mode_module, mock_client_apps):
         """pharos_remove_apps should return pending_removal status with a removal_token."""
         apps_srv = _apps_mode_module

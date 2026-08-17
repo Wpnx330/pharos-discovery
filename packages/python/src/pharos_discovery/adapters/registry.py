@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from pharos_discovery.errors import NoServersFound, RegistryUnavailable
 from pharos_discovery.models import AuthSpec, Publisher, ServerCard
+
+
+def _as_command(value: Any) -> str | None:
+    """Normalize a registry command / bin field to a single command string."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, list):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+        return " ".join(parts) if parts else None
+    return None
+
+
+def _encode_server_id(server_id: str) -> str:
+    """Percent-encode a server id so spaces and non-ASCII stay one path segment."""
+    return quote(str(server_id), safe="-._~")
 
 
 class SearchResult:
@@ -39,8 +56,10 @@ def _normalize_to_server_card(
         return ServerCard(**item)
 
     # --- Live registry shape (getpharos.dev /v1/search & /v1/packages) -----
-    name = item.get("name") or item.get("id") or "unknown"
-    title = item.get("title") or item.get("display_name") or name
+    # Prefer a stable machine id when the registry provides one. Display names
+    # (spaces, emojis) belong in title, not in the URL path.
+    name = item.get("id") or item.get("name") or "unknown"
+    title = item.get("title") or item.get("display_name") or item.get("name") or name
     description = item.get("description") or item.get("summary") or ""
     version = item.get("version") or "0.0.0"
 
@@ -106,9 +125,14 @@ def _normalize_to_server_card(
     if not transports:
         transports = ["stdio"]
 
-    # Endpoint / stdio command
+    # Endpoint / stdio command. Synced catalogs often store the launcher as
+    # ``bin`` instead of ``command``.
     endpoint = item.get("endpoint") or item.get("url")
-    stdio_command = item.get("stdio_command") or item.get("command")
+    stdio_command = (
+        _as_command(item.get("stdio_command"))
+        or _as_command(item.get("command"))
+        or _as_command(item.get("bin"))
+    )
 
     # For package-detail responses, extract from latest version's manifest
     versions = item.get("versions")
@@ -124,7 +148,11 @@ def _normalize_to_server_card(
         if not endpoint:
             endpoint = manifest.get("endpoint")
         if not stdio_command:
-            stdio_command = manifest.get("command") or manifest.get("stdio_command")
+            stdio_command = (
+                _as_command(manifest.get("command"))
+                or _as_command(manifest.get("stdio_command"))
+                or _as_command(manifest.get("bin"))
+            )
         manifest_caps = manifest.get("capabilities")
         if isinstance(manifest_caps, list):
             capabilities = [str(c) for c in manifest_caps]
@@ -280,9 +308,10 @@ class PharosRegistryAdapter:
             RegistryUnavailable: On HTTP errors
         """
         # Try /v1/servers/{id} (Pharos-native spec endpoint).
+        encoded_id = _encode_server_id(server_id)
         try:
             card, new_etag = await self._try_get_card(
-                f"{self._base_url}/v1/servers/{server_id}", etag
+                f"{self._base_url}/v1/servers/{encoded_id}", etag
             )
             if card is not None or new_etag is not None:
                 return card, new_etag
@@ -292,7 +321,7 @@ class PharosRegistryAdapter:
 
         # Primary returned 404 (card and etag both None) — try live fallback.
         card, new_etag = await self._try_get_card(
-            f"{self._base_url}/v1/packages/{server_id}", etag
+            f"{self._base_url}/v1/packages/{encoded_id}", etag
         )
         if card is None and new_etag is None:
             # Both endpoints returned 404 — server not found.

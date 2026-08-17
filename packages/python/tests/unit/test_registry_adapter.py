@@ -167,3 +167,79 @@ class TestAuth:
     def test_base_url_stripped(self):
         adapter = PharosRegistryAdapter("https://reg.example.com/")
         assert adapter.base_url == "https://reg.example.com"
+
+
+def _live_registry_item(**overrides):
+    item = {
+        "name": "🌦️ Weather MCP Demo",
+        "title": "Weather MCP Demo",
+        "description": "Demo weather server",
+        "version": "1.2.3",
+        "publisher": {"namespace": "official-sync", "verified": False},
+        "capabilities": {"tools": True},
+        "transport": ["stdio"],
+        "published_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
+    item.update(overrides)
+    return item
+
+
+class TestLiveRegistryNormalization:
+    def test_prefers_stable_id_over_display_name(self):
+        from pharos_discovery.adapters.registry import _normalize_to_server_card
+
+        card = _normalize_to_server_card(
+            _live_registry_item(id="weather-mcp-demo", name="🌦️ Weather MCP Demo"),
+            "https://getpharos.dev",
+        )
+        assert card.id == "weather-mcp-demo"
+        assert card.display_name == "Weather MCP Demo"
+
+    def test_keeps_display_name_when_only_name_exists(self):
+        from pharos_discovery.adapters.registry import _normalize_to_server_card
+
+        card = _normalize_to_server_card(_live_registry_item(), "https://getpharos.dev")
+        assert card.display_name == "Weather MCP Demo"
+        assert card.id == "🌦️ Weather MCP Demo"
+
+    def test_extracts_bin_as_stdio_command(self):
+        from pharos_discovery.adapters.registry import _normalize_to_server_card
+
+        card = _normalize_to_server_card(
+            _live_registry_item(bin="npx -y @demo/weather"),
+            "https://getpharos.dev",
+        )
+        assert card.stdio_command == "npx -y @demo/weather"
+
+    def test_extracts_manifest_bin_list(self):
+        from pharos_discovery.adapters.registry import _normalize_to_server_card
+
+        card = _normalize_to_server_card(
+            _live_registry_item(
+                versions=[{
+                    "version": "1.2.3",
+                    "manifest": {"bin": ["npx", "-y", "@demo/weather"]},
+                }],
+                dist_tags={"latest": "1.2.3"},
+            ),
+            "https://getpharos.dev",
+        )
+        assert card.stdio_command == "npx -y @demo/weather"
+
+
+class TestGetServerCardEncoding:
+    @pytest.mark.anyio
+    async def test_encodes_spaces_and_emoji_in_path(self, adapter):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_card()
+        mock_response.headers = {"ETag": "abc123"}
+
+        with patch.object(httpx.AsyncClient, "get", new=AsyncMock(return_value=mock_response)) as mock_get:
+            await adapter.get_server_card("🌦️ Weather MCP Demo")
+
+        requested = mock_get.call_args.args[0]
+        assert " " not in requested
+        assert "🌦️" not in requested
+        assert "%20" in requested or "%F0%9F" in requested
