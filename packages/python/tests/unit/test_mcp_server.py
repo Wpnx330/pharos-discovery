@@ -2100,3 +2100,354 @@ class TestModeSwitching:
             "approve_endpoint should exist in apps mode"
         )
         assert callable(apps_srv.approve_endpoint)
+
+
+# ─── Bug Fixes ──────────────────────────────────────────────────────────────────
+
+class TestApproveStoresMCPConnection:
+    """Bug 1: /approve must store an MCPConnection (not a raw transport) in
+    _connections so that _list_server_tools, pharos_list_tools, and
+    pharos_call_tool can use the high-level MCP protocol methods.
+    """
+
+    def _make_request(self, body: dict) -> Any:
+        request = AsyncMock()
+        request.json = AsyncMock(return_value=body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_approve_stores_mcp_connection(self, mock_server_card):
+        """_connections[server_id] should be an MCPConnection after /approve."""
+        from pharos_discovery.connection.manager import MCPConnection
+
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        assert token is not None
+
+        # Mock ConnectionManager.connect to return a fake transport
+        fake_transport = AsyncMock()
+        fake_transport.send = AsyncMock(return_value={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "2024-11-05", "capabilities": {}},
+        })
+        with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+            mock_mgr = AsyncMock()
+            mock_mgr.connect = AsyncMock(return_value=fake_transport)
+            MockMgr.return_value = mock_mgr
+            request = self._make_request({"approval_token": token, "approval_nonce": ""})
+            response = await srv.approve_endpoint(request)
+
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body["status"] == "connected"
+
+        # The stored object must be an MCPConnection, not a raw transport
+        assert "echo-server" in srv._connections
+        stored = srv._connections["echo-server"]
+        assert isinstance(stored, MCPConnection), (
+            f"Expected MCPConnection, got {type(stored).__name__}"
+        )
+        assert stored.server_id == "echo-server"
+        assert stored.initialized is True
+
+    @pytest.mark.asyncio
+    async def test_approve_list_server_tools_returns_tools(self, mock_server_card):
+        """_list_server_tools should return tools (not empty) after /approve.
+
+        Regression: previously the raw transport had no list_tools() method,
+        causing AttributeError caught by bare except, returning [].
+        """
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+
+        # Build a real MCPConnection with a fake transport that returns tools
+        fake_transport = AsyncMock()
+
+        async def fake_send(msg):
+            method = msg.get("method", "")
+            if method == "initialize":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {"protocolVersion": "2024-11-05"},
+                }
+            if method == "notifications/initialized":
+                return {"jsonrpc": "2.0", "result": {}}
+            if method == "tools/list":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "echo",
+                                "description": "Echo tool",
+                                "inputSchema": {"type": "object"},
+                            },
+                            {
+                                "name": "ping",
+                                "description": "Ping tool",
+                                "inputSchema": {"type": "object"},
+                            },
+                        ]
+                    },
+                }
+            return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {}}
+
+        fake_transport.send = fake_send
+        fake_transport.disconnect = AsyncMock()
+
+        with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+            mock_mgr = AsyncMock()
+            mock_mgr.connect = AsyncMock(return_value=fake_transport)
+            MockMgr.return_value = mock_mgr
+            request = self._make_request({"approval_token": token, "approval_nonce": ""})
+            response = await srv.approve_endpoint(request)
+
+        body = json.loads(response.body)
+        assert body["status"] == "connected"
+        # tools_count should be 2, not 0
+        assert body["tools_count"] == 2, f"Expected 2 tools, got {body['tools_count']}"
+
+        # _list_server_tools should also return the tools directly
+        tools = await srv._list_server_tools("echo-server")
+        assert len(tools) == 2
+        assert tools[0]["name"] == "echo"
+        assert tools[1]["name"] == "ping"
+
+    @pytest.mark.asyncio
+    async def test_list_server_tools_parses_dict_result(self):
+        """_list_server_tools should handle MCPConnection dict responses.
+
+        MCPConnection.list_tools() returns a JSON-RPC dict like
+        {"result": {"tools": [...]}} — not an object with a .tools attribute.
+        """
+        from pharos_discovery.connection.manager import MCPConnection
+
+        fake_transport = AsyncMock()
+        mcp_conn = MCPConnection(fake_transport, "test-srv")
+
+        # Make list_tools return a dict (as MCPConnection does)
+        mcp_conn.list_tools = AsyncMock(return_value={
+            "result": {
+                "tools": [
+                    {"name": "tool_a", "description": "A tool", "inputSchema": {"type": "object"}},
+                    {"name": "tool_b", "description": "B tool"},
+                ]
+            }
+        })
+        srv._connections["test-srv"] = mcp_conn
+
+        tools = await srv._list_server_tools("test-srv")
+        assert len(tools) == 2
+        assert tools[0]["name"] == "tool_a"
+        assert tools[0]["description"] == "A tool"
+        assert tools[0]["input_schema"] == {"type": "object"}
+        assert tools[1]["name"] == "tool_b"
+        assert tools[1]["input_schema"] == {}
+
+    @pytest.mark.asyncio
+    async def test_remove_disconnects_mcp_connection(self, mock_server_card):
+        """pharos_remove should cleanly disconnect an MCPConnection."""
+        from pharos_discovery.connection.manager import MCPConnection
+
+        fake_transport = AsyncMock()
+        fake_transport.disconnect = AsyncMock()
+        mcp_conn = MCPConnection(fake_transport, "echo-server")
+        srv._connections["echo-server"] = mcp_conn
+        srv._installed_servers["echo-server"] = {"transport": ["http+sse"]}
+
+        # Mock CLI to return FileNotFoundError (no pharos CLI in test env)
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_remove("echo-server")
+
+        data = json.loads(result)
+        assert data["status"] == "unregistered"
+        assert "echo-server" not in srv._connections
+        fake_transport.disconnect.assert_awaited_once()
+
+
+class TestPharosStartAlreadyRunning:
+    """Bug 2: pharos_start should return already_running if the server is
+    already in _connections (no CLI needed — works in Docker).
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_returns_already_running_when_connected(self):
+        """pharos_start should not shell out to CLI if server is connected."""
+        mock_conn = MagicMock()
+        srv._connections["my-server"] = mock_conn
+
+        result = await srv.pharos_start("my-server")
+        data = json.loads(result)
+        assert data["status"] == "already_running"
+        assert data["server_id"] == "my-server"
+        assert "pharos_list_tools" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_start_shells_out_when_not_connected(self):
+        """pharos_start should shell out to CLI when server is not connected."""
+        srv._connections.clear()
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b'{"status": "started"}', b""))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await srv.pharos_start("cli-server")
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        mock_exec.assert_called_once()
+
+
+class TestApproveBinOnlyServerError:
+    """Bug 3: /approve should return a clear error for servers that have a
+    `bin` field but no endpoint (cannot be started from source in this env).
+    """
+
+    def _make_request(self, body: dict) -> Any:
+        request = AsyncMock()
+        request.json = AsyncMock(return_value=body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_approve_bin_only_server_returns_clear_error(self):
+        """A server with bin but no endpoint should get a clear error message."""
+        card = MagicMock()
+        card.id = "bin-server"
+        card.display_name = "Bin Server"
+        card.description = "A server with bin only"
+        card.version = "1.0.0"
+        card.transport = ["stdio"]
+        card.publisher = MagicMock()
+        card.publisher.name = "test-pub"
+        card.publisher.verified = True
+        card.capabilities = ["tools"]
+        card.endpoint = None
+        card.stdio_command = None
+        card.bin = "python server.py"
+
+        srv._server_cards["bin-server"] = card
+        srv._pending_connections.clear()
+        token = srv._create_pending_connection(
+            card=card,
+            server_id="bin-server",
+            endpoint=None,
+            purpose="test",
+        )
+        assert token is not None
+
+        request = self._make_request({"approval_token": token, "approval_nonce": ""})
+        response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "no endpoint" in body["error"].lower()
+        assert "publisher must provide" in body["error"].lower()
+        assert body["server_id"] == "bin-server"
+
+    @pytest.mark.asyncio
+    async def test_approve_no_endpoint_no_bin_returns_error(self):
+        """A server with neither endpoint nor bin should also get an error."""
+        card = MagicMock()
+        card.id = "empty-server"
+        card.display_name = "Empty Server"
+        card.description = "A server with nothing"
+        card.version = "1.0.0"
+        card.transport = ["http+sse"]
+        card.publisher = MagicMock()
+        card.publisher.name = "test-pub"
+        card.publisher.verified = True
+        card.capabilities = ["tools"]
+        card.endpoint = None
+        card.stdio_command = None
+        card.bin = None
+
+        srv._server_cards["empty-server"] = card
+        srv._pending_connections.clear()
+        token = srv._create_pending_connection(
+            card=card,
+            server_id="empty-server",
+            endpoint=None,
+            purpose="test",
+        )
+
+        request = self._make_request({"approval_token": token, "approval_nonce": ""})
+        response = await srv.approve_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert body["server_id"] == "empty-server"
+
+    @pytest.mark.asyncio
+    async def test_approve_with_endpoint_still_works(self, mock_server_card):
+        """A server with an endpoint should NOT trigger the bin-only error."""
+        srv._server_cards["echo-server"] = mock_server_card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+
+        fake_transport = AsyncMock()
+        fake_transport.send = AsyncMock(return_value={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "2024-11-05"},
+        })
+        with patch(
+            "pharos_discovery.mcp_server.server.ConnectionManager"
+        ) as MockMgr:
+            mock_mgr = AsyncMock()
+            mock_mgr.connect = AsyncMock(return_value=fake_transport)
+            MockMgr.return_value = mock_mgr
+            request = self._make_request({"approval_token": token, "approval_nonce": ""})
+            response = await srv.approve_endpoint(request)
+
+        body = json.loads(response.body)
+        assert body["status"] == "connected"
+
+
+class TestMCPConnectionDisconnect:
+    """The MCPConnection class should have both close() and disconnect()."""
+
+    @pytest.mark.asyncio
+    async def test_disconnect_delegates_to_transport(self):
+        """MCPConnection.disconnect() should call transport.disconnect()."""
+        from pharos_discovery.connection.manager import MCPConnection
+
+        fake_transport = AsyncMock()
+        fake_transport.disconnect = AsyncMock()
+        mcp_conn = MCPConnection(fake_transport, "test-srv")
+
+        await mcp_conn.disconnect()
+        fake_transport.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_delegates_to_transport(self):
+        """MCPConnection.close() should call transport.disconnect()."""
+        from pharos_discovery.connection.manager import MCPConnection
+
+        fake_transport = AsyncMock()
+        fake_transport.disconnect = AsyncMock()
+        mcp_conn = MCPConnection(fake_transport, "test-srv")
+
+        await mcp_conn.close()
+        fake_transport.disconnect.assert_awaited_once()

@@ -311,6 +311,10 @@ class MCPConnection:
         """Disconnect the underlying transport."""
         await self._transport.disconnect()
 
+    async def disconnect(self) -> None:
+        """Alias for :meth:`close` — disconnect the underlying transport."""
+        await self._transport.disconnect()
+
 
 class ConnectionManager:
     """Manages MCP transport connections lifecycle.

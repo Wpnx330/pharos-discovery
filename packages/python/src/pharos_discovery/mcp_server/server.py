@@ -43,7 +43,7 @@ from mcp.types import Resource, TextResourceContents
 
 from pharos_discovery.client import PharosClient
 from pharos_discovery.models import ServerCard, ApprovalRequest, ApprovalResponse, ApprovalToken
-from pharos_discovery.connection.manager import ConnectionManager
+from pharos_discovery.connection.manager import ConnectionManager, MCPConnection
 from pharos_discovery.errors import (
     NoServersFound,
     RegistryUnavailable,
@@ -3165,6 +3165,27 @@ async def approve_endpoint(request: Request) -> JSONResponse:
     card = pending["card"]
     endpoint = pending["endpoint"]
 
+    # Validate that we have something to connect to. Servers with a `bin`
+    # field but no endpoint cannot be started in this environment (no source
+    # code or runtime to launch them). Provide a clear error rather than a
+    # confusing connection failure.
+    if not endpoint and not getattr(card, "stdio_command", None):
+        has_bin = bool(getattr(card, "bin", None))
+        if has_bin:
+            error_msg = (
+                "Server has no endpoint and cannot be started from source in "
+                "this environment. The publisher must provide an endpoint URL."
+            )
+        else:
+            error_msg = "Server has no endpoint or launch command and cannot be connected to."
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "error"
+            _approval_results[approval_token]["error"] = error_msg
+        return JSONResponse({
+            "error": error_msg,
+            "server_id": server_id,
+        })
+
     # Clean up the pending token (one-time use)
     del _pending_connections[approval_token]
 
@@ -3206,8 +3227,18 @@ async def approve_endpoint(request: Request) -> JSONResponse:
     # Connect to the server
     try:
         mgr = ConnectionManager()
-        connection = await mgr.connect(card, token)
-        _connections[server_id] = connection
+        transport = await mgr.connect(card, token)
+        # Wrap the raw transport in an MCPConnection so _list_server_tools,
+        # pharos_list_tools, and pharos_call_tool can use the high-level
+        # MCP protocol methods (initialize, tools/list, tools/call).
+        mcp_conn = MCPConnection(transport, server_id)
+        try:
+            await mcp_conn.initialize()
+        except Exception:
+            # initialize() failure is non-fatal; tools/list may still work
+            # for servers that don't require the handshake.
+            pass
+        _connections[server_id] = mcp_conn
 
         # Also register as installed so pharos_list_apps finds it
         _installed_servers[server_id] = {
@@ -3459,6 +3490,16 @@ async def pharos_start(server_id: str) -> str:
     Returns:
         JSON with start status, stdout, and stderr from the CLI.
     """
+    # If the server is already connected via the approval flow, there's no
+    # daemon process to start — the connection is live. Return immediately
+    # so this works in Docker (no pharos CLI needed).
+    if server_id in _connections:
+        return json.dumps({
+            "status": "already_running",
+            "server_id": server_id,
+            "message": "Server is already connected. Use pharos_list_tools to see available tools.",
+        })
+
     return await _run_pharos_cli("start", server_id)
 
 
@@ -3897,13 +3938,29 @@ async def _list_server_tools(server_id: str) -> list[dict]:
     connection = _connections[server_id]
     try:
         result = await connection.list_tools()
+        # MCPConnection.list_tools() returns a JSON-RPC response dict:
+        #   {"result": {"tools": [{name, description, inputSchema}, ...]}}
+        # Unwrap the result envelope to get the tools list.
+        if isinstance(result, dict):
+            result_body = result.get("result", result)
+            raw_tools = result_body.get("tools", []) if isinstance(result_body, dict) else []
+        else:
+            raw_tools = getattr(result, "tools", [])
+
         tools = []
-        for tool in result.tools:
-            tools.append({
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-            })
+        for tool in raw_tools:
+            if isinstance(tool, dict):
+                tools.append({
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description") or "",
+                    "input_schema": tool.get("inputSchema", tool.get("input_schema", {})),
+                })
+            else:
+                tools.append({
+                    "name": getattr(tool, "name", ""),
+                    "description": getattr(tool, "description", "") or "",
+                    "input_schema": getattr(tool, "inputSchema", {}),
+                })
         return tools
     except Exception:
         return []
