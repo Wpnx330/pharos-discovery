@@ -1870,6 +1870,216 @@ class TestAppsModeTools:
                 pytest.fail(f"nonce leaked into JSON field '{key}'")
 
     @pytest.mark.asyncio
+    async def test_remove_apps_returns_check_removal_message(self, _apps_mode_module, mock_client_apps):
+        """pharos_remove_apps response message should tell the AI to call pharos_check_removal."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        # Pre-populate a card so remove can find the server name
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+        result = await apps_srv.pharos_remove_apps("test-server")
+        data = json.loads(result)
+        assert data["status"] == "pending_removal"
+        assert "pharos_check_removal" in data["message"]
+        assert data["removal_token"] in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_remove_apps_initializes_approval_results(self, _apps_mode_module, mock_client_apps):
+        """pharos_remove_apps should initialize _approval_results for the removal token."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+        result = await apps_srv.pharos_remove_apps("test-server")
+        data = json.loads(result)
+        token = data["removal_token"]
+        assert token in apps_srv._approval_results
+        assert apps_srv._approval_results[token]["result"] is None  # pending
+
+    @pytest.mark.asyncio
+    async def test_check_removal_pending(self, _apps_mode_module, mock_client_apps):
+        """pharos_check_removal returns 'pending' when user hasn't responded.
+
+        Uses wait_seconds=1 so the blocking wait expires quickly.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+            check_result = await apps_srv.pharos_check_removal(token, wait_seconds=1)
+
+        data = json.loads(check_result)
+        assert data["status"] == "pending"
+        assert data["removal_token"] == token
+        assert "Call this tool again" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_check_removal_removed(self, _apps_mode_module, mock_client_apps):
+        """pharos_check_removal returns 'removed' when user confirmed removal."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+            # Simulate the /approve endpoint setting the result for a removal
+            apps_srv._approval_results[token]["result"] = "removed"
+            apps_srv._approval_results[token]["server_id"] = "test-server"
+
+            check_result = await apps_srv.pharos_check_removal(token)
+
+        data = json.loads(check_result)
+        assert data["status"] == "removed"
+        assert data["removal_token"] == token
+        assert data["server_id"] == "test-server"
+
+    @pytest.mark.asyncio
+    async def test_check_removal_cancelled(self, _apps_mode_module, mock_client_apps):
+        """pharos_check_removal returns 'cancelled' when user clicked Cancel."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+            # Simulate the /deny endpoint setting the result for a removal
+            apps_srv._approval_results[token]["result"] = "cancelled"
+
+            check_result = await apps_srv.pharos_check_removal(token)
+
+        data = json.loads(check_result)
+        assert data["status"] == "cancelled"
+        assert data["removal_token"] == token
+
+    @pytest.mark.asyncio
+    async def test_check_removal_invalid_token(self, _apps_mode_module):
+        """pharos_check_removal returns 'error' for an invalid token."""
+        apps_srv = _apps_mode_module
+        apps_srv._approval_results.clear()
+
+        result = await apps_srv.pharos_check_removal("invalid-removal-token")
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "Invalid" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_check_removal_timeout(self, _apps_mode_module, mock_client_apps):
+        """pharos_check_removal returns 'timeout' when removal expired."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+            # Simulate expiry
+            apps_srv._approval_results[token]["expires_at"] = time.time() - 1
+
+            check_result = await apps_srv.pharos_check_removal(token)
+
+        data = json.loads(check_result)
+        assert data["status"] == "timeout"
+        assert data["removal_token"] == token
+
+    @pytest.mark.asyncio
+    async def test_approve_removal(self, _apps_mode_module, mock_client_apps):
+        """POST /approve with a removal token should remove the server from
+        _connections and _installed_servers and set result to 'removed'.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        apps_srv._connections.clear()
+        apps_srv._installed_servers.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+        # Simulate the server being connected and installed
+        mock_conn = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        apps_srv._connections["test-server"] = mock_conn
+        apps_srv._installed_servers["test-server"] = {
+            "transport": ["http+sse"],
+            "endpoint": "http://127.0.0.1:8765",
+        }
+
+        # Get the nonce from pending connections
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+
+        # Call /approve with the removal token
+        request = AsyncMock()
+        request.json = AsyncMock(return_value={
+            "approval_token": token,
+            "approval_nonce": nonce,
+        })
+        response = await apps_srv.approve_endpoint(request)
+
+        body = json.loads(response.body)
+        assert body["status"] == "removed"
+        assert body["server_id"] == "test-server"
+        # Server should be removed from _connections
+        assert "test-server" not in apps_srv._connections
+        # Server should be removed from _installed_servers
+        assert "test-server" not in apps_srv._installed_servers
+        # disconnect should have been called
+        mock_conn.disconnect.assert_awaited_once()
+        # The result should be set to "removed"
+        assert apps_srv._approval_results[token]["result"] == "removed"
+        # The pending connection should be cleaned up
+        assert token not in apps_srv._pending_connections
+
+    @pytest.mark.asyncio
+    async def test_deny_removal(self, _apps_mode_module, mock_client_apps):
+        """POST /deny with a removal token should set result to 'cancelled'."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_info_apps("test-server")
+            remove_result = await apps_srv.pharos_remove_apps("test-server")
+            token = json.loads(remove_result)["removal_token"]
+
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
+
+        # Call /deny with the removal token
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "approval_token": token,
+            "approval_nonce": nonce,
+        })
+        response = await apps_srv.deny_endpoint(request)
+
+        body = json.loads(response.body)
+        assert body["status"] == "cancelled"
+        # The result should be "cancelled", not "denied"
+        assert apps_srv._approval_results[token]["result"] == "cancelled"
+        # The pending connection should be cleaned up
+        assert token not in apps_srv._pending_connections
+
+    @pytest.mark.asyncio
     async def test_list_apps_returns_html_table(self, _apps_mode_module):
         """pharos_list_apps should return HTML containing a <table> element."""
         apps_srv = _apps_mode_module
@@ -1952,7 +2162,8 @@ class TestModeSwitching:
     _APPS_TOOLS = [
         "pharos_search_apps", "pharos_info_apps", "pharos_install_apps",
         "pharos_check_approval",
-        "pharos_remove_apps", "pharos_list_apps", "pharos_publish_apps",
+        "pharos_remove_apps", "pharos_check_removal",
+        "pharos_list_apps", "pharos_publish_apps",
     ]
 
     @staticmethod
@@ -2016,6 +2227,9 @@ class TestModeSwitching:
         )
         assert hasattr(apps_srv, "pharos_remove_apps"), (
             "pharos_remove_apps should exist in apps mode"
+        )
+        assert hasattr(apps_srv, "pharos_check_removal"), (
+            "pharos_check_removal should exist in apps mode"
         )
         assert hasattr(apps_srv, "pharos_list_apps"), "pharos_list_apps should exist in apps mode"
         assert hasattr(apps_srv, "pharos_publish_apps"), (

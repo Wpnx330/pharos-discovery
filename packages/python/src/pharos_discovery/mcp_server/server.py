@@ -1300,13 +1300,44 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
     font-size: 13px;
     color: var(--text);
   }
-  .actions { display: flex; gap: 8px; margin-top: 16px; }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .header-text { flex: 1; min-width: 0; }
+  .header-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .btn-danger {
+    background: var(--danger);
+    color: white;
+    border: 1px solid var(--danger);
+  }
+  .btn-danger:hover {
+    background: rgba(248, 81, 73, 0.8);
+    border-color: rgba(248, 81, 73, 0.8);
+  }
+  .btn-static {
+    cursor: default;
+    opacity: 0.85;
+  }
+  .btn-static:hover {
+    filter: none;
+  }
 </style>
 </head>
 <body>
   <div class="header">
-    <div class="title">Removal Confirmation</div>
-    <div class="subtitle" id="subtitle"></div>
+    <div class="header-text">
+      <div class="title">Removal Confirmation</div>
+      <div class="subtitle" id="subtitle"></div>
+    </div>
+    <div class="header-actions" id="header-actions"></div>
   </div>
   <div class="removal-card" id="removal-card"></div>
   <div id="status"></div>
@@ -1316,38 +1347,41 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
   function render() {
     const card = document.getElementById("removal-card");
     const subtitle = document.getElementById("subtitle");
+    const headerActions = document.getElementById("header-actions");
     subtitle.textContent = "id: " + (DATA.server_id || "unknown");
 
-    const nameEl = document.createElement("div");
-    nameEl.className = "removal-name";
-    nameEl.textContent = DATA.server_name || DATA.server_id || "Unknown Server";
-    card.appendChild(nameEl);
-
-    const descEl = document.createElement("div");
-    descEl.className = "removal-desc";
-    descEl.innerHTML = DATA.server_description || "<em>No description.</em>";
-    card.appendChild(descEl);
-
-    const warning = document.createElement("div");
-    warning.className = "warning-box";
-    warning.textContent = "This will remove the server and disconnect any active sessions. This action cannot be undone from the UI.";
-    card.appendChild(warning);
-
-    const actions = document.createElement("div");
-    actions.className = "actions";
+    // Cancel button in header (secondary)
     const cancelBtn = document.createElement("button");
     cancelBtn.className = "btn";
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", () => {
+      const cancelId = Math.floor(Math.random() * 1000000);
       window.parent.postMessage({
         jsonrpc: "2.0",
-        method: "notifications/tool_result",
-        params: { approved: false }
+        id: cancelId,
+        method: "ui/deny",
+        params: {
+          approval_token: DATA.removal_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        }
       }, "*");
-      showStatus("Removal cancelled.", "ok");
-    });
-    actions.appendChild(cancelBtn);
 
+      const cancelHandler = (event) => {
+        if (!event.data || event.data.jsonrpc !== "2.0" || event.data.id !== cancelId) return;
+        window.removeEventListener("message", cancelHandler);
+        headerActions.innerHTML = "";
+        const cancelledStatic = document.createElement("button");
+        cancelledStatic.className = "btn btn-static";
+        cancelledStatic.textContent = "Cancelled";
+        cancelledStatic.disabled = true;
+        headerActions.appendChild(cancelledStatic);
+        showStatus("Removal cancelled.", "ok");
+      };
+      window.addEventListener("message", cancelHandler);
+    });
+    headerActions.appendChild(cancelBtn);
+
+    // Remove button in header (destructive, red)
     const removeBtn = document.createElement("button");
     removeBtn.className = "btn btn-danger";
     removeBtn.textContent = "Remove";
@@ -1378,6 +1412,12 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
           cancelBtn.disabled = false;
         } else {
           showStatus("Server removed.", "ok");
+          headerActions.innerHTML = "";
+          const removedStatic = document.createElement("button");
+          removedStatic.className = "btn btn-danger btn-static";
+          removedStatic.textContent = "Removed";
+          removedStatic.disabled = true;
+          headerActions.appendChild(removedStatic);
           window.parent.postMessage({
             jsonrpc: "2.0",
             method: "notifications/tool_result",
@@ -1387,8 +1427,23 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
       };
       window.addEventListener("message", removeHandler);
     });
-    actions.appendChild(removeBtn);
-    card.appendChild(actions);
+    headerActions.appendChild(removeBtn);
+
+    // Card content
+    const nameEl = document.createElement("div");
+    nameEl.className = "removal-name";
+    nameEl.textContent = DATA.server_name || DATA.server_id || "Unknown Server";
+    card.appendChild(nameEl);
+
+    const descEl = document.createElement("div");
+    descEl.className = "removal-desc";
+    descEl.innerHTML = DATA.server_description || "<em>No description.</em>";
+    card.appendChild(descEl);
+
+    const warning = document.createElement("div");
+    warning.className = "warning-box";
+    warning.textContent = "This will remove the server and disconnect any active sessions. This action cannot be undone from the UI.";
+    card.appendChild(warning);
   }
 
   function showStatus(msg, kind) {
@@ -2877,14 +2932,127 @@ else:
             oldest = next(iter(_removal_data_cache))
             del _removal_data_cache[oldest]
 
+        # Initialize the removal result tracker (same as install).
+        # The /approve endpoint will set result="removed" and /deny will set
+        # result="cancelled" when the user acts. pharos_check_removal polls
+        # this dict.
+        _approval_results[removal_token] = {
+            "result": None,  # None=pending, "removed", "cancelled", "timeout"
+            "tools_count": 0,
+            "tools": [],
+            "error": None,
+            "expires_at": time.time() + _PHAROS_APPROVAL_TIMEOUT,
+        }
+
         # Return JSON to AI — nonce is NOT here
         return json.dumps({
             "status": "pending_removal",
             "removal_token": removal_token,
             "server_id": server_id,
-            "message": f"Removal confirmation required for {server_name}. "
-                       f"Tell the user to click Remove in the card above.",
+            "message": (
+                f"Removal confirmation card rendered for {server_name}. "
+                f"Call pharos_check_removal with removal_token='{removal_token}' "
+                f"to wait for the user's response."
+            ),
         })
+
+
+    @mcp.tool()
+    async def pharos_check_removal(removal_token: str, wait_seconds: int = 25) -> str:
+        """Check the status of a pending removal (Apps mode).
+
+        Polls the removal result for a token returned by pharos_remove_apps.
+        By default, BLOCKS for up to 25 seconds waiting for the user to click
+        Remove or Cancel. If the user acts during this time, returns the result
+        immediately. If the wait expires, returns "pending" — call again to
+        continue waiting.
+
+        Args:
+            removal_token: The token returned by pharos_remove_apps
+            wait_seconds: How long to block waiting for a result (default 25, max 30)
+
+        Returns:
+            JSON with status:
+            - "pending" → user has not yet responded (call again to keep waiting)
+            - "removed" → user confirmed removal, server disconnected and uninstalled
+            - "cancelled" → user clicked Cancel
+            - "timeout" → removal expired without user response
+            - "error" → invalid token or other error
+        """
+        wait_seconds = min(max(wait_seconds, 1), 30)
+
+        result_data = _approval_results.get(removal_token)
+
+        if result_data is None:
+            return json.dumps({
+                "status": "error",
+                "error": "Invalid or unknown removal token.",
+                "removal_token": removal_token,
+            })
+
+        def _check_timeout():
+            if result_data.get("result") is None:
+                if time.time() >= result_data.get("expires_at", 0):
+                    result_data["result"] = "timeout"
+                    result_data["error"] = (
+                        f"Removal timed out after {_PHAROS_APPROVAL_TIMEOUT}s. "
+                        f"The user did not respond in time."
+                    )
+
+        _check_timeout()
+        result = result_data.get("result")
+
+        if result is None:
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                await asyncio.sleep(1)
+                _check_timeout()
+                result = result_data.get("result")
+                if result is not None:
+                    break
+
+        if result is None:
+            return json.dumps({
+                "status": "pending",
+                "removal_token": removal_token,
+                "message": "User has not yet responded. Call this tool again with the same removal_token to continue waiting.",
+            })
+        elif result == "removed":
+            return json.dumps({
+                "status": "removed",
+                "removal_token": removal_token,
+                "server_id": result_data.get("server_id", ""),
+                "message": "Server removed and disconnected successfully.",
+            })
+        elif result == "cancelled":
+            return json.dumps({
+                "status": "cancelled",
+                "removal_token": removal_token,
+                "message": "User cancelled the removal.",
+            })
+        elif result == "timeout":
+            _approval_results.pop(removal_token, None)
+            _pending_connections.pop(removal_token, None)
+            return json.dumps({
+                "status": "timeout",
+                "removal_token": removal_token,
+                "message": result_data.get("error", "Removal timed out."),
+            })
+        elif result == "error":
+            _approval_results.pop(removal_token, None)
+            _pending_connections.pop(removal_token, None)
+            return json.dumps({
+                "status": "error",
+                "removal_token": removal_token,
+                "error": result_data.get("error", "Unknown error during removal."),
+                "message": result_data.get("error", "Unknown error during removal."),
+            })
+        else:
+            return json.dumps({
+                "status": "error",
+                "removal_token": removal_token,
+                "message": f"Unexpected removal result: {result}",
+            })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/installed"}})
@@ -3164,6 +3332,35 @@ async def approve_endpoint(request: Request) -> JSONResponse:
     server_id = pending["server_id"]
     card = pending["card"]
     endpoint = pending["endpoint"]
+    purpose = pending.get("purpose", "User request")
+
+    # Clean up the pending token (one-time use)
+    del _pending_connections[approval_token]
+
+    # Handle removal approval — the removal card's Remove button sends
+    # ui/approve (same as install's Approve), but there's nothing to
+    # connect. Disconnect and uninstall instead.
+    if purpose == "removal":
+        if server_id in _connections:
+            conn = _connections[server_id]
+            try:
+                await conn.disconnect()
+            except Exception:
+                pass
+            del _connections[server_id]
+
+        _installed_servers.pop(server_id, None)
+        _server_cards.pop(server_id, None)
+
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "removed"
+            _approval_results[approval_token]["server_id"] = server_id
+
+        return JSONResponse({
+            "status": "removed",
+            "server_id": server_id,
+            "message": "Server removed successfully.",
+        })
 
     # Validate that we have something to connect to. Servers with a `bin`
     # field but no endpoint cannot be started in this environment (no source
@@ -3185,9 +3382,6 @@ async def approve_endpoint(request: Request) -> JSONResponse:
             "error": error_msg,
             "server_id": server_id,
         })
-
-    # Clean up the pending token (one-time use)
-    del _pending_connections[approval_token]
 
     # Check if already connected (race condition guard)
     if server_id in _connections:
@@ -3316,12 +3510,19 @@ async def deny_endpoint(request: Request) -> JSONResponse:
         _approval_events[token]["result"] = "denied"
         _approval_events[token]["event"].set()
 
-    # Record the result for pharos_check_approval (non-blocking flow)
+    # Record the result for pharos_check_approval / pharos_check_removal
+    # (non-blocking flow). Removals use "cancelled" instead of "denied".
     if token in _approval_results:
-        _approval_results[token]["result"] = "denied"
+        if pending.get("purpose") == "removal":
+            _approval_results[token]["result"] = "cancelled"
+        else:
+            _approval_results[token]["result"] = "denied"
 
     # Clean up
     _pending_connections.pop(token, None)
+
+    if pending.get("purpose") == "removal":
+        return JSONResponse({"status": "cancelled"})
 
     return JSONResponse({"status": "denied"})
 
