@@ -1136,17 +1136,28 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
     denyBtn.className = "btn btn-danger";
     denyBtn.textContent = "Deny";
     denyBtn.addEventListener("click", () => {
+      const denyId = Math.floor(Math.random() * 1000000);
       window.parent.postMessage({
         jsonrpc: "2.0",
-        method: "notifications/tool_result",
-        params: { approved: false }
+        id: denyId,
+        method: "ui/deny",
+        params: {
+          approval_token: DATA.approval_token || "",
+          approval_nonce: DATA.approval_nonce || "",
+        }
       }, "*");
-      headerActions.innerHTML = "";
-      const deniedStatic = document.createElement("button");
-      deniedStatic.className = "btn btn-danger btn-static";
-      deniedStatic.textContent = "Denied";
-      deniedStatic.disabled = true;
-      headerActions.appendChild(deniedStatic);
+
+      const denyHandler = (event) => {
+        if (!event.data || event.data.jsonrpc !== "2.0" || event.data.id !== denyId) return;
+        window.removeEventListener("message", denyHandler);
+        headerActions.innerHTML = "";
+        const deniedStatic = document.createElement("button");
+        deniedStatic.className = "btn btn-danger btn-static";
+        deniedStatic.textContent = "Denied";
+        deniedStatic.disabled = true;
+        headerActions.appendChild(deniedStatic);
+      };
+      window.addEventListener("message", denyHandler);
     });
     headerActions.appendChild(denyBtn);
 
@@ -1765,6 +1776,16 @@ _MAX_CACHE_SIZE = 20
 _REQUIRE_PHYSICAL_APPROVAL = os.environ.get(
     "PHAROS_REQUIRE_PHYSICAL_APPROVAL", "false"
 ).lower() in ("true", "1", "yes")
+
+# Approval wait timeout (seconds). The tool will block for this long
+# waiting for the user to click Approve/Deny in the iframe. If the user
+# does not respond within this time, the install is auto-denied.
+# Set via PHAROS_APPROVAL_TIMEOUT env var. Default: 120 seconds.
+_PHAROS_APPROVAL_TIMEOUT = int(os.environ.get("PHAROS_APPROVAL_TIMEOUT", "120"))
+
+# Per-token asyncio events for blocking approval flow.
+# Key: approval_token, Value: dict with "event" (asyncio.Event), "result" (str|None)
+_approval_events: dict[str, dict] = {}
 
 # Signing key for pending connection tokens (HMAC-SHA256).
 # In production this would be a proper server secret; for local MCP it's
@@ -2535,18 +2556,21 @@ else:
         """Install an MCP server with visual approval flow (Apps mode).
 
         Creates a pending approval connection and renders an approval card in
-        the iframe. The user must click Approve before the server is installed
-        and connected. The approval_nonce is injected into the HTML but is NOT
-        included in the JSON response the AI sees.
+        the iframe. The tool BLOCKS until the user clicks Approve or Deny,
+        or until the approval timeout expires. The approval_nonce is injected
+        into the HTML but is NOT included in the JSON response the AI sees.
 
         Args:
             server_id: The server ID to install
             purpose: Why the installation is being requested (shown to user)
 
         Returns:
-            JSON with status "pending_approval", approval_token, server_id,
-            and an html field containing the rendered approval card. The
-            nonce is in the HTML only, never in the JSON.
+            JSON with status:
+            - "pending_approval" → (this is the initial state; tool blocks waiting)
+            - "installed" → user approved, server connected, tools available
+            - "denied" → user clicked Deny
+            - "timeout" → user did not respond within PHAROS_APPROVAL_TIMEOUT seconds
+            - "error" → server not found or too many pending connections
         """
         # Get the server card (from cache or registry)
         card = _server_cards.get(server_id)
@@ -2610,14 +2634,60 @@ else:
             oldest = next(iter(_approval_data_cache))
             del _approval_data_cache[oldest]
 
-        # Return JSON to AI — nonce is NOT here
-        return json.dumps({
-            "status": "pending_approval",
-            "approval_token": token,
-            "server_id": server_id,
-            "message": f"Approval required to install {card.display_name}. "
-                       f"Tell the user to click Approve in the card above.",
-        })
+        # Create an asyncio.Event so this tool can block until the user approves
+        approval_event = asyncio.Event()
+        _approval_events[token] = {
+            "event": approval_event,
+            "result": None,  # Will be set by /approve endpoint: "approved" or "denied"
+        }
+
+        # Block until the user clicks Approve/Deny or the timeout expires.
+        # The iframe renders the approval card from the resource URI in the
+        # tool metadata (_meta.ui.resourceUri). LibreChat fetches that resource
+        # HTML immediately when the tool call starts — before the tool returns.
+        # So the card is visible while we block here.
+        try:
+            await asyncio.wait_for(approval_event.wait(), timeout=_PHAROS_APPROVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            _approval_events.pop(token, None)
+            _pending_connections.pop(token, None)
+            return json.dumps({
+                "status": "timeout",
+                "server_id": server_id,
+                "message": f"Approval timed out after {_PHAROS_APPROVAL_TIMEOUT}s. "
+                           f"The user did not respond in time. Ask if they want to try again.",
+            })
+
+        # Event was set — check the result
+        event_data = _approval_events.pop(token, {})
+        result = event_data.get("result", "unknown")
+
+        if result == "denied":
+            _pending_connections.pop(token, None)
+            return json.dumps({
+                "status": "denied",
+                "server_id": server_id,
+                "message": f"User denied installation of {card.display_name}.",
+            })
+        elif result == "approved":
+            # The /approve endpoint already connected and installed the server.
+            # Get the tools list to return to the AI.
+            tools = await _list_server_tools(server_id)
+            return json.dumps({
+                "status": "installed",
+                "server_id": server_id,
+                "tools_count": len(tools),
+                "tools": tools,
+                "message": f"{card.display_name} approved and installed. "
+                           f"{len(tools)} tools available.",
+            })
+        else:
+            _pending_connections.pop(token, None)
+            return json.dumps({
+                "status": "error",
+                "server_id": server_id,
+                "message": f"Unexpected approval result: {result}",
+            })
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/removal"}})
@@ -3024,6 +3094,11 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         # List initial tools
         tools = await _list_server_tools(server_id)
 
+        # Signal the waiting tool that approval succeeded
+        if approval_token in _approval_events:
+            _approval_events[approval_token]["result"] = "approved"
+            _approval_events[approval_token]["event"].set()
+
         return JSONResponse({
             "status": "connected",
             "server_id": server_id,
@@ -3035,6 +3110,44 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Connection failed: {e}", "server_id": server_id})
     except Exception as e:
         return JSONResponse({"error": f"Connection error: {e}", "server_id": server_id})
+
+
+@mcp.custom_route("/deny", methods=["POST"])
+async def deny_endpoint(request: Request) -> JSONResponse:
+    """Handle denial from the iframe UI.
+
+    Expects a JSON body with:
+        approval_token: The token returned by the install/connect tool
+        approval_nonce: The nonce injected into the HTML card (UI-only)
+
+    Signals the waiting pharos_install_apps tool that the user denied.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    token = body.get("approval_token", "")
+    nonce = body.get("approval_nonce", "")
+
+    pending = _pending_connections.get(token)
+    if pending is None:
+        return JSONResponse({"error": "Invalid or unknown token"})
+
+    if _REQUIRE_PHYSICAL_APPROVAL:
+        stored_nonce = pending.get("approval_nonce")
+        if not stored_nonce or nonce != stored_nonce:
+            return JSONResponse({"error": "Physical approval required"})
+
+    # Signal the waiting tool
+    if token in _approval_events:
+        _approval_events[token]["result"] = "denied"
+        _approval_events[token]["event"].set()
+
+    # Clean up
+    _pending_connections.pop(token, None)
+
+    return JSONResponse({"status": "denied"})
 
 
 # ─── Non-A/B Tools (registered unconditionally in both modes) ──────────────────

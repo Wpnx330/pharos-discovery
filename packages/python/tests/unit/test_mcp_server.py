@@ -132,6 +132,12 @@ class TestToolRegistration:
         assert srv.approve_endpoint.__doc__ is not None
         assert "approval" in srv.approve_endpoint.__doc__.lower()
 
+    def test_deny_endpoint_registered(self):
+        """deny_endpoint should be callable (it's a custom_route, not a tool)."""
+        assert callable(srv.deny_endpoint)
+        assert srv.deny_endpoint.__doc__ is not None
+        assert "denial" in srv.deny_endpoint.__doc__.lower()
+
     def test_pharos_connect_removed(self):
         """pharos_connect should NOT exist (removed, folded into pharos_install_apps)."""
         assert not hasattr(srv, "pharos_connect")
@@ -309,6 +315,7 @@ class TestApproveEndpoint:
         srv._server_cards["echo-server"] = mock_server_card
         srv._connections.clear()
         srv._pending_connections.clear()
+        srv._approval_events.clear()
         # Set up a pending connection using the extracted helper
         token = srv._create_pending_connection(
             card=mock_server_card,
@@ -317,6 +324,9 @@ class TestApproveEndpoint:
             purpose="test",
         )
         assert token is not None
+        # Simulate a waiting tool with an asyncio.Event
+        event = asyncio.Event()
+        srv._approval_events[token] = {"event": event, "result": None}
         # Approve via the HTTP endpoint
         request = self._make_request({"approval_token": token, "approval_nonce": ""})
         with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
@@ -332,6 +342,9 @@ class TestApproveEndpoint:
         assert body["status"] == "connected"
         assert body["server_id"] == "echo-server"
         assert body["tools_count"] == 1
+        # The event should be set and result marked as approved
+        assert event.is_set()
+        assert srv._approval_events[token]["result"] == "approved"
 
     @pytest.mark.asyncio
     async def test_approve_rejected_without_nonce_in_physical_mode(self, mock_server_card):
@@ -463,6 +476,81 @@ class TestApproveEndpoint:
             purpose="test",
         )
         assert token is None
+
+
+# ─── /deny endpoint ──────────────────────────────────────────────────────────
+
+class TestDenyEndpoint:
+    """Test the /deny HTTP endpoint."""
+
+    def _make_request(self, body: dict) -> Any:
+        request = MagicMock()
+        request.json = AsyncMock(return_value=body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_deny_sets_event_and_cleans_up(self, mock_server_card):
+        """deny_endpoint should set the event, mark result as denied, and clean up."""
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        # Simulate a waiting tool
+        event = asyncio.Event()
+        srv._approval_events[token] = {"event": event, "result": None}
+
+        request = self._make_request({"approval_token": token, "approval_nonce": ""})
+        response = await srv.deny_endpoint(request)
+
+        body = json.loads(response.body)
+        assert body["status"] == "denied"
+        assert event.is_set()
+        assert srv._approval_events[token]["result"] == "denied"
+        # Token cleaned up from pending connections
+        assert token not in srv._pending_connections
+
+    @pytest.mark.asyncio
+    async def test_deny_invalid_token(self):
+        """deny_endpoint should reject unknown tokens."""
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        request = self._make_request({"approval_token": "bogus-token"})
+        response = await srv.deny_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "Invalid" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_deny_rejected_without_nonce_in_physical_mode(self, mock_server_card):
+        """deny_endpoint should reject when physical approval is required and nonce is wrong."""
+        srv._pending_connections.clear()
+        srv._approval_events.clear()
+        token = srv._create_pending_connection(
+            card=mock_server_card,
+            server_id="echo-server",
+            endpoint="http://127.0.0.1:8765",
+            purpose="test",
+        )
+        with patch.object(srv, "_REQUIRE_PHYSICAL_APPROVAL", True):
+            request = self._make_request({"approval_token": token, "approval_nonce": "wrong"})
+            response = await srv.deny_endpoint(request)
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "Physical approval required" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_deny_invalid_json(self):
+        """deny_endpoint should return 400 on invalid JSON."""
+        request = MagicMock()
+        request.json = AsyncMock(side_effect=Exception("parse error"))
+        response = await srv.deny_endpoint(request)
+        assert response.status_code == 400
+        body = json.loads(response.body)
+        assert "error" in body
 
 
 # ─── pharos_list_tools ─────────────────────────────────────────────────────────
@@ -1342,22 +1430,63 @@ class TestAppsModeTools:
         assert data["server"]["name"] == "Test Server"
 
     @pytest.mark.asyncio
-    async def test_install_apps_returns_pending_approval(self, _apps_mode_module, mock_client_apps):
-        """pharos_install_apps should return pending_approval status with a token."""
+    async def test_install_apps_denied_returns_denied(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps blocks until user denies, then returns denied status."""
         apps_srv = _apps_mode_module
         apps_srv._server_cards.clear()
         apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        # Pre-create the event so we can set it after the tool starts blocking.
+        # We need to intercept the token — but the token is generated inside the
+        # tool. Instead, patch asyncio.Event to return a controllable event.
+        original_event = asyncio.Event
+        controlled_event = original_event()
+
+        class PatchedEvent(original_event.__class__):
+            pass
+
+        # Simpler: run the tool as a task, then set the event once we know the token
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
-            result = await apps_srv.pharos_install_apps("test-server", purpose="unit test")
+            task = asyncio.create_task(
+                apps_srv.pharos_install_apps("test-server", purpose="unit test")
+            )
+            # Wait for the tool to register its event in _approval_events
+            for _ in range(100):
+                if apps_srv._approval_events:
+                    break
+                await asyncio.sleep(0.01)
+
+            token = next(iter(apps_srv._approval_events))
+            apps_srv._approval_events[token]["result"] = "denied"
+            apps_srv._approval_events[token]["event"].set()
+
+            result = await task
+
         data = json.loads(result)
-        assert data["status"] == "pending_approval"
-        assert "approval_token" in data
+        assert data["status"] == "denied"
         assert data["server_id"] == "test-server"
-        assert "html" not in data
-        # The nonce should NOT be in the AI-visible JSON
-        token = data["approval_token"]
-        assert token in apps_srv._pending_connections
-        assert "approval_nonce" not in data
+        # The token should be cleaned up from pending connections
+        assert token not in apps_srv._pending_connections
+        assert token not in apps_srv._approval_events
+
+    @pytest.mark.asyncio
+    async def test_install_apps_timeout_returns_timeout(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps returns timeout status when user doesn't respond."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        # Patch the timeout to be very short so the test doesn't hang
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.1):
+                result = await apps_srv.pharos_install_apps("test-server", purpose="timeout test")
+
+        data = json.loads(result)
+        assert data["status"] == "timeout"
+        assert data["server_id"] == "test-server"
+        assert "0.1s" in data["message"]
 
     @pytest.mark.asyncio
     async def test_install_apps_nonce_not_in_json_response(self, _apps_mode_module, mock_client_apps):
@@ -1365,13 +1494,32 @@ class TestAppsModeTools:
 
         The nonce is injected into the HTML (which is a string field), but must
         not be a separate key in the JSON response. The AI should only see
-        status, approval_token, server_id, message, and html.
+        status, server_id, message, etc.
         """
         apps_srv = _apps_mode_module
         apps_srv._server_cards.clear()
         apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
-            result = await apps_srv.pharos_install_apps("test-server", purpose="nonce test")
+            task = asyncio.create_task(
+                apps_srv.pharos_install_apps("test-server", purpose="nonce test")
+            )
+            # Wait for the tool to register its event
+            for _ in range(100):
+                if apps_srv._approval_events:
+                    break
+                await asyncio.sleep(0.01)
+
+            token = next(iter(apps_srv._approval_events))
+            # Get the nonce from pending connections before we set the event
+            nonce = apps_srv._pending_connections[token]["approval_nonce"]
+
+            apps_srv._approval_events[token]["result"] = "denied"
+            apps_srv._approval_events[token]["event"].set()
+
+            result = await task
+
         data = json.loads(result)
         # The nonce must NOT be a top-level key in the parsed JSON
         assert "approval_nonce" not in data, (
@@ -1379,8 +1527,6 @@ class TestAppsModeTools:
             "The AI would be able to read it and bypass physical approval."
         )
         # The nonce value should not appear anywhere in the JSON response
-        token = data["approval_token"]
-        nonce = apps_srv._pending_connections[token]["approval_nonce"]
         for key, value in data.items():
             if isinstance(value, str) and nonce in value:
                 pytest.fail(
