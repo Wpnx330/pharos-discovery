@@ -2545,6 +2545,8 @@ else:
             JSON with status, results array, search_id, and an html field
             containing the rendered results table for the iframe.
         """
+        global _current_search_id
+
         client = _get_client()
         limit = min(max(limit, 1), 50)
 
@@ -2555,7 +2557,19 @@ else:
         try:
             results = await client.search(text=query, filters=filters or None, limit=limit)
         except NoServersFound:
-            output: list[dict] = []
+            search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
+            _search_results_cache[search_id] = []
+            _current_search_id = search_id
+            no_results_data = {"query": query, "results": [], "error": None}
+            safe_json = json.dumps(no_results_data).replace("<", "\\u003c").replace(">", "\\u003e")
+            html = SEARCH_APPS_TEMPLATE.replace("__DATA__", safe_json)
+            return json.dumps({
+                "status": "no_results",
+                "results": [],
+                "count": 0,
+                "search_id": search_id,
+                "html": html,
+            })
         except RegistryUnavailable as e:
             error_html_data = {"query": query, "results": [], "error": str(e)}
             safe_json = json.dumps(error_html_data).replace("<", "\\u003c").replace(">", "\\u003e")
@@ -2629,7 +2643,6 @@ else:
         # Cache for UI resource rendering (same pattern as pharos_search)
         search_id = f"sr-{int(time.time())}-{os.urandom(4).hex()}"
         _search_results_cache[search_id] = output
-        global _current_search_id
         _current_search_id = search_id
         if len(_search_results_cache) > _MAX_CACHE_SIZE:
             oldest = next(iter(_search_results_cache))
@@ -3690,7 +3703,7 @@ def approval_resource() -> str:
     data = _approval_data_cache.get(token, {}) if token else {}
     # Escape < > to prevent </script> breakout (XSS safe JSON-in-HTML)
     safe_json = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e")
-    return APPROVAL_HTML_TEMPLATE.replace("__APPROVAL_DATA__", safe_json)
+    return APPROVAL_APPS_TEMPLATE.replace("__DATA__", safe_json)
 
 
 @mcp.resource("ui://pharos/oauth", mime_type=MCP_APP_MIME)
