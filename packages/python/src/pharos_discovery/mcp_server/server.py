@@ -1159,19 +1159,27 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
       denyBtn.disabled = true;
       showStatus("Sending approval...", "ok");
 
-      fetch("/approve", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
+      const approveId = Math.floor(Math.random() * 1000000);
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        id: approveId,
+        method: "ui/approve",
+        params: {
           approval_token: DATA.approval_token || "",
           approval_nonce: DATA.approval_nonce || "",
-        })
-      }).then(resp => resp.json()).then(body => {
-        if (body.error) {
-          showStatus("Error: " + body.error, "err");
+        }
+      }, "*");
+
+      const approveHandler = (event) => {
+        if (!event.data || event.data.jsonrpc !== "2.0" || event.data.id !== approveId) return;
+        window.removeEventListener("message", approveHandler);
+        if (event.data.error) {
+          const errMsg = event.data.error.message || "Unknown error";
+          showStatus("Error: " + errMsg, "err");
           approveBtn.disabled = false;
           denyBtn.disabled = false;
         } else {
+          const body = event.data.result || {};
           showStatus("Approved. " + (body.tools_count || 0) + " tools available.", "ok");
           headerActions.innerHTML = "";
           const approvedStatic = document.createElement("button");
@@ -1185,11 +1193,8 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
             params: { approved: true, server_id: body.server_id }
           }, "*");
         }
-      }).catch(err => {
-        showStatus("Request failed: " + (err.message || String(err)), "err");
-        approveBtn.disabled = false;
-        denyBtn.disabled = false;
-      });
+      };
+      window.addEventListener("message", approveHandler);
     });
     headerActions.appendChild(approveBtn);
 
@@ -1341,16 +1346,23 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
       cancelBtn.disabled = true;
       showStatus("Sending removal confirmation...", "ok");
 
-      fetch("/approve", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
+      const removeId = Math.floor(Math.random() * 1000000);
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        id: removeId,
+        method: "ui/approve",
+        params: {
           approval_token: DATA.removal_token || "",
           approval_nonce: DATA.approval_nonce || "",
-        })
-      }).then(resp => resp.json()).then(body => {
-        if (body.error) {
-          showStatus("Error: " + body.error, "err");
+        }
+      }, "*");
+
+      const removeHandler = (event) => {
+        if (!event.data || event.data.jsonrpc !== "2.0" || event.data.id !== removeId) return;
+        window.removeEventListener("message", removeHandler);
+        if (event.data.error) {
+          const errMsg = event.data.error.message || "Unknown error";
+          showStatus("Error: " + errMsg, "err");
           removeBtn.disabled = false;
           cancelBtn.disabled = false;
         } else {
@@ -1361,11 +1373,8 @@ REMOVAL_APPS_TEMPLATE = """<!DOCTYPE html>
             params: { approved: true, action: "removed", server_id: DATA.server_id }
           }, "*");
         }
-      }).catch(err => {
-        showStatus("Request failed: " + (err.message || String(err)), "err");
-        removeBtn.disabled = false;
-        cancelBtn.disabled = false;
-      });
+      };
+      window.addEventListener("message", removeHandler);
     });
     actions.appendChild(removeBtn);
     card.appendChild(actions);
@@ -1661,16 +1670,23 @@ PUBLISH_APPS_TEMPLATE = """<!DOCTYPE html>
       cancelBtn.disabled = true;
       showStatus("Sending publish confirmation...", "ok");
 
-      fetch("/approve", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
+      const publishId = Math.floor(Math.random() * 1000000);
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        id: publishId,
+        method: "ui/approve",
+        params: {
           approval_token: DATA.publish_token || "",
           approval_nonce: DATA.approval_nonce || "",
-        })
-      }).then(resp => resp.json()).then(body => {
-        if (body.error) {
-          showStatus("Error: " + body.error, "err");
+        }
+      }, "*");
+
+      const publishHandler = (event) => {
+        if (!event.data || event.data.jsonrpc !== "2.0" || event.data.id !== publishId) return;
+        window.removeEventListener("message", publishHandler);
+        if (event.data.error) {
+          const errMsg = event.data.error.message || "Unknown error";
+          showStatus("Error: " + errMsg, "err");
           publishBtn.disabled = false;
           cancelBtn.disabled = false;
         } else {
@@ -1681,11 +1697,8 @@ PUBLISH_APPS_TEMPLATE = """<!DOCTYPE html>
             params: { approved: true, action: "published", server_id: s.id }
           }, "*");
         }
-      }).catch(err => {
-        showStatus("Request failed: " + (err.message || String(err)), "err");
-        publishBtn.disabled = false;
-        cancelBtn.disabled = false;
-      });
+      };
+      window.addEventListener("message", publishHandler);
     });
     actions.appendChild(publishBtn);
     card.appendChild(actions);
