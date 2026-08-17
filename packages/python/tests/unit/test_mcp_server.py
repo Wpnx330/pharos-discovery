@@ -1658,6 +1658,83 @@ class TestAppsModeTools:
         assert data["approval_token"] == token
 
     @pytest.mark.asyncio
+    async def test_check_approval_error_result(self, _apps_mode_module, mock_client_apps):
+        """pharos_check_approval returns 'error' with the actual error message
+        when the /approve endpoint recorded result='error'.
+
+        Previously this fell through to the else branch and returned
+        'Unexpected approval result: error' instead of the real error.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            install_result = await apps_srv.pharos_install_apps("test-server", purpose="test")
+            token = json.loads(install_result)["approval_token"]
+
+            # Simulate the /approve endpoint failing to connect
+            apps_srv._approval_results[token]["result"] = "error"
+            apps_srv._approval_results[token]["error"] = "Connection failed: ECONNREFUSED"
+
+            check_result = await apps_srv.pharos_check_approval(token)
+
+        data = json.loads(check_result)
+        assert data["status"] == "error"
+        assert data["approval_token"] == token
+        assert "Connection failed: ECONNREFUSED" in data["error"]
+        assert "Connection failed: ECONNREFUSED" in data["message"]
+        # The token should be cleaned up
+        assert token not in apps_srv._approval_results
+        assert token not in apps_srv._pending_connections
+
+    @pytest.mark.asyncio
+    async def test_install_apps_no_endpoint(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps returns error when a remote-transport server
+        has no endpoint URL — before showing an approval card.
+
+        This prevents the broken UX where the user sees an approval card,
+        clicks Approve, and the connection fails because there's nothing to
+        connect to.
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        # Create a card with http+sse transport but no endpoint
+        bad_card = MagicMock()
+        bad_card.id = "no-endpoint-server"
+        bad_card.display_name = "No Endpoint Server"
+        bad_card.description = "A server with no endpoint"
+        bad_card.version = "1.0.0"
+        bad_card.transport = ["http+sse"]
+        bad_card.publisher = MagicMock()
+        bad_card.publisher.name = "test-pub"
+        bad_card.publisher.verified = True
+        bad_card.tools_count = 2
+        bad_card.capabilities = ["tools"]
+        bad_card.endpoint = None
+        bad_card.tags = []
+        bad_card.pricing = None
+        bad_card.documentation_url = None
+        bad_card.source_registry = "pharos"
+        bad_card.stdio_command = None
+        apps_srv._server_cards["no-endpoint-server"] = bad_card
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("no-endpoint-server", purpose="test")
+
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["server_id"] == "no-endpoint-server"
+        assert "no endpoint" in data["error"].lower()
+        # No approval card should have been created
+        assert "approval_token" not in data
+        assert len(apps_srv._pending_connections) == 0
+
+    @pytest.mark.asyncio
     async def test_check_approval_invalid_token(self, _apps_mode_module, mock_client_apps):
         """pharos_check_approval returns 'error' for an invalid token."""
         apps_srv = _apps_mode_module

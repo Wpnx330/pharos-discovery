@@ -2596,6 +2596,34 @@ else:
         # Determine endpoint from the card
         endpoint = getattr(card, "endpoint", None)
 
+        # Validate that the server is actually connectable before asking the
+        # user to approve. For remote transports, an endpoint is required.
+        # For stdio, a stdio_command is required. If neither is available,
+        # there's nothing to connect to — don't show an approval card.
+        transports = list(card.transport) if card.transport else []
+        has_remote = any(t in ("http+sse", "streamable-http") for t in transports)
+        has_stdio = "stdio" in transports
+
+        if has_remote and not endpoint and not has_stdio:
+            return json.dumps({
+                "status": "error",
+                "server_id": server_id,
+                "error": (
+                    f"Server '{server_id}' has transport {transports} but no endpoint URL. "
+                    f"The server cannot be connected to. Contact the publisher or try a "
+                    f"different server."
+                ),
+            })
+        if has_stdio and not getattr(card, "stdio_command", None) and not endpoint:
+            return json.dumps({
+                "status": "error",
+                "server_id": server_id,
+                "error": (
+                    f"Server '{server_id}' has stdio transport but no command configured. "
+                    f"The server cannot be started."
+                ),
+            })
+
         # Create pending approval connection (reuses existing helper)
         token = _create_pending_connection(card, server_id, endpoint, purpose)
         if token is None:
@@ -2755,6 +2783,15 @@ else:
                 "status": "timeout",
                 "approval_token": approval_token,
                 "message": result_data.get("error", "Approval timed out."),
+            })
+        elif result == "error":
+            _approval_results.pop(approval_token, None)
+            _pending_connections.pop(approval_token, None)
+            return json.dumps({
+                "status": "error",
+                "approval_token": approval_token,
+                "error": result_data.get("error", "Unknown error during approval."),
+                "message": result_data.get("error", "Unknown error during approval."),
             })
         else:
             return json.dumps({
