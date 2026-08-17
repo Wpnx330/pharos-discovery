@@ -38,7 +38,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Resource, TextResourceContents
 
 from pharos_discovery.client import PharosClient
@@ -2552,7 +2552,11 @@ else:
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
-    async def pharos_install_apps(server_id: str, purpose: str = "User request") -> str:
+    async def pharos_install_apps(
+        server_id: str,
+        purpose: str = "User request",
+        ctx: Context = None,
+    ) -> str:
         """Install an MCP server with visual approval flow (Apps mode).
 
         Creates a pending approval connection and renders an approval card in
@@ -2646,9 +2650,39 @@ else:
         # tool metadata (_meta.ui.resourceUri). LibreChat fetches that resource
         # HTML immediately when the tool call starts — before the tool returns.
         # So the card is visible while we block here.
-        try:
-            await asyncio.wait_for(approval_event.wait(), timeout=_PHAROS_APPROVAL_TIMEOUT)
-        except asyncio.TimeoutError:
+        #
+        # We poll in a loop (10s intervals) instead of a single wait_for so we
+        # can send MCP progress notifications. LibreChat sets
+        # resetTimeoutOnProgress: true on the MCP client, so each progress
+        # notification resets the 130s client-side timeout. Without this, a
+        # long approval wait would cause the MCP client to time out and abort
+        # the tool call before the user has a chance to click.
+        deadline = time.time() + _PHAROS_APPROVAL_TIMEOUT
+        timed_out = False
+        while not approval_event.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            wait_time = min(10, remaining)
+            try:
+                await asyncio.wait_for(approval_event.wait(), timeout=wait_time)
+            except asyncio.TimeoutError:
+                # Send a progress notification to reset the MCP client timeout
+                if ctx is not None:
+                    try:
+                        elapsed = _PHAROS_APPROVAL_TIMEOUT - (deadline - time.time())
+                        progress_pct = int((elapsed / _PHAROS_APPROVAL_TIMEOUT) * 100)
+                        await ctx.report_progress(
+                            progress=progress_pct,
+                            total=100,
+                            message=f"Waiting for user approval ({int(remaining)}s remaining)",
+                        )
+                    except Exception:
+                        pass  # Progress notifications are best-effort
+                continue
+
+        if timed_out:
             _approval_events.pop(token, None)
             _pending_connections.pop(token, None)
             return json.dumps({

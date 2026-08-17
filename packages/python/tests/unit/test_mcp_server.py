@@ -1535,6 +1535,124 @@ class TestAppsModeTools:
                 )
 
     @pytest.mark.asyncio
+    async def test_install_apps_approved_returns_installed(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps blocks until user approves, then returns installed status."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+        apps_srv._connections.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            task = asyncio.create_task(
+                apps_srv.pharos_install_apps("test-server", purpose="approve test")
+            )
+            # Wait for the tool to register its event in _approval_events
+            for _ in range(100):
+                if apps_srv._approval_events:
+                    break
+                await asyncio.sleep(0.01)
+
+            token = next(iter(apps_srv._approval_events))
+            # Simulate the /approve endpoint: mark as approved and set the event.
+            # The /approve endpoint also connects and stores the connection, but
+            # for this test we just need the event result to be "approved".
+            # We mock _list_server_tools to avoid needing a real connection.
+            apps_srv._approval_events[token]["result"] = "approved"
+            apps_srv._approval_events[token]["event"].set()
+
+            with patch.object(apps_srv, "_list_server_tools",
+                              return_value=[{"name": "echo", "description": "Echo tool"}]):
+                result = await task
+
+        data = json.loads(result)
+        assert data["status"] == "installed"
+        assert data["server_id"] == "test-server"
+        assert data["tools_count"] == 1
+        assert len(data["tools"]) == 1
+        assert data["tools"][0]["name"] == "echo"
+        # The token should be cleaned up from approval events
+        assert token not in apps_srv._approval_events
+
+    @pytest.mark.asyncio
+    async def test_install_apps_sends_progress_notifications(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps should send progress notifications via ctx while blocking.
+
+        The polling loop sends a progress notification every 10s (or when the
+        wait_for times out). We verify that ctx.report_progress is called.
+        Progress notifications reset the MCP client's 130s timeout
+        (resetTimeoutOnProgress: true in LibreChat).
+        """
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        # Create a mock Context with an AsyncMock for report_progress
+        mock_ctx = MagicMock()
+        mock_ctx.report_progress = AsyncMock()
+
+        # Use a very short timeout and short poll interval to make the test fast.
+        # We patch _PHAROS_APPROVAL_TIMEOUT to 0.3s so the loop runs ~once.
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.3):
+                result = await apps_srv.pharos_install_apps(
+                    "test-server", purpose="progress test", ctx=mock_ctx
+                )
+
+        data = json.loads(result)
+        assert data["status"] == "timeout"
+        # The polling loop should have called report_progress at least once
+        # (the 0.3s timeout means the first wait_for(10) times out at 0.3s,
+        # triggering a progress notification before the deadline check)
+        assert mock_ctx.report_progress.called, (
+            "ctx.report_progress should be called during the blocking loop "
+            "to reset the MCP client timeout"
+        )
+        # Verify the progress call has progress/total params
+        call_kwargs = mock_ctx.report_progress.call_args
+        assert call_kwargs.kwargs.get("total") == 100
+
+    @pytest.mark.asyncio
+    async def test_install_apps_progress_best_effort_no_ctx(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps should not crash when ctx is None (best-effort progress)."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.1):
+                # ctx defaults to None — should still work without progress
+                result = await apps_srv.pharos_install_apps("test-server", purpose="no ctx test")
+
+        data = json.loads(result)
+        assert data["status"] == "timeout"
+        assert data["server_id"] == "test-server"
+
+    @pytest.mark.asyncio
+    async def test_install_apps_progress_swallows_report_errors(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps should not crash if ctx.report_progress raises."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        mock_ctx = MagicMock()
+        mock_ctx.report_progress = AsyncMock(side_effect=RuntimeError("session closed"))
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.3):
+                result = await apps_srv.pharos_install_apps(
+                    "test-server", purpose="error ctx test", ctx=mock_ctx
+                )
+
+        data = json.loads(result)
+        assert data["status"] == "timeout"
+        # The tool should have survived the report_progress exception
+        assert mock_ctx.report_progress.called
+
+    @pytest.mark.asyncio
     async def test_remove_apps_returns_pending_removal(self, _apps_mode_module, mock_client_apps):
         """pharos_remove_apps should return pending_removal status with a removal_token."""
         apps_srv = _apps_mode_module
