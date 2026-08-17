@@ -1430,66 +1430,30 @@ class TestAppsModeTools:
         assert data["server"]["name"] == "Test Server"
 
     @pytest.mark.asyncio
-    async def test_install_apps_denied_returns_denied(self, _apps_mode_module, mock_client_apps):
-        """pharos_install_apps blocks until user denies, then returns denied status."""
+    async def test_install_apps_returns_pending_approval(self, _apps_mode_module, mock_client_apps):
+        """pharos_install_apps returns pending_approval immediately without blocking."""
         apps_srv = _apps_mode_module
         apps_srv._server_cards.clear()
         apps_srv._pending_connections.clear()
         apps_srv._approval_events.clear()
 
-        # Pre-create the event so we can set it after the tool starts blocking.
-        # We need to intercept the token — but the token is generated inside the
-        # tool. Instead, patch asyncio.Event to return a controllable event.
-        original_event = asyncio.Event
-        controlled_event = original_event()
-
-        class PatchedEvent(original_event.__class__):
-            pass
-
-        # Simpler: run the tool as a task, then set the event once we know the token
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
-            task = asyncio.create_task(
-                apps_srv.pharos_install_apps("test-server", purpose="unit test")
-            )
-            # Wait for the tool to register its event in _approval_events
-            for _ in range(100):
-                if apps_srv._approval_events:
-                    break
-                await asyncio.sleep(0.01)
-
-            token = next(iter(apps_srv._approval_events))
-            apps_srv._approval_events[token]["result"] = "denied"
-            apps_srv._approval_events[token]["event"].set()
-
-            result = await task
+            result = await apps_srv.pharos_install_apps("test-server", purpose="unit test")
 
         data = json.loads(result)
-        assert data["status"] == "denied"
-        assert data["server_id"] == "test-server"
-        # The token should be cleaned up from pending connections
-        assert token not in apps_srv._pending_connections
-        assert token not in apps_srv._approval_events
+        assert data["status"] == "pending_approval"
+        assert "approval_token" in data
+        token = data["approval_token"]
+        # An asyncio.Event must have been registered for the wait tool
+        assert token in apps_srv._approval_events
+        assert apps_srv._approval_events[token]["server_id"] == "test-server"
+        # The message must instruct the AI to call pharos_wait_for_approval
+        assert "pharos_wait_for_approval" in data["message"]
+        # The token should still be pending (not cleaned up by install)
+        assert token in apps_srv._pending_connections
 
     @pytest.mark.asyncio
-    async def test_install_apps_timeout_returns_timeout(self, _apps_mode_module, mock_client_apps):
-        """pharos_install_apps returns timeout status when user doesn't respond."""
-        apps_srv = _apps_mode_module
-        apps_srv._server_cards.clear()
-        apps_srv._pending_connections.clear()
-        apps_srv._approval_events.clear()
-
-        # Patch the timeout to be very short so the test doesn't hang
-        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
-            with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.1):
-                result = await apps_srv.pharos_install_apps("test-server", purpose="timeout test")
-
-        data = json.loads(result)
-        assert data["status"] == "timeout"
-        assert data["server_id"] == "test-server"
-        assert "0.1s" in data["message"]
-
-    @pytest.mark.asyncio
-    async def test_install_apps_nonce_not_in_json_response(self, _apps_mode_module, mock_client_apps):
+    async def test_install_apps_nonce_not_in_json(self, _apps_mode_module, mock_client_apps):
         """The approval_nonce must NOT appear as a top-level JSON field the AI can parse.
 
         The nonce is injected into the HTML (which is a string field), but must
@@ -1502,23 +1466,7 @@ class TestAppsModeTools:
         apps_srv._approval_events.clear()
 
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
-            task = asyncio.create_task(
-                apps_srv.pharos_install_apps("test-server", purpose="nonce test")
-            )
-            # Wait for the tool to register its event
-            for _ in range(100):
-                if apps_srv._approval_events:
-                    break
-                await asyncio.sleep(0.01)
-
-            token = next(iter(apps_srv._approval_events))
-            # Get the nonce from pending connections before we set the event
-            nonce = apps_srv._pending_connections[token]["approval_nonce"]
-
-            apps_srv._approval_events[token]["result"] = "denied"
-            apps_srv._approval_events[token]["event"].set()
-
-            result = await task
+            result = await apps_srv.pharos_install_apps("test-server", purpose="nonce test")
 
         data = json.loads(result)
         # The nonce must NOT be a top-level key in the parsed JSON
@@ -1527,12 +1475,107 @@ class TestAppsModeTools:
             "The AI would be able to read it and bypass physical approval."
         )
         # The nonce value should not appear anywhere in the JSON response
+        token = data["approval_token"]
+        nonce = apps_srv._pending_connections[token]["approval_nonce"]
         for key, value in data.items():
             if isinstance(value, str) and nonce in value:
                 pytest.fail(
                     f"approval_nonce value leaked into JSON field '{key}'. "
                     f"The nonce must not appear in any AI-visible field."
                 )
+
+    @pytest.mark.asyncio
+    async def test_wait_for_approval_error_invalid_token(self, _apps_mode_module, mock_client_apps):
+        """pharos_wait_for_approval returns error for an unknown token."""
+        apps_srv = _apps_mode_module
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        result = await apps_srv.pharos_wait_for_approval("nonexistent-token")
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "Invalid or expired approval token" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_wait_for_approval_returns_denied(self, _apps_mode_module, mock_client_apps):
+        """pharos_wait_for_approval blocks until denied, then returns denied status."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            install_result = await apps_srv.pharos_install_apps("test-server", purpose="unit test")
+        token = json.loads(install_result)["approval_token"]
+
+        # Set the event to denied before calling wait (user already clicked)
+        apps_srv._approval_events[token]["result"] = "denied"
+        apps_srv._approval_events[token]["event"].set()
+
+        result = await apps_srv.pharos_wait_for_approval(token)
+
+        data = json.loads(result)
+        assert data["status"] == "denied"
+        assert "User denied" in data["message"]
+        # Cleanup
+        assert token not in apps_srv._pending_connections
+        assert token not in apps_srv._approval_events
+
+    @pytest.mark.asyncio
+    async def test_wait_for_approval_returns_installed(self, _apps_mode_module, mock_client_apps):
+        """pharos_wait_for_approval blocks until approved, then returns installed status."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+        apps_srv._connections.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            install_result = await apps_srv.pharos_install_apps("test-server", purpose="unit test")
+        token = json.loads(install_result)["approval_token"]
+
+        # Simulate /approve having connected the server and set the event
+        apps_srv._connections["test-server"] = MagicMock()
+        apps_srv._approval_events[token]["result"] = "approved"
+        apps_srv._approval_events[token]["server_id"] = "test-server"
+        apps_srv._approval_events[token]["event"].set()
+
+        # Patch _list_server_tools so we don't need a live connection
+        mock_tools = AsyncMock(return_value=[{"name": "echo"}])
+        with patch.object(apps_srv, "_list_server_tools", new=mock_tools):
+            result = await apps_srv.pharos_wait_for_approval(token)
+
+        data = json.loads(result)
+        assert data["status"] == "installed"
+        assert data["server_id"] == "test-server"
+        assert data["tools_count"] == 1
+        # Cleanup
+        assert token not in apps_srv._approval_events
+
+    @pytest.mark.asyncio
+    async def test_wait_for_approval_returns_timeout(self, _apps_mode_module, mock_client_apps):
+        """pharos_wait_for_approval returns timeout when the user never responds."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_events.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            install_result = await apps_srv.pharos_install_apps(
+                "test-server", purpose="timeout test",
+            )
+        token = json.loads(install_result)["approval_token"]
+
+        # Patch the timeout to be very short so the test doesn't hang
+        with patch.object(apps_srv, "_PHAROS_APPROVAL_TIMEOUT", 0.1):
+            result = await apps_srv.pharos_wait_for_approval(token)
+
+        data = json.loads(result)
+        assert data["status"] == "timeout"
+        assert "0.1s" in data["message"]
+        # Cleanup
+        assert token not in apps_srv._pending_connections
+        assert token not in apps_srv._approval_events
 
     @pytest.mark.asyncio
     async def test_remove_apps_returns_pending_removal(self, _apps_mode_module, mock_client_apps):
@@ -1639,6 +1682,7 @@ class TestModeSwitching:
     # Apps-mode-only tool names (absent in CLI mode)
     _APPS_TOOLS = [
         "pharos_search_apps", "pharos_info_apps", "pharos_install_apps",
+        "pharos_wait_for_approval",
         "pharos_remove_apps", "pharos_list_apps", "pharos_publish_apps",
     ]
 
@@ -1685,6 +1729,9 @@ class TestModeSwitching:
         assert not hasattr(cli_srv, "pharos_install_apps"), (
             "pharos_install_apps should NOT exist in CLI mode"
         )
+        assert not hasattr(cli_srv, "pharos_wait_for_approval"), (
+            "pharos_wait_for_approval should NOT exist in CLI mode"
+        )
 
     def test_apps_mode_enabled(self):
         """With PHAROS_MCP_APPS=true, _apps tools are registered."""
@@ -1697,6 +1744,9 @@ class TestModeSwitching:
         assert hasattr(apps_srv, "pharos_info_apps"), "pharos_info_apps should exist in apps mode"
         assert hasattr(apps_srv, "pharos_install_apps"), (
             "pharos_install_apps should exist in apps mode"
+        )
+        assert hasattr(apps_srv, "pharos_wait_for_approval"), (
+            "pharos_wait_for_approval should exist in apps mode"
         )
         assert hasattr(apps_srv, "pharos_remove_apps"), (
             "pharos_remove_apps should exist in apps mode"

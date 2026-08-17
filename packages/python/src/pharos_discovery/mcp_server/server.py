@@ -2556,21 +2556,20 @@ else:
         """Install an MCP server with visual approval flow (Apps mode).
 
         Creates a pending approval connection and renders an approval card in
-        the iframe. The tool BLOCKS until the user clicks Approve or Deny,
-        or until the approval timeout expires. The approval_nonce is injected
-        into the HTML but is NOT included in the JSON response the AI sees.
+        the iframe, then returns IMMEDIATELY so the host can render the card.
+        The tool does NOT block — call pharos_wait_for_approval with the
+        returned approval_token to block until the user responds. The
+        approval_nonce is injected into the HTML but is NOT included in the
+        JSON response the AI sees.
 
         Args:
             server_id: The server ID to install
             purpose: Why the installation is being requested (shown to user)
 
         Returns:
-            JSON with status:
-            - "pending_approval" → (this is the initial state; tool blocks waiting)
-            - "installed" → user approved, server connected, tools available
-            - "denied" → user clicked Deny
-            - "timeout" → user did not respond within PHAROS_APPROVAL_TIMEOUT seconds
-            - "error" → server not found or too many pending connections
+            JSON with status "pending_approval" — the approval card is now
+            displayed. Call pharos_wait_for_approval with the approval_token
+            to block until the user responds. Other statuses: "error".
         """
         # Get the server card (from cache or registry)
         card = _server_cards.get(server_id)
@@ -2634,61 +2633,97 @@ else:
             oldest = next(iter(_approval_data_cache))
             del _approval_data_cache[oldest]
 
-        # Create an asyncio.Event so this tool can block until the user approves
+        # Create an asyncio.Event for the wait tool to block on
         approval_event = asyncio.Event()
         _approval_events[token] = {
             "event": approval_event,
             "result": None,  # Will be set by /approve endpoint: "approved" or "denied"
+            "server_id": server_id,
         }
 
-        # Block until the user clicks Approve/Deny or the timeout expires.
-        # The iframe renders the approval card from the resource URI in the
-        # tool metadata (_meta.ui.resourceUri). LibreChat fetches that resource
-        # HTML immediately when the tool call starts — before the tool returns.
-        # So the card is visible while we block here.
+        # Return immediately so the iframe can render the approval card.
+        # The AI must call pharos_wait_for_approval to block until the user responds.
+        return json.dumps({
+            "status": "pending_approval",
+            "approval_token": token,
+            "server_id": server_id,
+            "message": f"Approval required to install {card.display_name}. "
+                       f"The approval card is now displayed above. "
+                       f"Call pharos_wait_for_approval with this approval_token "
+                       f"to wait for the user's response. "
+                       f"The user has {_PHAROS_APPROVAL_TIMEOUT} seconds to approve or deny.",
+        })
+
+    @mcp.tool()
+    async def pharos_wait_for_approval(approval_token: str) -> str:
+        """Wait for the user to approve or deny a pending installation.
+
+        After calling pharos_install_apps (which returns pending_approval and
+        displays an approval card), call this tool with the approval_token to
+        block until the user clicks Approve or Deny in the card. This tool
+        stays open until the user responds or the timeout expires.
+
+        Args:
+            approval_token: The token returned by pharos_install_apps
+
+        Returns:
+            JSON with status:
+            - "installed" → user approved, server connected, tools available
+            - "denied" → user clicked Deny
+            - "timeout" → user did not respond in time (auto-denied)
+            - "error" → invalid token or event missing
+        """
+        event_data = _approval_events.get(approval_token)
+        if event_data is None:
+            return json.dumps({
+                "status": "error",
+                "error": "Invalid or expired approval token. "
+                         "Call pharos_install_apps to get a new token.",
+            })
+
+        approval_event = event_data["event"]
+
         try:
             await asyncio.wait_for(approval_event.wait(), timeout=_PHAROS_APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
-            _approval_events.pop(token, None)
-            _pending_connections.pop(token, None)
+            _approval_events.pop(approval_token, None)
+            _pending_connections.pop(approval_token, None)
             return json.dumps({
                 "status": "timeout",
-                "server_id": server_id,
+                "server_id": approval_token,
                 "message": f"Approval timed out after {_PHAROS_APPROVAL_TIMEOUT}s. "
                            f"The user did not respond in time. Ask if they want to try again.",
             })
 
         # Event was set — check the result
-        event_data = _approval_events.pop(token, {})
+        event_data = _approval_events.pop(approval_token, {})
         result = event_data.get("result", "unknown")
 
         if result == "denied":
-            _pending_connections.pop(token, None)
+            _pending_connections.pop(approval_token, None)
             return json.dumps({
                 "status": "denied",
-                "server_id": server_id,
-                "message": f"User denied installation of {card.display_name}.",
+                "message": "User denied the installation.",
             })
         elif result == "approved":
             # The /approve endpoint already connected and installed the server.
-            # Get the tools list to return to the AI.
-            tools = await _list_server_tools(server_id)
+            server_id = event_data.get("server_id", "")
+            tools = []
+            if server_id and server_id in _connections:
+                tools = await _list_server_tools(server_id)
             return json.dumps({
                 "status": "installed",
                 "server_id": server_id,
                 "tools_count": len(tools),
                 "tools": tools,
-                "message": f"{card.display_name} approved and installed. "
-                           f"{len(tools)} tools available.",
+                "message": f"Server approved and installed. {len(tools)} tools available.",
             })
         else:
-            _pending_connections.pop(token, None)
+            _pending_connections.pop(approval_token, None)
             return json.dumps({
                 "status": "error",
-                "server_id": server_id,
                 "message": f"Unexpected approval result: {result}",
             })
-
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/removal"}})
     async def pharos_remove_apps(server_id: str) -> str:
@@ -3097,6 +3132,7 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         # Signal the waiting tool that approval succeeded
         if approval_token in _approval_events:
             _approval_events[approval_token]["result"] = "approved"
+            _approval_events[approval_token]["server_id"] = server_id
             _approval_events[approval_token]["event"].set()
 
         return JSONResponse({
