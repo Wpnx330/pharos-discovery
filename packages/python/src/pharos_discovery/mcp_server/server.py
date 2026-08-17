@@ -1787,6 +1787,12 @@ _PHAROS_APPROVAL_TIMEOUT = int(os.environ.get("PHAROS_APPROVAL_TIMEOUT", "120"))
 # Key: approval_token, Value: dict with "event" (asyncio.Event), "result" (str|None)
 _approval_events: dict[str, dict] = {}
 
+# Per-token approval results for the non-blocking approval flow.
+# Key: approval_token, Value: dict with "result", "tools_count", "tools", "error", "expires_at"
+# The /approve and /deny endpoints set the "result" field. pharos_check_approval
+# polls this dict to report the final status to the AI.
+_approval_results: dict[str, dict] = {}
+
 # Signing key for pending connection tokens (HMAC-SHA256).
 # In production this would be a proper server secret; for local MCP it's
 # derived from the process ID + a static component.
@@ -2555,26 +2561,23 @@ else:
     async def pharos_install_apps(
         server_id: str,
         purpose: str = "User request",
-        ctx: Context = None,
     ) -> str:
         """Install an MCP server with visual approval flow (Apps mode).
 
         Creates a pending approval connection and renders an approval card in
-        the iframe. The tool BLOCKS until the user clicks Approve or Deny,
-        or until the approval timeout expires. The approval_nonce is injected
-        into the HTML but is NOT included in the JSON response the AI sees.
+        the iframe. This tool returns IMMEDIATELY with status "pending_approval"
+        — it does NOT block waiting for the user. The iframe polls
+        /approval/status to update its UI when the user clicks Approve/Deny.
+        After calling this tool, call pharos_check_approval to poll the result.
 
         Args:
             server_id: The server ID to install
             purpose: Why the installation is being requested (shown to user)
 
         Returns:
-            JSON with status:
-            - "pending_approval" → (this is the initial state; tool blocks waiting)
-            - "installed" → user approved, server connected, tools available
-            - "denied" → user clicked Deny
-            - "timeout" → user did not respond within PHAROS_APPROVAL_TIMEOUT seconds
-            - "error" → server not found or too many pending connections
+            JSON with status "pending_approval" and the approval_token.
+            Call pharos_check_approval with the approval_token to get the
+            final result ("installed", "denied", "timeout", or "pending").
         """
         # Get the server card (from cache or registry)
         card = _server_cards.get(server_id)
@@ -2638,88 +2641,125 @@ else:
             oldest = next(iter(_approval_data_cache))
             del _approval_data_cache[oldest]
 
-        # Create an asyncio.Event so this tool can block until the user approves
-        approval_event = asyncio.Event()
-        _approval_events[token] = {
-            "event": approval_event,
-            "result": None,  # Will be set by /approve endpoint: "approved" or "denied"
+        # Initialize the approval result tracker. The /approve and /deny
+        # endpoints will set _approval_results[token] when the user acts.
+        # pharos_check_approval polls this dict.
+        _approval_results[token] = {
+            "result": None,  # None=pending, "approved", "denied", "timeout"
+            "tools_count": 0,
+            "tools": [],
+            "error": None,
+            "expires_at": time.time() + _PHAROS_APPROVAL_TIMEOUT,
         }
 
-        # Block until the user clicks Approve/Deny or the timeout expires.
-        # The iframe renders the approval card from the resource URI in the
-        # tool metadata (_meta.ui.resourceUri). LibreChat fetches that resource
-        # HTML immediately when the tool call starts — before the tool returns.
-        # So the card is visible while we block here.
-        #
-        # We poll in a loop (10s intervals) instead of a single wait_for so we
-        # can send MCP progress notifications. LibreChat sets
-        # resetTimeoutOnProgress: true on the MCP client, so each progress
-        # notification resets the 130s client-side timeout. Without this, a
-        # long approval wait would cause the MCP client to time out and abort
-        # the tool call before the user has a chance to click.
-        deadline = time.time() + _PHAROS_APPROVAL_TIMEOUT
-        timed_out = False
-        while not approval_event.is_set():
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                timed_out = True
-                break
-            wait_time = min(10, remaining)
-            try:
-                await asyncio.wait_for(approval_event.wait(), timeout=wait_time)
-            except asyncio.TimeoutError:
-                # Send a progress notification to reset the MCP client timeout
-                if ctx is not None:
-                    try:
-                        elapsed = _PHAROS_APPROVAL_TIMEOUT - (deadline - time.time())
-                        progress_pct = int((elapsed / _PHAROS_APPROVAL_TIMEOUT) * 100)
-                        await ctx.report_progress(
-                            progress=progress_pct,
-                            total=100,
-                            message=f"Waiting for user approval ({int(remaining)}s remaining)",
-                        )
-                    except Exception:
-                        pass  # Progress notifications are best-effort
-                continue
+        return json.dumps({
+            "status": "pending_approval",
+            "approval_token": token,
+            "server_id": server_id,
+            "server_name": str(card.display_name),
+            "message": (
+                f"Approval card rendered for {card.display_name}. "
+                f"Call pharos_check_approval with approval_token='{token}' "
+                f"to wait for the user's response."
+            ),
+        })
 
-        if timed_out:
-            _approval_events.pop(token, None)
-            _pending_connections.pop(token, None)
-            return json.dumps({
-                "status": "timeout",
-                "server_id": server_id,
-                "message": f"Approval timed out after {_PHAROS_APPROVAL_TIMEOUT}s. "
-                           f"The user did not respond in time. Ask if they want to try again.",
-            })
 
-        # Event was set — check the result
-        event_data = _approval_events.pop(token, {})
-        result = event_data.get("result", "unknown")
+    @mcp.tool()
+    async def pharos_check_approval(approval_token: str, wait_seconds: int = 25) -> str:
+        """Check the status of a pending approval (Apps mode).
 
-        if result == "denied":
-            _pending_connections.pop(token, None)
-            return json.dumps({
-                "status": "denied",
-                "server_id": server_id,
-                "message": f"User denied installation of {card.display_name}.",
-            })
-        elif result == "approved":
-            # The /approve endpoint already connected and installed the server.
-            # Get the tools list to return to the AI.
-            tools = await _list_server_tools(server_id)
-            return json.dumps({
-                "status": "installed",
-                "server_id": server_id,
-                "tools_count": len(tools),
-                "tools": tools,
-                "message": f"{card.display_name} approved and installed. "
-                           f"{len(tools)} tools available.",
-            })
-        else:
-            _pending_connections.pop(token, None)
+        Polls the approval result for a token returned by pharos_install_apps.
+        By default, BLOCKS for up to 25 seconds waiting for the user to click
+        Approve or Deny. If the user acts during this time, returns the result
+        immediately. If the wait expires, returns "pending" — call again to
+        continue waiting.
+
+        Args:
+            approval_token: The token returned by pharos_install_apps
+            wait_seconds: How long to block waiting for a result (default 25, max 30)
+
+        Returns:
+            JSON with status:
+            - "pending" → user has not yet responded (call again to keep waiting)
+            - "installed" → user approved, server connected, tools available
+            - "denied" → user clicked Deny
+            - "timeout" → approval expired without user response
+            - "error" → invalid token or other error
+        """
+        wait_seconds = min(max(wait_seconds, 1), 30)
+
+        result_data = _approval_results.get(approval_token)
+
+        if result_data is None:
             return json.dumps({
                 "status": "error",
-                "server_id": server_id,
+                "error": "Invalid or unknown approval token.",
+                "approval_token": approval_token,
+            })
+
+        # Check for timeout (expiry). Kept as a nested helper so it can be
+        # invoked both before and during the blocking wait loop below.
+        def _check_timeout():
+            if result_data.get("result") is None:
+                if time.time() >= result_data.get("expires_at", 0):
+                    result_data["result"] = "timeout"
+                    result_data["error"] = (
+                        f"Approval timed out after {_PHAROS_APPROVAL_TIMEOUT}s. "
+                        f"The user did not respond in time."
+                    )
+
+        _check_timeout()
+        result = result_data.get("result")
+
+        # If not yet resolved, block for up to wait_seconds polling once per
+        # second. asyncio.sleep(1) yields control so other tasks (including
+        # the HTTP /approve and /deny handlers that set the result) can run.
+        # This is safe inside a regular MCP tool call.
+        if result is None:
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                await asyncio.sleep(1)
+                _check_timeout()
+                result = result_data.get("result")
+                if result is not None:
+                    break
+
+        if result is None:
+            return json.dumps({
+                "status": "pending",
+                "approval_token": approval_token,
+                "message": "User has not yet responded. Call this tool again with the same approval_token to continue waiting.",
+            })
+        elif result == "installed":
+            tools = result_data.get("tools", [])
+            return json.dumps({
+                "status": "installed",
+                "approval_token": approval_token,
+                "server_id": result_data.get("server_id", ""),
+                "tools_count": result_data.get("tools_count", len(tools)),
+                "tools": tools,
+                "message": f"Server approved and installed. {len(tools)} tools available.",
+            })
+        elif result == "denied":
+            return json.dumps({
+                "status": "denied",
+                "approval_token": approval_token,
+                "message": "User denied the installation.",
+            })
+        elif result == "timeout":
+            # Clean up expired entry
+            _approval_results.pop(approval_token, None)
+            _pending_connections.pop(approval_token, None)
+            return json.dumps({
+                "status": "timeout",
+                "approval_token": approval_token,
+                "message": result_data.get("error", "Approval timed out."),
+            })
+        else:
+            return json.dumps({
+                "status": "error",
+                "approval_token": approval_token,
                 "message": f"Unexpected approval result: {result}",
             })
 
@@ -3092,10 +3132,24 @@ async def approve_endpoint(request: Request) -> JSONResponse:
 
     # Check if already connected (race condition guard)
     if server_id in _connections:
+        # Record the result for pharos_check_approval
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "installed"
+            _approval_results[approval_token]["server_id"] = server_id
         return JSONResponse({
             "status": "already_connected",
             "server_id": server_id,
             "message": "Already connected. Use pharos_list_tools to see available tools.",
+        })
+
+    # Guard against double-approval: check if this token was already processed
+    result_entry = _approval_results.get(approval_token)
+    if result_entry is not None and result_entry.get("result") is not None:
+        return JSONResponse({
+            "status": result_entry["result"],
+            "server_id": server_id,
+            "message": "This approval token has already been processed.",
+            "tools_count": result_entry.get("tools_count", 0),
         })
 
     # Build an approval token for the connection manager
@@ -3128,7 +3182,14 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         # List initial tools
         tools = await _list_server_tools(server_id)
 
-        # Signal the waiting tool that approval succeeded
+        # Record the result for pharos_check_approval
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "installed"
+            _approval_results[approval_token]["server_id"] = server_id
+            _approval_results[approval_token]["tools_count"] = len(tools)
+            _approval_results[approval_token]["tools"] = tools
+
+        # Also signal any legacy event-based waiters
         if approval_token in _approval_events:
             _approval_events[approval_token]["result"] = "approved"
             _approval_events[approval_token]["event"].set()
@@ -3141,8 +3202,16 @@ async def approve_endpoint(request: Request) -> JSONResponse:
             "tools": tools,
         })
     except ConnectionFailed as e:
+        # Record the failure for pharos_check_approval
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "error"
+            _approval_results[approval_token]["error"] = f"Connection failed: {e}"
         return JSONResponse({"error": f"Connection failed: {e}", "server_id": server_id})
     except Exception as e:
+        # Record the failure for pharos_check_approval
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "error"
+            _approval_results[approval_token]["error"] = f"Connection error: {e}"
         return JSONResponse({"error": f"Connection error: {e}", "server_id": server_id})
 
 
@@ -3173,15 +3242,68 @@ async def deny_endpoint(request: Request) -> JSONResponse:
         if not stored_nonce or nonce != stored_nonce:
             return JSONResponse({"error": "Physical approval required"})
 
-    # Signal the waiting tool
+    # Signal the waiting tool (legacy event-based flow)
     if token in _approval_events:
         _approval_events[token]["result"] = "denied"
         _approval_events[token]["event"].set()
+
+    # Record the result for pharos_check_approval (non-blocking flow)
+    if token in _approval_results:
+        _approval_results[token]["result"] = "denied"
 
     # Clean up
     _pending_connections.pop(token, None)
 
     return JSONResponse({"status": "denied"})
+
+
+@mcp.custom_route("/approval/status", methods=["GET"])
+async def approval_status_endpoint(request: Request) -> JSONResponse:
+    """Check the status of a pending approval.
+
+    Called by the iframe UI to poll whether the user has clicked Approve/Deny.
+    This is a GET endpoint so the iframe can include the token as a query param.
+
+    Query params:
+        approval_token: The token returned by pharos_install_apps
+
+    Returns JSON with the current approval status:
+        "pending", "installed", "denied", "timeout", or "error"
+    """
+    from urllib.parse import parse_qs
+    query = parse_qs(request.url.query)
+    approval_token = query.get("approval_token", [""])[0]
+
+    if not approval_token:
+        return JSONResponse({"error": "Missing approval_token query parameter"}, status_code=400)
+
+    result_data = _approval_results.get(approval_token)
+    if result_data is None:
+        return JSONResponse({"status": "error", "error": "Invalid or unknown approval token"})
+
+    # Check for timeout
+    if result_data.get("result") is None:
+        if time.time() >= result_data.get("expires_at", 0):
+            result_data["result"] = "timeout"
+
+    result = result_data.get("result")
+    if result is None:
+        return JSONResponse({"status": "pending"})
+    elif result == "installed":
+        return JSONResponse({
+            "status": "installed",
+            "server_id": result_data.get("server_id", ""),
+            "tools_count": result_data.get("tools_count", 0),
+        })
+    elif result == "denied":
+        return JSONResponse({"status": "denied"})
+    elif result == "timeout":
+        return JSONResponse({"status": "timeout"})
+    else:
+        return JSONResponse({
+            "status": "error",
+            "error": result_data.get("error", "Unknown error"),
+        })
 
 
 # ─── Non-A/B Tools (registered unconditionally in both modes) ──────────────────
