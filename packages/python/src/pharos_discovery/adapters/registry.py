@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -25,6 +27,33 @@ def _encode_server_id(server_id: str) -> str:
     return quote(str(server_id), safe="-._~")
 
 
+def _slugify(text: str) -> str:
+    """Generate a CLI-safe slug from a server name.
+
+    Removes emojis and special characters, replaces spaces with hyphens,
+    and lowercases. Falls back to a short hash if the result is empty
+    (e.g., name was all emojis).
+    """
+    # Remove any character that's not alphanumeric, space, hyphen, dot,
+    # underscore, slash, or @.
+    cleaned = re.sub(r"[^a-zA-Z0-9 \-._/@]", "", text)
+    # Replace runs of whitespace with a single hyphen.
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    # Collapse multiple hyphens into one.
+    cleaned = re.sub(r"-+", "-", cleaned)
+    # Strip leading/trailing hyphens.
+    cleaned = cleaned.strip("-")
+    # Lowercase.
+    cleaned = cleaned.lower()
+
+    if not cleaned:
+        # Name was all emojis / special chars — use a hash fallback.
+        short_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+        cleaned = f"server-{short_hash}"
+
+    return cleaned
+
+
 class SearchResult:
     """Wrapper for a search result item."""
 
@@ -42,6 +71,7 @@ class SearchResult:
 def _normalize_to_server_card(
     item: dict[str, Any],
     source_registry: str,
+    slug_map: dict[str, str] | None = None,
 ) -> ServerCard:
     """Normalize a raw registry item into a :class:`ServerCard`.
 
@@ -50,16 +80,32 @@ def _normalize_to_server_card(
     2. **Live registry** (getpharos.dev) — has ``name``, ``title``,
        ``capabilities`` as a dict with ``tools``/``auth`` keys, and
        ``publisher`` with a ``namespace`` field.
+
+    Args:
+        item: Raw registry item dict.
+        source_registry: Base URL of the source registry (for provenance).
+        slug_map: Optional dict to populate with ``{slug: original_name}``
+            mappings, so :meth:`PharosRegistryAdapter.get_server_card` can
+            reverse-lookup the original name for API calls.
     """
     # --- Pharos-native shape (existing tests / other registries) -----------
     if "id" in item and "display_name" in item:
         return ServerCard(**item)
 
     # --- Live registry shape (getpharos.dev /v1/search & /v1/packages) -----
-    # Prefer a stable machine id when the registry provides one. Display names
-    # (spaces, emojis) belong in title, not in the URL path.
-    name = item.get("id") or item.get("name") or "unknown"
-    title = item.get("title") or item.get("display_name") or item.get("name") or name
+    # Prefer a stable machine id when the registry provides one. If no id
+    # field exists, generate a sanitized slug from the name so the id is
+    # safe for URL paths, CLI package names, and internal lookups. Display
+    # names (spaces, emojis) belong in title, not in the id.
+    raw_id = item.get("id")
+    raw_name = item.get("name") or "unknown"
+    if raw_id:
+        name = raw_id
+    else:
+        name = _slugify(raw_name)
+        if slug_map is not None:
+            slug_map[name] = raw_name
+    title = item.get("title") or item.get("display_name") or item.get("name") or raw_name
     description = item.get("description") or item.get("summary") or ""
     version = item.get("version") or "0.0.0"
 
@@ -217,6 +263,7 @@ class PharosRegistryAdapter:
         self._get_timeout = get_timeout
         self._api_key = api_key
         self._etag_cache: dict[str, str] = {}
+        self._slug_to_original: dict[str, str] = {}
 
     @property
     def base_url(self) -> str:
@@ -281,7 +328,7 @@ class PharosRegistryAdapter:
 
         results: list[SearchResult] = []
         for item in items:
-            card = _normalize_to_server_card(item, self._base_url)
+            card = _normalize_to_server_card(item, self._base_url, self._slug_to_original)
             score = item.get("_score") or item.get("score")
             results.append(SearchResult(card=card, score=score, raw_item=item))
 
@@ -307,8 +354,10 @@ class PharosRegistryAdapter:
         Raises:
             RegistryUnavailable: On HTTP errors
         """
+        # If server_id is a slug, resolve to original name for registry lookup.
+        lookup_id = self._slug_to_original.get(server_id, server_id)
+        encoded_id = _encode_server_id(lookup_id)
         # Try /v1/servers/{id} (Pharos-native spec endpoint).
-        encoded_id = _encode_server_id(server_id)
         try:
             card, new_etag = await self._try_get_card(
                 f"{self._base_url}/v1/servers/{encoded_id}", etag
@@ -362,7 +411,7 @@ class PharosRegistryAdapter:
 
         new_etag = resp.headers.get("ETag")
         body = resp.json()
-        card = _normalize_to_server_card(body, self._base_url)
+        card = _normalize_to_server_card(body, self._base_url, self._slug_to_original)
         return card, new_etag
 
     async def get_blocklist(self) -> list[str]:
