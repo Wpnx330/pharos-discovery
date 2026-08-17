@@ -2579,19 +2579,20 @@ else:
             Call pharos_check_approval with the approval_token to get the
             final result ("installed", "denied", "timeout", or "pending").
         """
-        # Get the server card (from cache or registry)
-        card = _server_cards.get(server_id)
-        if card is None:
-            client = _get_client()
-            try:
-                card = await client.get_server(server_id)
-                _server_cards[server_id] = card
-            except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "error": f"Cannot install: server '{server_id}' not found: {e}",
-                    "server_id": server_id,
-                })
+        # Always fetch the server card fresh from the registry for install.
+        # The _server_cards cache may be stale (e.g., publisher added an endpoint
+        # after the initial search). Install is a consequential action — freshness
+        # matters more than the ~200ms saved by caching.
+        client = _get_client()
+        try:
+            card = await client.get_server(server_id)
+            _server_cards[server_id] = card  # update cache with fresh data
+        except Exception as e:
+            return json.dumps({
+                "status": "error",
+                "error": f"Cannot install: server '{server_id}' not found: {e}",
+                "server_id": server_id,
+            })
 
         # Determine endpoint from the card
         endpoint = getattr(card, "endpoint", None)
