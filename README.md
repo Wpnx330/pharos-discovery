@@ -86,14 +86,34 @@ Add to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`)
 
 ### Tools
 
+Mode is selected at startup by `PHAROS_MCP_APPS`.
+
+**CLI mode** (default — no iframe):
+
 | Tool | Description |
 |---|---|
 | `pharos_search` | Search the registry for MCP servers (natural-language query) |
-| `pharos_install` | Install an MCP server to the local machine via the `pharos` CLI |
-| `pharos_connect` | Request a connection to a running server — returns pending approval token (MCP Apps UI) |
-| `pharos_approve` | Approve a pending connection — completes the connection after user confirmation |
+| `pharos_info` | Server card details |
+| `pharos_install` | Install a server (remote endpoint or CLI for stdio) |
+| `pharos_remove` | Remove an installed server |
+| `pharos_list` | List installed servers |
 | `pharos_list_tools` | List tools available on a connected server |
-| `pharos_call_tool` | Call a tool on a connected server with arbitrary arguments |
+| `pharos_call_tool` | Call a tool on a connected server |
+
+**Apps mode** (`PHAROS_MCP_APPS=true` — LibreChat / MCP Apps hosts):
+
+| Tool | Description |
+|---|---|
+| `pharos_search_apps` | Search + results iframe |
+| `pharos_info_apps` | Server details iframe |
+| `pharos_install_apps` | Install with visual approval (replaces `pharos_connect`) |
+| `pharos_remove_apps` | Remove with confirmation iframe |
+| `pharos_list_apps` | Installed-servers iframe |
+| `pharos_publish_apps` | Publish confirmation iframe |
+
+`pharos_connect` is **gone**. Approval is `POST /approve` (custom HTTP route, not an MCP tool — invisible to the model). The iframe Approve button posts via the host (`postMessage`); the AI cannot click it. After `pharos_install_apps` returns `pending_approval`, the host polls `pharos_check_approval`.
+
+Tool JSON is compact. HTML lives on `ui://pharos/...` resources, often with a per-call token (`ui://pharos/approval/{token}`) so iframes do not show a stale card.
 
 ### MCP Apps UI Resources
 

@@ -166,6 +166,7 @@ class TestToolRegistration:
         result = srv.approval_resource()
         assert "<html" in result.lower()
         assert "PHAROS" in result
+        assert "Approval Required" not in result
 
     def test_oauth_resource_registered(self):
         assert callable(srv.oauth_resource)
@@ -247,10 +248,16 @@ class TestPharosSearch:
 class TestPharosInstall:
     """Test the pharos_install tool."""
 
+    def _no_registry(self):
+        """Cache-miss hydrate must not hit a live registry in unit tests."""
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(side_effect=Exception("not found"))
+        return patch.object(srv, "_get_client", return_value=mock_client)
+
     @pytest.mark.asyncio
     async def test_install_cli_not_found(self):
         """Should return error when pharos CLI is not on PATH."""
-        with patch.dict(os.environ, {"PHAROS_CLI": "/nonexistent/pharos"}):
+        with self._no_registry(), patch.dict(os.environ, {"PHAROS_CLI": "/nonexistent/pharos"}):
             result = await srv.pharos_install("test-server")
         data = json.loads(result)
         assert "error" in data
@@ -263,7 +270,7 @@ class TestPharosInstall:
         mock_proc = AsyncMock()
         mock_proc.returncode = 0
         mock_proc.communicate = AsyncMock(return_value=(b"installed successfully", b""))
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        with self._no_registry(), patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await srv.pharos_install("test-server")
         data = json.loads(result)
         assert data["status"] == "installed"
@@ -276,7 +283,7 @@ class TestPharosInstall:
         mock_proc = AsyncMock()
         mock_proc.returncode = 1
         mock_proc.communicate = AsyncMock(return_value=(b"", b"install failed"))
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        with self._no_registry(), patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await srv.pharos_install("bad-server")
         data = json.loads(result)
         assert "error" in data
@@ -288,7 +295,7 @@ class TestPharosInstall:
         import asyncio as aio
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(side_effect=aio.TimeoutError())
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        with self._no_registry(), patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await srv.pharos_install("slow-server")
         data = json.loads(result)
         assert "error" in data
@@ -625,7 +632,13 @@ class TestUIResources:
 
     def test_approval_html_contains_no_script_injection(self):
         """Approval HTML should use textContent for user-controlled data."""
-        html = srv.approval_resource()
+        srv._approval_data_cache["xss-tok"] = {
+            "server": {"id": "x", "display_name": "X", "description": "d"},
+            "purpose": "t",
+            "approval_token": "xss-tok",
+            "approval_nonce": "n",
+        }
+        html = srv.approval_resource("xss-tok")
         # The HTML uses textContent (safe) not innerHTML for user data
         assert "textContent" in html
         # Check that user-controlled values (server_name, server_id) use textContent
@@ -820,7 +833,10 @@ class TestSecurity:
     async def test_install_server_id_no_command_injection(self):
         """Server ID should be passed as argument, not shell interpolation."""
         malicious_id = "test; rm -rf /"
-        with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(side_effect=Exception("not found"))
+        with patch.object(srv, "_get_client", return_value=mock_client), \
+             patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_proc = AsyncMock()
             mock_proc.returncode = 1
             mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
@@ -845,7 +861,13 @@ class TestSecurity:
 
     def test_html_no_xss_via_innerhtml(self):
         """Approval HTML should not use innerHTML for user-controlled data."""
-        html = srv.approval_resource()
+        srv._approval_data_cache["xss-tok"] = {
+            "server": {"id": "x", "display_name": "X", "description": "d"},
+            "purpose": "t",
+            "approval_token": "xss-tok",
+            "approval_nonce": "n",
+        }
+        html = srv.approval_resource("xss-tok")
         # Find all innerHTML usages in the script section
         if "<script>" in html:
             script = html.split("<script>")[1].split("</script>")[0]
@@ -981,9 +1003,17 @@ class TestInstallTransportGuard:
         card = MagicMock()
         card.transport = ["http+sse"]
         card.endpoint = None
+        card.stdio_command = None
+        card.command = None
+        card.bin = None
+        card.runtime = None
+        card.package = None
         srv._server_cards["bad-remote"] = card
 
-        result = await srv.pharos_install("bad-remote")
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(side_effect=Exception("404"))
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_install("bad-remote")
         data = json.loads(result)
 
         assert "error" in data
@@ -995,6 +1025,11 @@ class TestInstallTransportGuard:
         card = MagicMock()
         card.transport = ["stdio"]
         card.endpoint = None
+        card.stdio_command = "npx -y echo"
+        card.command = "npx -y echo"
+        card.bin = None
+        card.runtime = None
+        card.package = None
         srv._server_cards["stdio-srv"] = card
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
@@ -1015,6 +1050,11 @@ class TestInstallTransportGuard:
         card = MagicMock()
         card.transport = "stdio"
         card.endpoint = None
+        card.stdio_command = "npx -y echo"
+        card.command = "npx -y echo"
+        card.bin = None
+        card.runtime = None
+        card.package = None
         srv._server_cards["stdio-srv"] = card
 
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
@@ -1032,9 +1072,17 @@ class TestInstallTransportGuard:
         card = MagicMock()
         card.transport = "websocket"  # unsupported
         card.endpoint = None
+        card.stdio_command = None
+        card.command = None
+        card.bin = None
+        card.runtime = None
+        card.package = None
         srv._server_cards["ws-srv"] = card
 
-        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(side_effect=Exception("404"))
+        with patch.object(srv, "_get_client", return_value=mock_client), \
+             patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
             result = await srv.pharos_install("ws-srv")
             data = json.loads(result)
 
@@ -1703,10 +1751,9 @@ class TestAppsModeTools:
         apps_srv._pending_connections.clear()
         apps_srv._approval_results.clear()
 
-        # Create a card with http+sse transport but no endpoint. The install
-        # path uses the cached card first (cache-first, like pharos_info_apps),
-        # so seeding the cache with this bad card is sufficient for the
-        # no-endpoint error to surface — the registry is never hit.
+        # Incomplete cached search card: http+sse with no endpoint. Hydrate
+        # tries package detail; when that also has no endpoint, install
+        # errors without advertising an approval UI.
         bad_card = MagicMock()
         bad_card.id = "no-endpoint-server"
         bad_card.display_name = "No Endpoint Server"
@@ -1724,9 +1771,11 @@ class TestAppsModeTools:
         bad_card.documentation_url = None
         bad_card.source_registry = "pharos"
         bad_card.stdio_command = None
-        # Seed the cache with the bad card; cache-first means this is used.
+        bad_card.command = None
+        bad_card.bin = None
+        bad_card.runtime = None
+        bad_card.package = None
         apps_srv._server_cards["no-endpoint-server"] = bad_card
-        # Registry mock should NOT be called (cache hit).
         mock_client_apps.get_server = AsyncMock(return_value=bad_card)
 
         with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
@@ -1738,9 +1787,10 @@ class TestAppsModeTools:
         assert "no endpoint" in data["error"].lower()
         # No approval card should have been created
         assert "approval_token" not in data
+        assert "ui_resource_uri" not in data
         assert len(apps_srv._pending_connections) == 0
-        # Cache-first: registry must NOT have been called.
-        mock_client_apps.get_server.assert_not_awaited()
+        # Incomplete cache: registry is consulted once to hydrate.
+        mock_client_apps.get_server.assert_awaited_once_with("no-endpoint-server")
 
     @pytest.mark.asyncio
     async def test_install_apps_uses_cached_card(self, _apps_mode_module, mock_client_apps):
@@ -1796,6 +1846,146 @@ class TestAppsModeTools:
         mock_client_apps.get_server.assert_not_awaited()
         # The cached card is still in the cache (unchanged).
         assert apps_srv._server_cards["test-server"] is cached_card
+
+    @pytest.mark.asyncio
+    async def test_install_apps_hydrates_incomplete_cached_card(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Cached search card with remote transport and no endpoint is hydrated."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        incomplete = MagicMock()
+        incomplete.id = "test-echo-server"
+        incomplete.display_name = "Test Echo Server"
+        incomplete.description = "echo"
+        incomplete.version = "0.2.5"
+        incomplete.transport = ["http+sse"]
+        incomplete.publisher = MagicMock()
+        incomplete.publisher.name = "test-pub"
+        incomplete.publisher.verified = True
+        incomplete.tools_count = 1
+        incomplete.capabilities = ["tools"]
+        incomplete.endpoint = None
+        incomplete.tags = []
+        incomplete.pricing = None
+        incomplete.documentation_url = None
+        incomplete.source_registry = "pharos"
+        incomplete.stdio_command = None
+        incomplete.command = None
+        incomplete.bin = None
+        incomplete.runtime = None
+        incomplete.package = None
+        apps_srv._server_cards["test-echo-server"] = incomplete
+
+        hydrated = MagicMock()
+        hydrated.id = "test-echo-server"
+        hydrated.display_name = "Test Echo Server"
+        hydrated.description = "echo"
+        hydrated.version = "0.2.5"
+        hydrated.transport = ["http+sse"]
+        hydrated.publisher = incomplete.publisher
+        hydrated.tools_count = 1
+        hydrated.capabilities = ["tools"]
+        hydrated.endpoint = "http://host.docker.internal:8765"
+        hydrated.tags = []
+        hydrated.pricing = None
+        hydrated.documentation_url = None
+        hydrated.source_registry = "pharos"
+        hydrated.stdio_command = None
+        hydrated.command = None
+        hydrated.bin = None
+        hydrated.runtime = None
+        hydrated.package = None
+        mock_client_apps.get_server = AsyncMock(return_value=hydrated)
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-echo-server", purpose="test")
+
+        data = json.loads(result)
+        assert data["status"] == "pending_approval", f"Expected pending_approval, got: {data}"
+        assert data["ui_resource_uri"].startswith("ui://pharos/approval/")
+        mock_client_apps.get_server.assert_awaited_once_with("test-echo-server")
+        assert apps_srv._server_cards["test-echo-server"] is hydrated
+
+    @pytest.mark.asyncio
+    async def test_install_apps_incomplete_cache_keeps_card_on_fetch_error(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Hydrate 404 keeps the cached card and returns the no-endpoint error."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+
+        incomplete = MagicMock()
+        incomplete.id = "test-echo-server"
+        incomplete.display_name = "Test Echo Server"
+        incomplete.description = "echo"
+        incomplete.version = "0.2.5"
+        incomplete.transport = ["http+sse"]
+        incomplete.publisher = MagicMock()
+        incomplete.publisher.name = "test-pub"
+        incomplete.publisher.verified = True
+        incomplete.tools_count = 1
+        incomplete.capabilities = ["tools"]
+        incomplete.endpoint = None
+        incomplete.tags = []
+        incomplete.pricing = None
+        incomplete.documentation_url = None
+        incomplete.source_registry = "pharos"
+        incomplete.stdio_command = None
+        incomplete.command = None
+        incomplete.bin = None
+        incomplete.runtime = None
+        incomplete.package = None
+        apps_srv._server_cards["test-echo-server"] = incomplete
+        mock_client_apps.get_server = AsyncMock(side_effect=Exception("404 not found"))
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-echo-server", purpose="test")
+
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "no endpoint" in data["error"].lower()
+        assert "ui_resource_uri" not in data
+        assert "approval_token" not in data
+        assert apps_srv._server_cards["test-echo-server"] is incomplete
+        mock_client_apps.get_server.assert_awaited_once_with("test-echo-server")
+
+    def test_empty_approval_resource_is_neutral(self, _apps_mode_module):
+        """Static / empty approval URI must not render a fake approval card."""
+        apps_srv = _apps_mode_module
+        apps_srv._approval_data_cache.clear()
+        apps_srv._current_approval_token = None
+        html = apps_srv.approval_resource()
+        assert "Approval Required" not in html
+        static_html = apps_srv.approval_resource_static()
+        assert "Approval Required" not in static_html
+
+    @pytest.mark.asyncio
+    async def test_successful_approval_html_has_buttons_and_name(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Successful install approval HTML still contains Approve/Deny + name."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        apps_srv._approval_data_cache.clear()
+
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            result = await apps_srv.pharos_install_apps("test-server", purpose="test")
+
+        data = json.loads(result)
+        assert data["status"] == "pending_approval"
+        html = apps_srv.approval_resource(data["approval_token"])
+        assert "Approval Required" in html
+        assert "Approve" in html
+        assert "Deny" in html
+        assert "Test Server" in html
 
     @pytest.mark.asyncio
     async def test_install_apps_falls_back_to_registry_on_cache_miss(

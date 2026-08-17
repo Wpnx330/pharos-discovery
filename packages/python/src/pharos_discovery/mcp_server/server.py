@@ -1050,7 +1050,7 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PHAROS Approval Required</title>
+<title>PHAROS</title>
 <style>""" + _APPS_BASE_CSS + """
   .approval-card {
     background: var(--surface);
@@ -1111,24 +1111,42 @@ APPROVAL_APPS_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <div class="header">
-    <div class="header-text">
-      <div class="title">Approval Required</div>
-      <div class="subtitle" id="subtitle"></div>
-    </div>
-    <div class="header-actions" id="header-actions"></div>
-  </div>
-  <div class="approval-card" id="approval-card"></div>
+  <!-- Neutral empty page when DATA.server is missing. Hosts may still
+       fetch ui://pharos/approval on install errors because of a static
+       tool decorator; do not render a fake approval card in that case. -->
+  <div id="approval-root"></div>
   <div id="status"></div>
 <script>
   const DATA = __DATA__;
 
   function render() {
+    if (!DATA || !DATA.server) return;
     const s = DATA.server;
-    if (!s) return;
-    const card = document.getElementById("approval-card");
-    const subtitle = document.getElementById("subtitle");
-    const headerActions = document.getElementById("header-actions");
+    document.title = "PHAROS Approval Required";
+
+    const root = document.getElementById("approval-root");
+    const header = document.createElement("div");
+    header.className = "header";
+    const headerText = document.createElement("div");
+    headerText.className = "header-text";
+    const titleEl = document.createElement("div");
+    titleEl.className = "title";
+    titleEl.textContent = "Approval Required";
+    const subtitle = document.createElement("div");
+    subtitle.className = "subtitle";
+    subtitle.id = "subtitle";
+    headerText.appendChild(titleEl);
+    headerText.appendChild(subtitle);
+    const headerActions = document.createElement("div");
+    headerActions.className = "header-actions";
+    headerActions.id = "header-actions";
+    header.appendChild(headerText);
+    header.appendChild(headerActions);
+    const card = document.createElement("div");
+    card.className = "approval-card";
+    card.id = "approval-card";
+    root.appendChild(header);
+    root.appendChild(card);
     subtitle.textContent = "id: " + (s.id || DATA.server_id || "unknown");
 
     // Buttons in header (right-aligned, visible without scrolling)
@@ -1851,6 +1869,98 @@ def _cache_put(cache: dict, key: str, value: object) -> None:
         oldest = next(iter(cache))
         del cache[oldest]
 
+
+_KNOWN_INSTALL_RUNTIMES = frozenset({"npx", "uvx", "docker", "python", "binary"})
+_REMOTE_TRANSPORTS = frozenset({
+    "http+sse", "http-sse", "streamable-http", "http", "sse",
+})
+
+
+def _is_http_endpoint(raw: object) -> bool:
+    """True when *raw* is a usable http(s) MCP endpoint URL."""
+    if not isinstance(raw, str):
+        return False
+    value = raw.strip().lower()
+    return value.startswith("https://") or value.startswith("http://")
+
+
+def _card_str_field(card: object, *names: str) -> str:
+    """Return the first non-empty string (or joined list) attribute on *card*."""
+    for name in names:
+        value = getattr(card, name, None)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+        elif isinstance(value, (list, tuple)):
+            parts = [str(part).strip() for part in value if str(part).strip()]
+            if parts:
+                return " ".join(parts)
+    return ""
+
+
+def _card_transports(card: object) -> list[str]:
+    raw = getattr(card, "transport", None)
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw]
+    return []
+
+
+def _card_connectable(card: object | None) -> bool:
+    """True if *card* has enough data to launch without inventing a command.
+
+    Mirrors registry ``ManifestInstallable``: an http(s) endpoint, a
+    command/bin/stdio_command, or a known runtime paired with a package.
+    """
+    if card is None:
+        return False
+    if _is_http_endpoint(getattr(card, "endpoint", None)):
+        return True
+    if _card_str_field(card, "stdio_command", "command", "bin"):
+        return True
+    runtime = _card_str_field(card, "runtime").lower()
+    package = _card_str_field(card, "package")
+    return runtime in _KNOWN_INSTALL_RUNTIMES and bool(package)
+
+
+async def _resolve_server_card(
+    server_id: str,
+    *,
+    hydrate_if: Any = None,
+) -> tuple[Any, Exception | None]:
+    """Return a cached card, hydrating from the registry when needed.
+
+    Cache-first stays in place for connectable cards (emoji / space names
+    that 400 on ``/v1/packages/{name}``). Incomplete search cards — remote
+    with no endpoint, or stdio with no command — are refreshed from package
+    detail so install/info see the same fields as ``GET /v1/packages/{id}``.
+
+    *hydrate_if*, when set, is ``callable(card) -> bool`` that decides
+    whether a cached card should be refreshed. Default is
+    ``not _card_connectable(card)``.
+    """
+    card = _server_cards.get(server_id)
+    should_hydrate = hydrate_if if hydrate_if is not None else (
+        lambda cached: not _card_connectable(cached)
+    )
+    if card is not None and not should_hydrate(card):
+        return card, None
+
+    try:
+        fetched = await _get_client().get_server(server_id)
+    except Exception as exc:
+        return card, exc
+
+    if fetched is None:
+        return card, None
+
+    if _card_connectable(fetched) or card is None:
+        _server_cards[server_id] = fetched
+        return fetched, None
+    return card, None
+
 # Physical approval mode — when set, pharos_approve requires a UI-originated
 # token that the AI agent cannot generate. This prevents the AI from
 # auto-approving connections in end-user chatbot scenarios (scenario 3).
@@ -2137,30 +2247,18 @@ if not MCP_APPS_MODE:
             JSON with install status, version, and install path (stdio) or
             endpoint URL (remote).
         """
-        client = _get_client()
-
-        # Check transport from cached server card or fetch from registry
-        transport = None
-        endpoint = None
-        if server_id in _server_cards:
-            card = _server_cards[server_id]
-            transport = getattr(card, "transport", None)
-            endpoint = getattr(card, "endpoint", None)
-
-        # If we don't have the card cached, fetch it
-        if transport is None:
-            try:
-                card = await client.get_server(server_id)
-                transport = getattr(card, "transport", None)
-                endpoint = getattr(card, "endpoint", None)
-                _server_cards[server_id] = card
-            except Exception:
-                pass  # Fall through to CLI install attempt
+        # Cache-first when the card is already connectable (emoji/space names
+        # 400 on /v1/packages/{name}). Incomplete search cards are hydrated
+        # from package detail before we decide remote-vs-stdio.
+        card, _fetch_err = await _resolve_server_card(server_id)
+        transport = getattr(card, "transport", None) if card is not None else None
+        endpoint = getattr(card, "endpoint", None) if card is not None else None
 
         # Remote transport: register endpoint without CLI
-        remote_transports = ("sse", "streamable-http", "http", "http+sse")
-        if transport and any(t in remote_transports for t in transport):
-            transport_str = ", ".join(transport)
+        remote_transports = ("sse", "streamable-http", "http", "http+sse", "http-sse")
+        transports = _card_transports(card) if card is not None else []
+        if transport and any(t in remote_transports for t in transports):
+            transport_str = ", ".join(transports)
             if not endpoint:
                 return json.dumps({
                     "error": f"Server '{server_id}' has transport '{transport_str}' but no endpoint URL",
@@ -2561,19 +2659,15 @@ else:
             JSON with status, server_id, and an html field containing the
             rendered server detail card for the iframe.
         """
-        # Try cached card first (from a prior search), then fetch from registry
-        card = _server_cards.get(server_id)
+        # Cache-first when connectable; hydrate incomplete search cards
+        # so the details table shows the package-detail endpoint.
+        card, fetch_err = await _resolve_server_card(server_id)
         if card is None:
-            client = _get_client()
-            try:
-                card = await client.get_server(server_id)
-                _server_cards[server_id] = card
-            except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "error": f"Failed to get server info: {e}",
-                    "server_id": server_id,
-                })
+            return json.dumps({
+                "status": "error",
+                "error": f"Failed to get server info: {fetch_err}",
+                "server_id": server_id,
+            })
 
         server_data = {
             "id": str(card.id),
@@ -2619,7 +2713,7 @@ else:
         })
 
 
-    @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/approval"}})
+    @mcp.tool()
     async def pharos_install_apps(
         server_id: str,
         purpose: str = "User request",
@@ -2641,34 +2735,29 @@ else:
             Call pharos_check_approval with the approval_token to get the
             final result ("installed", "denied", "timeout", or "pending").
         """
-        # Try cached card first (from a prior search). Many registry servers
-        # have display names with spaces/emojis that cannot be looked up via
-        # /v1/packages/{name} (the registry rejects them with 400). The search
-        # endpoint works because the name is a query param, so the card from
-        # search is the only reliable source for these servers.
-        card = _server_cards.get(server_id)
+        # Cache-first when the card is already connectable (emoji/space
+        # names that 400 on /v1/packages/{name}). Incomplete search cards
+        # (remote + no endpoint, stdio + no command) are hydrated from
+        # package detail. Errors never advertise an approval UI.
+        card, fetch_err = await _resolve_server_card(server_id)
         if card is None:
-            client = _get_client()
-            try:
-                card = await client.get_server(server_id)
-                _server_cards[server_id] = card
-            except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "error": f"Cannot install: server '{server_id}' not found: {e}",
-                    "server_id": server_id,
-                })
+            return json.dumps({
+                "status": "error",
+                "error": f"Cannot install: server '{server_id}' not found: {fetch_err}",
+                "server_id": server_id,
+            })
 
-        # Determine endpoint from the card
+        # Determine endpoint from the (possibly hydrated) card
         endpoint = getattr(card, "endpoint", None)
 
         # Validate that the server is actually connectable before asking the
         # user to approve. For remote transports, an endpoint is required.
-        # For stdio, a stdio_command is required. If neither is available,
-        # there's nothing to connect to — don't show an approval card.
-        transports = list(card.transport) if card.transport else []
-        has_remote = any(t in ("http+sse", "streamable-http") for t in transports)
+        # For stdio, a stdio_command/command/bin is required. If neither is
+        # available, there's nothing to connect to — don't show an approval card.
+        transports = _card_transports(card)
+        has_remote = any(t in _REMOTE_TRANSPORTS for t in transports)
         has_stdio = "stdio" in transports
+        stdio_cmd = _card_str_field(card, "stdio_command", "command", "bin")
 
         if has_remote and not endpoint and not has_stdio:
             return json.dumps({
@@ -2680,7 +2769,7 @@ else:
                     f"different server."
                 ),
             })
-        if has_stdio and not getattr(card, "stdio_command", None) and not endpoint:
+        if has_stdio and not stdio_cmd and not endpoint:
             return json.dumps({
                 "status": "error",
                 "server_id": server_id,
@@ -4011,10 +4100,26 @@ async def pharos_list_clients() -> str:
 MCP_APP_MIME = "text/html;profile=mcp-app"
 
 
+# Neutral page for the static ui://pharos/approval URI when no pending
+# install exists. Hosts may fetch this URI on install *errors* because of
+# a leftover static decorator; it must not look like an approval card.
+_EMPTY_APPROVAL_HTML = (
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+    "<title>PHAROS</title></head><body></body></html>"
+)
+
+
 def approval_resource(token: str | None = None) -> str:
-    """Approval UI card (MCP Apps). *token* selects a specific install card."""
+    """Approval UI card (MCP Apps). *token* selects a specific install card.
+
+    Empty cache / missing server payload renders a neutral blank page so
+    hosts that still fetch the static ``ui://pharos/approval`` URI on
+    install errors do not show a fake approval shell.
+    """
     key = token or _current_approval_token
     data = _approval_data_cache.get(key, {}) if key else {}
+    if not isinstance(data, dict) or not data.get("server"):
+        return _EMPTY_APPROVAL_HTML
     return _inject_template(APPROVAL_APPS_TEMPLATE, data)
 
 

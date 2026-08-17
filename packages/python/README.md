@@ -77,8 +77,9 @@ unconditionally in both modes.
 
 ### Apps Mode (`PHAROS_MCP_APPS=true`)
 
-The 6 `_apps` variants return JSON with an `html` field containing a full
-HTML document for rendering in a sandboxed iframe by the MCP Apps host:
+The 6 `_apps` variants return compact JSON. HTML for the sandboxed iframe is served from MCP resources (`ui://pharos/results/{token}`, `ui://pharos/approval/{token}`, etc.) — not inlined in the tool result (that overflowed host context windows).
+
+Approve is **not** an MCP tool. `POST /approve` is a custom HTTP route. In LibreChat the iframe is sandboxed (`allow-scripts`, no same-origin) so the button `postMessage`s the host, which proxies the approve/deny call. The model never sees `approval_nonce`.
 
 | Tool | Description |
 |------|-------------|

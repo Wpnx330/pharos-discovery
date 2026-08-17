@@ -8,7 +8,7 @@ pip install pharos-mcp
 
 This gives you:
 
-1. **PHAROS MCP Server** — the `pharos-mcp` command starts an MCP server that exposes 5 tools: `pharos_search`, `pharos_install`, `pharos_connect`, `pharos_list_tools`, `pharos_call_tool`
+1. **PHAROS MCP Server** — `pharos-mcp` exposes search/install/list/call tools. Set `PHAROS_MCP_APPS=true` for iframe Apps mode (`pharos_search_apps`, `pharos_install_apps`, …). There is no `pharos_connect` / `pharos_approve` tool; approval is a physical click in the host UI.
 2. **PHAROS CLI** — the `pharos` CLI binary, bundled as package data
 3. **Auto-configuration** — post-install hook detects MCP clients (Cursor, Claude Desktop, VS Code) and configures them automatically
 

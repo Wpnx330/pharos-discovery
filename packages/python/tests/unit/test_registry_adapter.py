@@ -217,6 +217,23 @@ class TestLiveRegistryNormalization:
         )
         assert card.stdio_command == "npx -y @demo/weather"
 
+    def test_search_hit_with_endpoint_and_command(self):
+        """Live search JSON now includes install fields; they must map onto ServerCard."""
+        from pharos_discovery.adapters.registry import _normalize_to_server_card
+
+        card = _normalize_to_server_card(
+            _live_registry_item(
+                name="test-echo-server",
+                title="Test Echo Server",
+                transport=["http-sse"],
+                endpoint="http://host.docker.internal:8765",
+                command="npx -y @demo/echo",
+            ),
+            "https://getpharos.dev",
+        )
+        assert card.endpoint == "http://host.docker.internal:8765"
+        assert card.stdio_command == "npx -y @demo/echo"
+
     def test_extracts_manifest_bin_list(self):
         from pharos_discovery.adapters.registry import _normalize_to_server_card
 
