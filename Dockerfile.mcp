@@ -8,10 +8,38 @@ COPY packages/python/ ./
 # Install mcp SDK v1.x (FastMCP API), then the local package
 RUN pip install --no-cache-dir "mcp>=1.0,<2.0" && pip install --no-cache-dir -e .
 
+# Node + npx so Apps/no-Apps can install real mcp.io kind-3 (npx) packages.
+# Must run as root before USER 1000. Debian slim's nodejs is enough for `npx -y`.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version && npx --version
+
+# Bake today's Zeus host CLI (static ELF at ~/.local/bin/pharos).
+# Provided at build time via compose additional_contexts.pharos_bin
+# (directory containing the `pharos` binary). Not a multi-stage build
+# from pharos-cli: this host is air-gapped (no golang image) and the
+# in-tree `pharos-cli/pharos` binary is older and dynamically linked.
+# After T1 lands, replace ~/.local/bin/pharos then rebuild this image.
+COPY --from=pharos_bin /pharos /usr/local/bin/pharos
+RUN chmod 755 /usr/local/bin/pharos
+
+# Match Zeus host uid/gid (cwykel=1000) so the bind-mounted ~/.pharos
+# store is writable without chowning host files to root.
+RUN (getent group 1000 >/dev/null || groupadd --gid 1000 pharos) \
+    && (getent passwd 1000 >/dev/null || useradd --create-home --uid 1000 --gid 1000 --shell /usr/sbin/nologin pharos) \
+    && mkdir -p /home/pharos \
+    && chown 1000:1000 /home/pharos
+
+USER 1000:1000
+ENV HOME=/home/pharos
+ENV PHAROS_HOME=/home/pharos/.pharos
+ENV PHAROS_CLI=/usr/local/bin/pharos
+
 ENV PHAROS_MCP_TRANSPORT=streamable-http
 ENV PHAROS_MCP_HOST=0.0.0.0
 ENV PHAROS_MCP_PORT=8766
-ENV PHAROS_REGISTRY_URL=https://getpharos.dev
+ENV PHAROS_REGISTRY_URL=https://api.getpharos.dev
 
 EXPOSE 8766
 

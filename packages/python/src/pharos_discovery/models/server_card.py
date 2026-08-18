@@ -62,6 +62,7 @@ class ServerCard(BaseModel):
     transport: list[Literal["stdio", "http+sse", "streamable-http"]]
     endpoint: str | None = None
     stdio_command: str | None = None
+    install_kind: Literal[1, 2, 3] | None = None
     capabilities: list[str]
     tools_count: int
     tools_count_verified: bool = False

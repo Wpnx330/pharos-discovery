@@ -1,6 +1,6 @@
 {
   "name": "pharos-discovery-monorepo",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Discovery SDK for MCP servers — search, approve, connect",
   "license": "MIT",

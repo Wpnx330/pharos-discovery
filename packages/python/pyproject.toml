@@ -1,6 +1,6 @@
 [project]
 name = "pharos-discovery"
-version = "0.1.0"
+version = "1.0.0"
 description = "Discovery SDK for MCP servers — search, approve, connect"
 readme = "README.md"
 requires-python = ">=3.10"

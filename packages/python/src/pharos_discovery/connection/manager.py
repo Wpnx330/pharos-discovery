@@ -9,7 +9,14 @@ from typing import Any, Literal, Protocol
 import httpx
 
 from pharos_discovery.errors import ConnectionFailed, TransportError
+from pharos_discovery.install_kind import HTTP_TRANSPORTS, launch_command
 from pharos_discovery.models import ApprovalToken, ServerCard
+
+_HTTP_SSE_ALIASES = frozenset({"http+sse", "http-sse", "sse", "http"})
+_HTTP_URL_FIELDS = ("endpoint", "local_endpoint")
+_KIND2_NOT_READY = (
+    "Local HTTP endpoint is not ready. Start the local server first, then retry connect."
+)
 
 
 class MCPTransport(Protocol):
@@ -414,18 +421,86 @@ class ConnectionManager:
         return MCPConnection(transport, server_id)
 
     def _create_transport(self, card: ServerCard, token: ApprovalToken) -> MCPTransport:
-        """Create the appropriate transport based on server card."""
-        transports = card.transport
+        """Create the appropriate transport based on server card.
 
+        Kind 1: remote ``http(s)://`` ``card.endpoint``.
+        Kind 2: same HTTP transports against a resolved local URL
+        (``card.endpoint`` after start, or optional ``local_endpoint``).
+        Missing URL → :class:`ConnectionFailed` for T2b to catch — never
+        "publisher must provide endpoint."
+        Kind 3: stdio from ``stdio_command`` / ``command`` / ``bin`` /
+        runtime+package via :func:`launch_command`.
+        """
+        transports = _transport_names(card)
         if not transports:
             raise ConnectionFailed(card.id, "No transport types specified")
 
-        # Prefer streamable-http > http+sse > stdio
-        if "streamable-http" in transports and card.endpoint:
-            return StreamableHTTPTransport(card.endpoint, token)
-        if "http+sse" in transports and card.endpoint:
-            return HttpSSETransport(card.endpoint, token)
-        if "stdio" in transports and card.stdio_command:
-            return StdioTransport(card.stdio_command, token)
+        http_url = _resolved_http_url(card)
+        has_streamable = "streamable-http" in transports
+        has_http_sse = any(name in _HTTP_SSE_ALIASES for name in transports)
+        has_http = any(name in HTTP_TRANSPORTS for name in transports)
+
+        # Prefer streamable-http > http+sse (and aliases) when a URL is ready.
+        if has_streamable and http_url:
+            return StreamableHTTPTransport(http_url, token)
+        if has_http_sse and http_url:
+            return HttpSSETransport(http_url, token)
+
+        if "stdio" in transports:
+            command = _stdio_launch_line(card)
+            if command:
+                return StdioTransport(command, token)
+
+        # Kind 2 before T2b has started / written the local URL.
+        if has_http and not http_url:
+            raise ConnectionFailed(card.id, _KIND2_NOT_READY)
 
         raise ConnectionFailed(card.id, f"No usable transport from {transports}")
+
+
+def _transport_names(card: Any) -> list[str]:
+    raw = getattr(card, "transport", None)
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = []
+    return [str(item).strip().lower() for item in items if str(item).strip()]
+
+
+def _http_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    lowered = text.lower()
+    if lowered.startswith("https://") or lowered.startswith("http://"):
+        return text
+    return None
+
+
+def _resolved_http_url(card: Any) -> str | None:
+    """Publisher / after-start ``endpoint``, else optional ``local_endpoint``."""
+    for name in _HTTP_URL_FIELDS:
+        url = _http_url(getattr(card, name, None))
+        if url:
+            return url
+    return None
+
+
+def _stdio_launch_line(card: Any) -> str | None:
+    """stdio_command / command / bin / runtime+package — same as INSTALL_KINDS.
+
+    Uses :func:`launch_command` first, then getattr so duck-typed cards
+    (T2b MagicMock, SimpleNamespace) still map without ServerCard fields.
+    """
+    mapped = launch_command(card)
+    if mapped:
+        return mapped
+    return launch_command({
+        "stdio_command": getattr(card, "stdio_command", None),
+        "command": getattr(card, "command", None),
+        "bin": getattr(card, "bin", None),
+        "runtime": getattr(card, "runtime", None),
+        "package": getattr(card, "package", None),
+    })

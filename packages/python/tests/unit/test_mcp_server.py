@@ -962,40 +962,240 @@ class TestRemoteOnlyFilter:
             assert filters is None
 
 
+class TestSearchCliFilters:
+    """pharos_search must accept the same filters as `pharos search`."""
+
+    @pytest.mark.asyncio
+    async def test_search_forwards_transport_registry_and_page_cursor(self):
+        """transport=http-sse, registry=pharos, page=2 → cursor offset 10."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search(
+                "echo",
+                limit=10,
+                transport="http-sse",
+                registry="pharos",
+                page=2,
+            )
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is not None
+            assert filters.get("transport") == "http-sse"
+            assert filters.get("registry") == "pharos"
+            assert filters.get("cursor") == "MTA="
+            assert "page" not in filters
+
+    @pytest.mark.asyncio
+    async def test_search_empty_filters_omitted(self):
+        """Empty transport/registry and page=1 must not send unused params."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search(
+                "echo",
+                transport="",
+                registry="",
+                page=1,
+            )
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is None
+
+    @pytest.mark.asyncio
+    async def test_search_whitespace_filters_omitted(self):
+        """Whitespace-only transport/registry are treated as unset."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search("echo", transport="  ", registry="\t")
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters is None
+
+    @pytest.mark.asyncio
+    async def test_search_remote_only_not_replaced_by_transport(self):
+        """Explicit --transport wins; remote_only must not overwrite it."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            mock_client.search = AsyncMock(return_value=[])
+            mock_get.return_value = mock_client
+
+            await srv.pharos_search(
+                "echo",
+                remote_only=True,
+                transport="http-sse",
+            )
+
+            call_args = mock_client.search.call_args
+            filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+            assert filters["transport"] == "http-sse"
+
+    @pytest.mark.asyncio
+    async def test_search_includes_source_registry_and_transport(self):
+        """Each hit must expose catalog + transport the way the CLI table does."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            card = MagicMock()
+            card.id = "echo-http"
+            card.display_name = "Echo HTTP"
+            card.description = "HTTP-SSE echo"
+            card.version = "1.0.0"
+            card.transport = ["http+sse"]
+            card.publisher = None
+            card.capabilities = ["tools"]
+            card.tools_count = 1
+            card.endpoint = "https://example.com/sse"
+            card.source_registry = "pharos"
+            result_mock = MagicMock()
+            result_mock.card = card
+            result_mock.score = 0.9
+            result_mock.raw_item = {
+                "source_registry": "pharos",
+                "transport": ["http-sse"],
+            }
+            mock_client.search = AsyncMock(return_value=[result_mock])
+            mock_get.return_value = mock_client
+
+            result = await srv.pharos_search("echo", transport="http-sse")
+
+        data = json.loads(result)
+        assert data["results"][0]["transport"] == ["http+sse"]
+        assert data["results"][0]["source_registry"] == "pharos"
+
+    @pytest.mark.asyncio
+    async def test_search_includes_next_cursor_and_total(self):
+        """--json equivalent: surface nextCursor/total when the API returns them."""
+        with patch.object(srv, "_get_client") as mock_get:
+            mock_client = AsyncMock()
+            card = MagicMock()
+            card.id = "echo-http"
+            card.display_name = "Echo HTTP"
+            card.description = "echo"
+            card.version = "1.0.0"
+            card.transport = ["http+sse"]
+            card.publisher = None
+            card.capabilities = ["tools"]
+            card.tools_count = 1
+            card.endpoint = "https://example.com/sse"
+            card.source_registry = "pharos"
+            result_mock = MagicMock()
+            result_mock.card = card
+            result_mock.score = 0.9
+            result_mock.raw_item = {"source_registry": "pharos"}
+
+            page = srv.SearchResults(
+                [result_mock], next_cursor="MTA=", total=37
+            )
+            mock_client.search = AsyncMock(return_value=page)
+            mock_get.return_value = mock_client
+
+            result = await srv.pharos_search("echo", page=1, limit=10)
+
+        data = json.loads(result)
+        assert data["nextCursor"] == "MTA="
+        assert data["total"] == 37
+
+
 class TestInstallTransportGuard:
     """Tests for pharos_install transport-aware behavior."""
 
     @pytest.mark.asyncio
-    async def test_install_remote_sse_registers_without_cli(self):
-        """Installing an SSE server should register endpoint without CLI."""
+    async def test_install_remote_sse_shells_cli(self):
+        """Kind 1 SSE install shells ``pharos install`` so clients get {type,url}."""
         card = MagicMock()
         card.transport = ["http+sse"]
         card.endpoint = "https://example.com/sse"
+        card.version = "1.0.0"
         srv._server_cards["remote-srv"] = card
 
-        with patch.object(srv, "_get_pharos_cli", return_value="pharos") as mock_cli:
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"installed", b""))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             result = await srv.pharos_install("remote-srv")
-            data = json.loads(result)
+        data = json.loads(result)
 
-            assert data["status"] == "registered"
-            assert data["transport"] == ["http+sse"]
-            assert data["endpoint"] == "https://example.com/sse"
-            mock_cli.assert_not_called()
+        assert data["status"] == "installed"
+        assert data["install_kind"] == 1
+        assert "start" not in data
+        install_args = mock_exec.call_args_list[0].args
+        assert "install" in install_args
+        assert not any("start" in call.args for call in mock_exec.call_args_list)
+        stored = srv._installed_servers["remote-srv"]
+        assert stored["endpoint"] == "https://example.com/sse"
+        assert stored["source"] == "cli"
 
     @pytest.mark.asyncio
-    async def test_install_remote_streamable_http_registers_without_cli(self):
-        """Installing a streamable-http server should register endpoint without CLI."""
+    async def test_install_remote_streamable_http_shells_cli(self):
+        """Kind 1 streamable-http install shells ``pharos install``."""
         card = MagicMock()
         card.transport = ["streamable-http"]
         card.endpoint = "https://example.com/mcp"
+        card.version = "1.0.0"
         srv._server_cards["remote-http"] = card
 
-        result = await srv.pharos_install("remote-http")
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await srv.pharos_install("remote-http")
+        data = json.loads(result)
+
+        assert data["status"] == "installed"
+        assert data["install_kind"] == 1
+        assert "install" in mock_exec.call_args_list[0].args
+        assert not any("start" in call.args for call in mock_exec.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_install_kind1_missing_cli_falls_back_to_registered(self):
+        """FileNotFoundError for kind 1 keeps the in-memory register fallback."""
+        card = MagicMock()
+        card.transport = ["streamable-http"]
+        card.endpoint = "https://example.com/mcp"
+        card.display_name = "Remote HTTP"
+        card.version = "1.0.0"
+        srv._server_cards["remote-http"] = card
+
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_install("remote-http")
         data = json.loads(result)
 
         assert data["status"] == "registered"
         assert data["transport"] == ["streamable-http"]
         assert data["endpoint"] == "https://example.com/mcp"
+        assert data["install_kind"] == 1
+        assert srv._installed_servers["remote-http"]["source"] == "mcp_registered"
+
+    @pytest.mark.asyncio
+    async def test_install_kind1_cli_nonzero_returns_error(self):
+        """Kind 1 must not pretend registered when ``pharos install`` fails."""
+        card = MagicMock()
+        card.transport = ["streamable-http"]
+        card.endpoint = "https://example.com/mcp"
+        card.version = "1.0.0"
+        srv._server_cards["remote-http"] = card
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"registry 500"))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await srv.pharos_install("remote-http")
+        data = json.loads(result)
+
+        assert "error" in data
+        assert data["status"] != "registered" if "status" in data else True
+        assert data["stderr"] == "registry 500"
+        assert "remote-http" not in srv._installed_servers
 
     @pytest.mark.asyncio
     async def test_install_remote_no_endpoint_returns_error(self):
@@ -1465,6 +1665,31 @@ class TestAppsModeTools:
         assert "name" in data["results"][0]
         assert "version" in data["results"][0]
         assert "description" not in data["results"][0]
+        assert data["results"][0]["transport"] == ["http+sse"]
+        assert data["results"][0]["source_registry"] == "pharos"
+
+    @pytest.mark.asyncio
+    async def test_search_apps_forwards_transport_registry_and_page_cursor(
+        self, _apps_mode_module, mock_client_apps
+    ):
+        """Apps search accepts the same CLI filters and maps page → cursor."""
+        apps_srv = _apps_mode_module
+        apps_srv._server_cards.clear()
+        apps_srv._search_results_cache.clear()
+        with patch.object(apps_srv, "_get_client", return_value=mock_client_apps):
+            await apps_srv.pharos_search_apps(
+                "echo",
+                limit=10,
+                transport="http-sse",
+                registry="pharos",
+                page=2,
+            )
+        call_args = mock_client_apps.search.call_args
+        filters = call_args.kwargs.get("filters") or call_args[1].get("filters")
+        assert filters["transport"] == "http-sse"
+        assert filters["registry"] == "pharos"
+        assert filters["cursor"] == "MTA="
+        assert "page" not in filters
 
     @pytest.mark.asyncio
     async def test_info_apps_returns_html(self, _apps_mode_module, mock_client_apps):
@@ -2850,9 +3075,7 @@ class TestPharosStartAlreadyRunning:
 
 
 class TestApproveBinOnlyServerError:
-    """Bug 3: /approve should return a clear error for servers that have a
-    `bin` field but no endpoint (cannot be started from source in this env).
-    """
+    """Kind 2/3 with bin/command must not use the publisher-endpoint error."""
 
     def _make_request(self, body: dict) -> Any:
         request = AsyncMock()
@@ -2861,7 +3084,7 @@ class TestApproveBinOnlyServerError:
 
     @pytest.mark.asyncio
     async def test_approve_bin_only_server_returns_clear_error(self):
-        """A server with bin but no endpoint should get a clear error message."""
+        """Kind 3 (stdio + bin, no endpoint) is not a publisher-endpoint error."""
         card = MagicMock()
         card.id = "bin-server"
         card.display_name = "Bin Server"
@@ -2875,6 +3098,9 @@ class TestApproveBinOnlyServerError:
         card.endpoint = None
         card.stdio_command = None
         card.bin = "python server.py"
+        card.command = None
+        card.runtime = None
+        card.package = None
 
         srv._server_cards["bin-server"] = card
         srv._pending_connections.clear()
@@ -2887,12 +3113,19 @@ class TestApproveBinOnlyServerError:
         assert token is not None
 
         request = self._make_request({"approval_token": token, "approval_nonce": ""})
-        response = await srv.approve_endpoint(request)
+        with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+            mock_mgr = AsyncMock()
+            mock_connection = AsyncMock()
+            mock_mgr.connect = AsyncMock(return_value=mock_connection)
+            MockMgr.return_value = mock_mgr
+            with patch.object(srv, "_list_server_tools", return_value=[]):
+                response = await srv.approve_endpoint(request)
         body = json.loads(response.body)
-        assert "error" in body
-        assert "no endpoint" in body["error"].lower()
-        assert "publisher must provide" in body["error"].lower()
-        assert body["server_id"] == "bin-server"
+        err = (body.get("error") or "").lower()
+        assert "publisher must provide" not in err
+        assert body.get("status") == "connected" or (
+            "start" in err and "publisher" not in err
+        )
 
     @pytest.mark.asyncio
     async def test_approve_no_endpoint_no_bin_returns_error(self):
@@ -2985,3 +3218,496 @@ class TestMCPConnectionDisconnect:
 
         await mcp_conn.close()
         fake_transport.disconnect.assert_awaited_once()
+
+
+# ─── T2b: kind dispatch + list unification ────────────────────────────────────
+
+def _kind_card(**fields: Any) -> MagicMock:
+    """ServerCard-shaped mock with real scalars (not nested MagicMocks)."""
+    card = MagicMock()
+    defaults = {
+        "id": "kind-server",
+        "display_name": "Kind Server",
+        "description": "kind fixture",
+        "version": "1.0.0",
+        "transport": ["stdio"],
+        "publisher": MagicMock(),
+        "tools_count": 1,
+        "capabilities": ["tools"],
+        "endpoint": None,
+        "stdio_command": None,
+        "command": None,
+        "bin": None,
+        "runtime": None,
+        "package": None,
+        "tags": [],
+        "pricing": None,
+        "documentation_url": None,
+        "source_registry": "pharos",
+    }
+    defaults.update(fields)
+    for key, value in defaults.items():
+        setattr(card, key, value)
+    card.publisher.name = "test-pub"
+    card.publisher.verified = True
+    return card
+
+
+class TestKind2InstallNoEndpoint:
+    """F3: http-sse + bin, no endpoint is Kind 2 — CLI install, not an error."""
+
+    def _no_registry(self):
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(side_effect=Exception("not found"))
+        return patch.object(srv, "_get_client", return_value=mock_client)
+
+    @pytest.mark.asyncio
+    async def test_install_kind2_no_endpoint_uses_cli(self):
+        card = _kind_card(
+            id="test-echo-server",
+            version="0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        srv._server_cards["test-echo-server"] = card
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"installed", b""))
+        with self._no_registry(), patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            result = await srv.pharos_install("test-echo-server")
+        data = json.loads(result)
+        assert "error" not in data or "no endpoint" not in data.get("error", "").lower()
+        assert data.get("status") in {"installed", "ok"}
+        assert "publisher must provide" not in json.dumps(data).lower()
+        calls = [call.args for call in mock_exec.call_args_list]
+        assert any("install" in args for args in calls)
+        assert any(
+            "test-echo-server@0.2.4" in args or "test-echo-server" in args
+            for args in calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_install_kind2_name_at_version_passed_as_single_arg(self):
+        card = _kind_card(
+            id="test-echo-server",
+            version="0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        srv._server_cards["test-echo-server"] = card
+        srv._server_cards["test-echo-server@0.2.4"] = card
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"installed", b""))
+        with self._no_registry(), patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            result = await srv.pharos_install("test-echo-server@0.2.4")
+        data = json.loads(result)
+        assert data.get("status") in {"installed", "ok"}
+        install_args = mock_exec.call_args_list[0].args
+        assert "test-echo-server@0.2.4" in install_args
+        assert "sh" not in install_args
+
+    @pytest.mark.asyncio
+    async def test_install_kind2_then_start(self):
+        card = _kind_card(
+            id="test-echo-server",
+            version="0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="python server.py",
+        )
+        srv._server_cards["test-echo-server"] = card
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        with self._no_registry(), patch(
+            "asyncio.create_subprocess_exec", return_value=mock_proc
+        ) as mock_exec:
+            await srv.pharos_install("test-echo-server")
+        verbs = []
+        for call in mock_exec.call_args_list:
+            if "install" in call.args:
+                verbs.append("install")
+            if "start" in call.args:
+                verbs.append("start")
+        assert verbs[:2] == ["install", "start"]
+
+
+class TestRemoteOnlyBlocksKinds:
+    """PHAROS_REMOTE_ONLY refuses kinds 2/3 and does not show an approval card."""
+
+    @pytest.mark.asyncio
+    async def test_install_remote_only_blocks_kind2(self, monkeypatch):
+        monkeypatch.setenv("PHAROS_REMOTE_ONLY", "true")
+        card = _kind_card(
+            id="test-echo-server",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        srv._server_cards["test-echo-server"] = card
+        result = await srv.pharos_install("test-echo-server")
+        data = json.loads(result)
+        assert "error" in data
+        assert "test-echo-server" not in srv._installed_servers
+
+    @pytest.mark.asyncio
+    async def test_install_remote_only_blocks_kind3(self, monkeypatch):
+        monkeypatch.setenv("PHAROS_REMOTE_ONLY", "1")
+        card = _kind_card(
+            id="ev4nv-models",
+            transport=["stdio"],
+            endpoint=None,
+            bin="./mcp-server",
+        )
+        srv._server_cards["ev4nv-models"] = card
+        result = await srv.pharos_install("ev4nv-models")
+        data = json.loads(result)
+        assert "error" in data
+        assert "ev4nv-models" not in srv._installed_servers
+
+    @pytest.mark.asyncio
+    async def test_install_remote_only_allows_kind1(self, monkeypatch):
+        monkeypatch.setenv("PHAROS_REMOTE_ONLY", "yes")
+        card = _kind_card(
+            id="com.invokera/world-time",
+            transport=["streamable-http"],
+            endpoint="https://world-time.example/mcp",
+        )
+        srv._server_cards["com.invokera/world-time"] = card
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"installed", b""))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await srv.pharos_install("com.invokera/world-time")
+        data = json.loads(result)
+        assert data["status"] == "installed"
+        assert data["install_kind"] == 1
+        assert "install" in mock_exec.call_args_list[0].args
+        assert any(
+            "com.invokera/world-time" in args or "com.invokera/world-time@1.0.0" in args
+            for args in (call.args for call in mock_exec.call_args_list)
+        )
+        assert not any("start" in call.args for call in mock_exec.call_args_list)
+        assert srv._installed_servers["com.invokera/world-time"]["endpoint"] == (
+            "https://world-time.example/mcp"
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_remote_only_env_requires_endpoint(self, monkeypatch):
+        monkeypatch.setenv("PHAROS_REMOTE_ONLY", "true")
+        remote = MagicMock()
+        remote.card = _kind_card(
+            id="world-time",
+            display_name="World Time",
+            transport=["streamable-http"],
+            endpoint="https://world-time.example/mcp",
+        )
+        local = MagicMock()
+        local.card = _kind_card(
+            id="test-echo-server",
+            display_name="Echo 0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        mock_client = AsyncMock()
+        mock_client.search = AsyncMock(return_value=[remote, local])
+        with patch.object(srv, "_get_client", return_value=mock_client):
+            result = await srv.pharos_search("echo")
+        data = json.loads(result)
+        ids = [row["id"] for row in data["results"]]
+        assert "world-time" in ids
+        assert "test-echo-server" not in ids
+
+
+class TestListStatusUnification:
+    """Do not hardcode registered; kind 1 live session is connected."""
+
+    @pytest.mark.asyncio
+    async def test_list_kind1_live_session_is_connected(self):
+        srv._installed_servers["world-time"] = {
+            "transport": ["streamable-http"],
+            "endpoint": "https://world-time.example/mcp",
+            "install_kind": 1,
+            "installed_at": "2026-08-17T00:00:00Z",
+            "name": "World Time",
+        }
+        srv._connections["world-time"] = MagicMock()
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_list()
+        data = json.loads(result)
+        row = next(r for r in data["installed"] if r["server_id"] == "world-time")
+        assert row["status"] == "connected"
+        assert row["endpoint"] == "https://world-time.example/mcp"
+        assert row["port"] == "—"
+        assert row["size"] == "—"
+        assert row["memory"] == "—"
+        assert row["uptime"] == "—"
+        assert row["status"] != "running"
+
+    @pytest.mark.asyncio
+    async def test_list_kind1_without_session_is_registered(self):
+        srv._installed_servers["world-time"] = {
+            "transport": ["streamable-http"],
+            "endpoint": "https://world-time.example/mcp",
+            "install_kind": 1,
+        }
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await srv.pharos_list()
+        data = json.loads(result)
+        row = next(r for r in data["installed"] if r["server_id"] == "world-time")
+        assert row["status"] == "registered"
+        assert row["status"] != "running"
+
+    @pytest.mark.asyncio
+    async def test_list_merges_cli_kind2_metrics(self):
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(
+            json.dumps([{
+                "name": "test-echo-server",
+                "version": "0.2.4",
+                "transport": "http-sse",
+                "kind": 2,
+                "status": "running",
+                "port": "8765",
+                "size": "2.0 KiB",
+                "memory": "4.0 KiB",
+                "uptime": "12s",
+            }]).encode(),
+            b"",
+        ))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await srv.pharos_list()
+        data = json.loads(result)
+        row = next(r for r in data["installed"] if r["server_id"] == "test-echo-server")
+        assert row["status"] == "running"
+        assert row["port"] == "8765"
+        assert row["size"] == "2.0 KiB"
+        assert row["memory"] == "4.0 KiB"
+        assert row["uptime"] == "12s"
+        assert row.get("kind") == 2
+
+    @pytest.mark.asyncio
+    async def test_list_kind3_idle_unless_child(self):
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(
+            json.dumps([{
+                "name": "ev4nv-models",
+                "version": "1.0.0",
+                "transport": "stdio",
+                "kind": 3,
+                "status": "idle",
+                "port": "—",
+                "size": "—",
+                "memory": "—",
+                "uptime": "—",
+            }]).encode(),
+            b"",
+        ))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await srv.pharos_list()
+        data = json.loads(result)
+        row = next(r for r in data["installed"] if r["server_id"] == "ev4nv-models")
+        assert row["status"] == "idle"
+        assert row["port"] == "—"
+
+    @pytest.mark.asyncio
+    async def test_list_never_fakes_running_for_kind1_cli_row(self):
+        srv._installed_servers["world-time"] = {
+            "transport": ["streamable-http"],
+            "endpoint": "https://world-time.example/mcp",
+            "install_kind": 1,
+        }
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(
+            json.dumps([{
+                "name": "world-time",
+                "transport": "streamable-http",
+                "kind": 1,
+                "status": "running",
+                "endpoint": "https://world-time.example/mcp",
+                "port": "443",
+                "size": "99",
+                "memory": "99",
+                "uptime": "1h",
+            }]).encode(),
+            b"",
+        ))
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await srv.pharos_list()
+        data = json.loads(result)
+        row = next(r for r in data["installed"] if r["server_id"] == "world-time")
+        assert row["status"] == "registered"
+        assert row["port"] == "—"
+        assert row["memory"] == "—"
+        assert row["uptime"] == "—"
+
+
+class TestApproveKind2NoEndpoint:
+    """/approve for Kind 2 starts then connects; never 'publisher must provide'."""
+
+    def _make_request(self, body: dict) -> Any:
+        request = AsyncMock()
+        request.json = AsyncMock(return_value=body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_approve_kind2_starts_then_connects(self):
+        card = _kind_card(
+            id="test-echo-server",
+            version="0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="python server.py --port 8765",
+        )
+        srv._server_cards["test-echo-server"] = card
+        srv._connections.clear()
+        srv._pending_connections.clear()
+        token = srv._create_pending_connection(
+            card=card,
+            server_id="test-echo-server",
+            endpoint=None,
+            purpose="test",
+        )
+        start_proc = AsyncMock()
+        start_proc.returncode = 0
+        start_proc.communicate = AsyncMock(
+            return_value=(b'{"endpoint": "http://127.0.0.1:8765"}', b"")
+        )
+        with patch("asyncio.create_subprocess_exec", return_value=start_proc) as mock_exec:
+            with patch("pharos_discovery.mcp_server.server.ConnectionManager") as MockMgr:
+                mock_mgr = AsyncMock()
+                mock_connection = AsyncMock()
+                mock_mgr.connect = AsyncMock(return_value=mock_connection)
+                MockMgr.return_value = mock_mgr
+                with patch.object(srv, "_list_server_tools", return_value=[{"name": "echo"}]):
+                    response = await srv.approve_endpoint(
+                        self._make_request({"approval_token": token, "approval_nonce": ""})
+                    )
+        body = json.loads(response.body)
+        assert "publisher must provide" not in json.dumps(body).lower()
+        assert body.get("status") == "connected"
+        assert any("start" in call.args for call in mock_exec.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_approve_kind2_missing_endpoint_is_start_first(self):
+        card = _kind_card(
+            id="test-echo-server",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="python server.py",
+        )
+        srv._pending_connections.clear()
+        token = srv._create_pending_connection(
+            card=card,
+            server_id="test-echo-server",
+            endpoint=None,
+            purpose="test",
+        )
+        start_proc = AsyncMock()
+        start_proc.returncode = 0
+        start_proc.communicate = AsyncMock(return_value=(b"started", b""))
+        with patch("asyncio.create_subprocess_exec", return_value=start_proc):
+            with patch.object(srv, "_resolve_local_endpoint", return_value=None):
+                response = await srv.approve_endpoint(
+                    self._make_request({"approval_token": token, "approval_nonce": ""})
+                )
+        body = json.loads(response.body)
+        assert "error" in body
+        assert "publisher must provide" not in body["error"].lower()
+        assert "start" in body["error"].lower()
+
+
+class TestInstallAppsKindDispatch:
+    """Apps-mode install: kind 2 gets an approval card; remote-only does not."""
+
+    @pytest.fixture
+    def apps_srv(self):
+        import importlib
+        import pharos_discovery.mcp_server.server as _srv_mod
+
+        saved = os.environ.get("PHAROS_MCP_APPS", "")
+        os.environ["PHAROS_MCP_APPS"] = "true"
+        try:
+            mod = importlib.reload(_srv_mod)
+            yield mod
+        finally:
+            os.environ.pop("PHAROS_MCP_APPS", None)
+            if saved:
+                os.environ["PHAROS_MCP_APPS"] = saved
+            importlib.reload(_srv_mod)
+
+    @pytest.mark.asyncio
+    async def test_install_apps_kind2_no_endpoint_shows_approval(self, apps_srv):
+        card = _kind_card(
+            id="test-echo-server",
+            version="0.2.4",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        apps_srv._server_cards["test-echo-server"] = card
+        apps_srv._pending_connections.clear()
+        apps_srv._approval_results.clear()
+        mock_client = AsyncMock()
+        mock_client.get_server = AsyncMock(
+            side_effect=AssertionError("cache hit — kind 2 is already connectable")
+        )
+        with patch.object(apps_srv, "_get_client", return_value=mock_client):
+            result = await apps_srv.pharos_install_apps("test-echo-server")
+        data = json.loads(result)
+        assert data["status"] == "pending_approval"
+        assert "approval_token" in data
+        assert "approval_nonce" not in data
+
+    @pytest.mark.asyncio
+    async def test_install_apps_remote_only_blocks_kind2_no_card(
+        self, apps_srv, monkeypatch
+    ):
+        monkeypatch.setenv("PHAROS_REMOTE_ONLY", "true")
+        card = _kind_card(
+            id="test-echo-server",
+            transport=["http-sse"],
+            endpoint=None,
+            bin="npx -y test-echo-server",
+        )
+        apps_srv._server_cards["test-echo-server"] = card
+        apps_srv._pending_connections.clear()
+        result = await apps_srv.pharos_install_apps("test-echo-server")
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert "approval_token" not in data
+        assert "ui_resource_uri" not in data
+        assert len(apps_srv._pending_connections) == 0
+
+    @pytest.mark.asyncio
+    async def test_list_apps_connected_not_hardcoded_registered(self, apps_srv):
+        apps_srv._installed_servers["world-time"] = {
+            "transport": ["streamable-http"],
+            "endpoint": "https://world-time.example/mcp",
+            "install_kind": 1,
+            "name": "World Time",
+            "installed_at": "2026-08-17T00:00:00Z",
+        }
+        apps_srv._connections["world-time"] = MagicMock()
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
+            result = await apps_srv.pharos_list_apps()
+        data = json.loads(result)
+        row = next(s for s in data["servers"] if s.get("id") == "world-time")
+        assert row["status"] == "connected"
+        html = apps_srv.installed_resource(data["ui_resource_uri"].rsplit("/", 1)[-1])
+        assert "Endpoint" in html
+        assert "PORT" in html.upper() or "Port" in html

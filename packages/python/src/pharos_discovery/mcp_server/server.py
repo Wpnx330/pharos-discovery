@@ -26,6 +26,7 @@ iframe UI. It is NOT exposed as an MCP tool — the AI cannot see or call it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -42,6 +43,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Resource, TextResourceContents
 
 from pharos_discovery.client import PharosClient
+from pharos_discovery.adapters.registry import SearchResults
 from pharos_discovery.models import ServerCard, ApprovalRequest, ApprovalResponse, ApprovalToken
 from pharos_discovery.connection.manager import ConnectionManager, MCPConnection
 from pharos_discovery.errors import (
@@ -50,6 +52,11 @@ from pharos_discovery.errors import (
     ApprovalDenied,
     ConnectionFailed,
     HeadlessApprovalRequired,
+)
+from pharos_discovery.install_kind import (
+    classify_install_kind,
+    remote_only_blocks,
+    launch_command,
 )
 
 # ─── Mode Detection ────────────────────────────────────────────────────────────
@@ -1540,8 +1547,13 @@ INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
         <th>Server ID</th>
         <th>Status</th>
         <th>Transport</th>
+        <th>Endpoint</th>
         <th>Source</th>
         <th>Installed</th>
+        <th>Port</th>
+        <th>Size</th>
+        <th>Memory</th>
+        <th>Uptime</th>
         <th></th>
       </tr>
     </thead>
@@ -1566,6 +1578,11 @@ INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
       return;
     }
 
+    function dash(v) {
+      if (v === null || v === undefined || v === "") return "—";
+      return String(v);
+    }
+
     tbody.innerHTML = "";
     servers.forEach((s) => {
       const tr = document.createElement("tr");
@@ -1577,8 +1594,9 @@ INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
 
       const cellStatus = document.createElement("td");
       const status = (s.status || "unknown").toLowerCase();
+      const live = status === "running" || status === "connected";
       const dot = document.createElement("span");
-      dot.className = "status-dot status-" + (status === "running" ? "running" : status === "error" ? "error" : "stopped");
+      dot.className = "status-dot status-" + (live ? "running" : status === "error" ? "error" : "stopped");
       cellStatus.appendChild(dot);
       cellStatus.appendChild(document.createTextNode(s.status || "unknown"));
       tr.appendChild(cellStatus);
@@ -1589,6 +1607,11 @@ INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
       cellTr.textContent = transport;
       tr.appendChild(cellTr);
 
+      const cellEp = document.createElement("td");
+      cellEp.className = "mono";
+      cellEp.textContent = dash(s.endpoint);
+      tr.appendChild(cellEp);
+
       const cellSrc = document.createElement("td");
       cellSrc.textContent = s.source || "unknown";
       tr.appendChild(cellSrc);
@@ -1596,8 +1619,15 @@ INSTALLED_APPS_TEMPLATE = """<!DOCTYPE html>
       const cellDate = document.createElement("td");
       cellDate.className = "mono";
       const installed = s.installed_at || "";
-      cellDate.textContent = installed ? installed.substring(0, 19).replace("T", " ") : "N/A";
+      cellDate.textContent = installed ? installed.substring(0, 19).replace("T", " ") : "—";
       tr.appendChild(cellDate);
+
+      for (const key of ["port", "size", "memory", "uptime"]) {
+        const cell = document.createElement("td");
+        cell.className = "mono";
+        cell.textContent = dash(s[key]);
+        tr.appendChild(cell);
+      }
 
       const cellAction = document.createElement("td");
       const removeLink = document.createElement("a");
@@ -1841,6 +1871,81 @@ _current_publish_token: str | None = None  # most recent publish token
 _MAX_CACHE_SIZE = 20
 
 
+def _encode_search_cursor(offset: int) -> str:
+    """Encode an integer offset as the live registry's opaque cursor.
+
+    Must match CLI ``encodeCursor``: base64.StdEncoding of the decimal offset.
+    """
+    return base64.b64encode(str(offset).encode("ascii")).decode("ascii")
+
+
+def _page_cursor(page: int, limit: int) -> str:
+    """Map 1-based page to a cursor. Page <= 1 (or non-positive offset) omits it."""
+    if page <= 1 or limit <= 0:
+        return ""
+    offset = (page - 1) * limit
+    if offset <= 0:
+        return ""
+    return _encode_search_cursor(offset)
+
+
+def _search_filters(
+    *,
+    remote_only: bool = False,
+    transport: str = "",
+    registry: str = "",
+    page: int = 1,
+    limit: int = 10,
+) -> dict[str, Any] | None:
+    """Build GET /v1/search filters matching the CLI flags.
+
+    Empty / whitespace transport and registry are omitted. ``page`` becomes
+    ``cursor`` (never ``page=``, which the live API ignores). Explicit
+    ``transport`` is not replaced by ``remote_only``; remote_only only
+    supplies the remote transport list when transport is unset.
+    """
+    filters: dict[str, Any] = {}
+    transport = (transport or "").strip()
+    registry = (registry or "").strip()
+    if transport:
+        filters["transport"] = transport
+    elif remote_only:
+        filters["transport"] = ["sse", "streamable-http", "http"]
+    if registry:
+        filters["registry"] = registry
+    cursor = _page_cursor(page, limit)
+    if cursor:
+        filters["cursor"] = cursor
+    return filters or None
+
+
+def _result_source_registry(result: Any) -> str | None:
+    raw = getattr(result, "raw_item", None) or {}
+    if isinstance(raw, dict):
+        raw_src = raw.get("source_registry")
+        if isinstance(raw_src, str) and raw_src:
+            return raw_src
+    card = getattr(result, "card", None)
+    if card is None:
+        return None
+    source = getattr(card, "source_registry", None)
+    if isinstance(source, str) and source:
+        return source
+    return None
+
+
+def _search_page_meta(results: Any) -> dict[str, Any]:
+    """Include nextCursor/total when the adapter/API returned them."""
+    meta: dict[str, Any] = {}
+    next_cursor = getattr(results, "next_cursor", None)
+    if isinstance(next_cursor, str) and next_cursor:
+        meta["nextCursor"] = next_cursor
+    total = getattr(results, "total", None)
+    if isinstance(total, int):
+        meta["total"] = total
+    return meta
+
+
 def _new_ui_token(prefix: str) -> str:
     """URL-safe per-call token used in ui:// resource URIs."""
     return f"{prefix}-{int(time.time())}-{os.urandom(8).hex()}"
@@ -1868,12 +1973,6 @@ def _cache_put(cache: dict, key: str, value: object) -> None:
     if len(cache) > _MAX_CACHE_SIZE:
         oldest = next(iter(cache))
         del cache[oldest]
-
-
-_KNOWN_INSTALL_RUNTIMES = frozenset({"npx", "uvx", "docker", "python", "binary"})
-_REMOTE_TRANSPORTS = frozenset({
-    "http+sse", "http-sse", "streamable-http", "http", "sse",
-})
 
 
 def _is_http_endpoint(raw: object) -> bool:
@@ -1908,21 +2007,437 @@ def _card_transports(card: object) -> list[str]:
     return []
 
 
-def _card_connectable(card: object | None) -> bool:
-    """True if *card* has enough data to launch without inventing a command.
-
-    Mirrors registry ``ManifestInstallable``: an http(s) endpoint, a
-    command/bin/stdio_command, or a known runtime paired with a package.
-    """
+def _card_kind_input(card: object | None) -> dict[str, Any]:
+    """Build a plain dict for ``classify_install_kind`` (MagicMock-safe)."""
     if card is None:
-        return False
-    if _is_http_endpoint(getattr(card, "endpoint", None)):
-        return True
-    if _card_str_field(card, "stdio_command", "command", "bin"):
-        return True
-    runtime = _card_str_field(card, "runtime").lower()
-    package = _card_str_field(card, "package")
-    return runtime in _KNOWN_INSTALL_RUNTIMES and bool(package)
+        return {}
+    if isinstance(card, dict):
+        return card
+    data: dict[str, Any] = {}
+    for name in (
+        "endpoint", "transport", "transports",
+        "command", "bin", "stdio_command", "runtime", "package",
+    ):
+        value = getattr(card, name, None)
+        if value in (None, "", [], ()):
+            continue
+        if type(value).__name__ in {"MagicMock", "AsyncMock"}:
+            continue
+        data[name] = value
+    return data
+
+
+def _install_kind(card: object | None) -> int | None:
+    """Classify via T2a — do not reimplement kind rules here."""
+    return classify_install_kind(_card_kind_input(card))
+
+
+def _card_connectable(card: object | None) -> bool:
+    """True if *card* classifies as kind 1, 2, or 3."""
+    return _install_kind(card) is not None
+
+
+def _split_name_version(server_id: str) -> tuple[str, str | None]:
+    """Split ``name@version``. Last ``@`` wins so scoped names stay intact."""
+    if not server_id or "@" not in server_id:
+        return server_id, None
+    name, _, version = server_id.rpartition("@")
+    if not name or not version:
+        return server_id, None
+    return name, version
+
+
+def _cli_install_target(server_id: str, card: object | None) -> str:
+    """Single argv for ``pharos install`` — allow ``name@version``."""
+    name, version = _split_name_version(server_id)
+    if version:
+        return f"{name}@{version}"
+    card_version = _card_str_field(card, "version") if card is not None else ""
+    if card_version:
+        return f"{server_id}@{card_version}"
+    return server_id
+
+
+def _canonical_server_id(server_id: str) -> str:
+    name, _ = _split_name_version(server_id)
+    return name or server_id
+
+
+def _remote_only_env() -> bool:
+    return os.environ.get("PHAROS_REMOTE_ONLY", "").strip().lower() in {
+        "true", "1", "yes",
+    }
+
+
+def _remote_only_error(server_id: str) -> dict[str, str]:
+    return {
+        "status": "error",
+        "error": (
+            f"Server '{server_id}' requires a local install (kind 2/3), "
+            "which is not available when PHAROS_REMOTE_ONLY is set."
+        ),
+        "server_id": server_id,
+    }
+
+
+_LIST_DASH = "—"
+
+
+def _list_cell(value: object) -> str:
+    if value in (None, "", [], ()):
+        return _LIST_DASH
+    text = str(value).strip()
+    return text if text else _LIST_DASH
+
+
+def _kind1_list_status(server_id: str) -> str:
+    return "connected" if server_id in _connections else "registered"
+
+
+def _apply_kind1_list_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    """Kind 1 never fakes running; SIZE/MEMORY/UPTIME/PORT are em-dashes."""
+    row["status"] = _kind1_list_status(row["server_id"])
+    row["port"] = _LIST_DASH
+    row["size"] = _LIST_DASH
+    row["memory"] = _LIST_DASH
+    row["uptime"] = _LIST_DASH
+    return row
+
+
+def _blank_list_row(server_id: str) -> dict[str, Any]:
+    return {
+        "server_id": server_id,
+        "name": server_id,
+        "version": _LIST_DASH,
+        "transport": "unknown",
+        "kind": None,
+        "status": "unknown",
+        "endpoint": _LIST_DASH,
+        "source": "unknown",
+        "installed_at": _LIST_DASH,
+        "port": _LIST_DASH,
+        "size": _LIST_DASH,
+        "memory": _LIST_DASH,
+        "uptime": _LIST_DASH,
+    }
+
+
+def _row_from_installed_meta(server_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+    card = _server_cards.get(server_id)
+    kind = meta.get("install_kind")
+    if kind not in (1, 2, 3):
+        kind = _install_kind(card) if card is not None else None
+        if kind is None and _is_http_endpoint(meta.get("endpoint")):
+            kind = 1
+    row = _blank_list_row(server_id)
+    row["name"] = meta.get("name") or (
+        str(getattr(card, "display_name", server_id)) if card is not None else server_id
+    )
+    row["version"] = _list_cell(meta.get("version") or getattr(card, "version", None))
+    transport = meta.get("transport", getattr(card, "transport", None) if card else None)
+    row["transport"] = transport if transport not in (None, "", []) else "unknown"
+    row["kind"] = kind
+    row["endpoint"] = _list_cell(meta.get("endpoint") or getattr(card, "endpoint", None))
+    row["source"] = meta.get("source") or "mcp_registered"
+    row["installed_at"] = _list_cell(meta.get("installed_at"))
+    if kind == 1:
+        return _apply_kind1_list_metrics(row)
+    if server_id in _connections:
+        row["status"] = "running" if kind == 3 else "connected"
+    elif kind == 2:
+        row["status"] = "stopped"
+    elif kind == 3:
+        row["status"] = "idle"
+    else:
+        row["status"] = "connected" if server_id in _connections else "registered"
+    return row
+
+
+def _row_from_cli_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    server_id = str(entry.get("name") or entry.get("id") or entry.get("server_id") or "unknown")
+    kind = entry.get("kind")
+    if kind not in (1, 2, 3):
+        kind = _install_kind(entry)
+    row = _blank_list_row(server_id)
+    row["name"] = entry.get("display_name") or server_id
+    row["version"] = _list_cell(entry.get("version"))
+    row["transport"] = entry.get("transport") or "unknown"
+    row["kind"] = kind
+    row["status"] = str(entry.get("status") or "unknown")
+    row["endpoint"] = _list_cell(entry.get("endpoint"))
+    row["source"] = "cli"
+    row["port"] = _list_cell(entry.get("port"))
+    row["size"] = _list_cell(entry.get("size"))
+    row["memory"] = _list_cell(entry.get("memory"))
+    row["uptime"] = _list_cell(entry.get("uptime"))
+    if kind == 1:
+        return _apply_kind1_list_metrics(row)
+    return row
+
+
+def _merge_list_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if value in (None, "", _LIST_DASH, "unknown") and merged.get(key) not in (None, "", _LIST_DASH):
+            continue
+        merged[key] = value
+    kind = merged.get("kind")
+    if kind not in (1, 2, 3):
+        kind = existing.get("kind") or incoming.get("kind")
+        merged["kind"] = kind
+    if kind == 1:
+        return _apply_kind1_list_metrics(merged)
+    return merged
+
+
+def _parse_cli_list_payload(raw: str) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        rows: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("NAME") or line.startswith("-"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            rows.append({
+                "name": parts[0],
+                "transport": parts[1] if len(parts) > 1 else "unknown",
+                "status": parts[2] if len(parts) > 2 else "unknown",
+            })
+        return rows
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        servers = parsed.get("servers") or parsed.get("installed") or []
+        if isinstance(servers, list):
+            return [item for item in servers if isinstance(item, dict)]
+    return []
+
+
+async def _collect_installed_rows() -> tuple[list[dict[str, Any]], str | None]:
+    """Merge in-memory registrations with ``pharos list --json``."""
+    by_id: dict[str, dict[str, Any]] = {}
+    note: str | None = None
+
+    for sid, meta in _installed_servers.items():
+        by_id[sid] = _row_from_installed_meta(sid, meta)
+
+    for sid in _connections:
+        if sid in by_id:
+            kind = by_id[sid].get("kind")
+            if kind == 1:
+                _apply_kind1_list_metrics(by_id[sid])
+            elif kind == 3:
+                by_id[sid]["status"] = "running"
+            else:
+                by_id[sid]["status"] = "connected"
+            continue
+        extra = _blank_list_row(sid)
+        extra["source"] = "mcp_connected"
+        extra["status"] = "connected"
+        extra["kind"] = 1 if _is_http_endpoint(getattr(_server_cards.get(sid), "endpoint", None)) else None
+        if extra["kind"] == 1:
+            extra["endpoint"] = _list_cell(getattr(_server_cards.get(sid), "endpoint", None))
+            _apply_kind1_list_metrics(extra)
+        by_id[sid] = extra
+
+    cli = _get_pharos_cli()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "list", "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        return list(by_id.values()), "pharos list timed out"
+    except FileNotFoundError:
+        note = "pharos CLI not found; only showing MCP-registered servers."
+    except Exception as exc:
+        return list(by_id.values()), f"pharos list failed: {exc}"
+    else:
+        if proc.returncode == 0 and stdout:
+            for entry in _parse_cli_list_payload(stdout.decode().strip()):
+                row = _row_from_cli_entry(entry)
+                sid = row["server_id"]
+                if sid in by_id:
+                    by_id[sid] = _merge_list_rows(by_id[sid], row)
+                else:
+                    by_id[sid] = row
+
+    return list(by_id.values()), note
+
+
+def _compact_list_server(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("server_id", "unknown"),
+        "name": row.get("name") or row.get("server_id") or "unknown",
+        "version": row.get("version") or _LIST_DASH,
+        "transport": row.get("transport", "unknown"),
+        "status": row.get("status", "unknown"),
+        "kind": row.get("kind"),
+        "endpoint": row.get("endpoint", _LIST_DASH),
+        "port": row.get("port", _LIST_DASH),
+        "size": row.get("size", _LIST_DASH),
+        "memory": row.get("memory", _LIST_DASH),
+        "uptime": row.get("uptime", _LIST_DASH),
+    }
+
+
+def _endpoint_from_cli_payload(raw: str) -> str | None:
+    """Extract an http(s) endpoint from ``_run_pharos_cli`` JSON or stdout."""
+    if not raw:
+        return None
+
+    def _from_obj(obj: object) -> str | None:
+        if not isinstance(obj, dict):
+            return None
+        for key in ("endpoint", "url", "base_url"):
+            value = obj.get(key)
+            if _is_http_endpoint(value):
+                return str(value).strip()
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        found = _from_obj(parsed)
+        if found:
+            return found
+        stdout = parsed.get("stdout")
+        if isinstance(stdout, str) and stdout.strip():
+            try:
+                inner = json.loads(stdout)
+            except json.JSONDecodeError:
+                inner = None
+            found = _from_obj(inner)
+            if found:
+                return found
+            for token in stdout.split():
+                if _is_http_endpoint(token):
+                    return token.strip().rstrip(",;")
+    for token in raw.split():
+        if _is_http_endpoint(token):
+            return token.strip().rstrip(",;")
+    return None
+
+
+def _apply_launch_fields(card: object, *, endpoint: str | None = None) -> None:
+    """Copy launch data onto *card* so ConnectionManager can connect."""
+    if card is None:
+        return
+    if endpoint:
+        for attr in ("endpoint", "local_endpoint"):
+            try:
+                setattr(card, attr, endpoint)
+            except Exception:
+                pass
+    cmd = launch_command(_card_kind_input(card))
+    if cmd and not _card_str_field(card, "stdio_command"):
+        try:
+            card.stdio_command = cmd
+        except Exception:
+            pass
+
+
+def _register_kind1_in_memory(store_id: str, card: object | None) -> str:
+    """Bookmark a kind-1 remote when the pharos CLI binary is missing."""
+    transport = getattr(card, "transport", None) if card is not None else None
+    endpoint = getattr(card, "endpoint", None) if card is not None else None
+    _installed_servers[store_id] = {
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "transport": transport,
+        "endpoint": endpoint,
+        "install_kind": 1,
+        "source": "mcp_registered",
+        "name": (
+            str(getattr(card, "display_name", store_id)) if card is not None else store_id
+        ),
+        "version": _card_str_field(card, "version") if card is not None else "",
+    }
+    return json.dumps({
+        "status": "registered",
+        "server_id": store_id,
+        "transport": transport,
+        "endpoint": endpoint,
+        "install_kind": 1,
+        "message": "Remote server registered.",
+    })
+
+
+async def _cli_install_and_maybe_start(
+    server_id: str,
+    card: object | None,
+    kind: int | None,
+) -> str:
+    """Run ``pharos install {id}@{ver}``; kind 2 also runs ``pharos start``.
+
+    Kind 1/2/3 all shell the CLI so client configs (Cursor ``{type,url}``)
+    get written. Kind 1 and 3 do not start. If the binary is missing,
+    kind 1 falls back to in-memory registration; kind 2/3 stay errors.
+    """
+    cli = _get_pharos_cli()
+    target = _cli_install_target(server_id, card)
+    store_id = _canonical_server_id(target)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "install", target,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "Install timed out (120s)", "server_id": store_id})
+    except FileNotFoundError:
+        if kind == 1:
+            return _register_kind1_in_memory(store_id, card)
+        return json.dumps({
+            "error": f"pharos CLI not found at '{cli}'",
+            "server_id": store_id,
+            "hint": (
+                "For remote servers, use pharos_search(remote_only=True) to find "
+                "servers that don't require local installation. To install stdio "
+                "servers, install the pharos CLI first: pip install pharos-mcp"
+            ),
+        })
+
+    if proc.returncode != 0:
+        return json.dumps({
+            "error": "Install failed",
+            "stderr": stderr.decode() if stderr else "",
+            "server_id": store_id,
+        })
+
+    _installed_servers[store_id] = {
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "transport": getattr(card, "transport", None) if card is not None else None,
+        "endpoint": getattr(card, "endpoint", None) if card is not None else None,
+        "install_kind": kind,
+        "version": _split_name_version(target)[1] or (
+            _card_str_field(card, "version") if card is not None else ""
+        ),
+        "name": (
+            str(getattr(card, "display_name", store_id)) if card is not None else store_id
+        ),
+        "source": "cli",
+    }
+
+    payload: dict[str, Any] = {
+        "status": "installed",
+        "server_id": store_id,
+        "install_kind": kind,
+        "output": stdout.decode().strip() if stdout else "",
+    }
+    if kind == 2:
+        payload["start"] = json.loads(await _run_pharos_cli("start", store_id))
+    return json.dumps(payload)
 
 
 async def _resolve_server_card(
@@ -2167,6 +2682,9 @@ if not MCP_APPS_MODE:
         query: str,
         limit: int = 10,
         remote_only: bool = False,
+        transport: str = "",
+        registry: str = "",
+        page: int = 1,
     ) -> str:
         """Search the PHAROS registry for MCP servers matching the query.
 
@@ -2178,24 +2696,54 @@ if not MCP_APPS_MODE:
                 environment cannot install local binaries (e.g. mobile agents,
                 cloud-only). For desktop environments with local CLI access,
                 leave as False (default) to get all available servers.
+            transport: Filter by transport (stdio, http-sse, streamable-http,
+                sse, http). Empty = no transport filter. Same values as
+                ``pharos search --transport``. Combined with remote_only when
+                both are set: explicit transport is sent, not replaced.
+            registry: Filter by source catalog (mcp.io, mcp.so, pharos,
+                smithery). Empty = no registry filter.
+            page: 1-based page. Mapped to the registry cursor offset
+                ``(page-1)*limit`` the same way the CLI does.
 
         Returns:
             JSON array of matching servers with id, name, description, version,
-            transport, publisher, tools_count, and capabilities.
+            transport, source_registry, publisher, tools_count, and capabilities.
+            Includes nextCursor and total when the registry returns them.
         """
         client = _get_client()
         limit = min(max(limit, 1), 50)
+        if page < 1:
+            page = 1
 
-        filters: dict[str, Any] = {}
-        if remote_only:
-            filters["transport"] = ["sse", "streamable-http", "http"]
+        filters = _search_filters(
+            remote_only=remote_only,
+            transport=transport,
+            registry=registry,
+            page=page,
+            limit=limit,
+        )
 
         try:
-            results = await client.search(text=query, filters=filters or None, limit=limit)
+            results = await client.search(text=query, filters=filters, limit=limit)
         except NoServersFound:
             return json.dumps({"results": [], "message": "No servers found. Try a different query."})
         except RegistryUnavailable as e:
             return json.dumps({"error": f"Registry unavailable: {e}", "results": []})
+
+        # PHAROS_REMOTE_ONLY is capability, not UI: search requires an endpoint.
+        if _remote_only_env():
+            filtered = [
+                r for r in results
+                if _is_http_endpoint(getattr(r.card, "endpoint", None))
+            ]
+            if isinstance(results, SearchResults):
+                results = SearchResults(
+                    filtered,
+                    next_cursor=results.next_cursor,
+                    total=results.total,
+                )
+            else:
+                results = filtered
 
         # Cache cards for later use
         for r in results:
@@ -2210,6 +2758,7 @@ if not MCP_APPS_MODE:
                 "description": card.description,
                 "version": card.version,
                 "transport": card.transport,
+                "source_registry": _result_source_registry(r),
                 "publisher": {
                     "name": card.publisher.name if card.publisher else "unknown",
                     "verified": card.publisher.verified if card.publisher else False,
@@ -2229,16 +2778,23 @@ if not MCP_APPS_MODE:
             oldest = next(iter(_search_results_cache))
             del _search_results_cache[oldest]
 
-        return json.dumps({"results": output, "count": len(output), "search_id": search_id})
+        payload: dict[str, Any] = {
+            "results": output,
+            "count": len(output),
+            "search_id": search_id,
+        }
+        payload.update(_search_page_meta(results))
+        return json.dumps(payload)
 
 
     @mcp.tool()
     async def pharos_install(server_id: str) -> str:
         """Install an MCP server from the PHAROS registry to the local machine.
 
-        For remote transports (sse, streamable-http, http), the server is registered
-        as a remote endpoint without requiring the pharos CLI. For stdio servers,
-        the pharos CLI must be installed locally to download and configure the package.
+        Kinds 1, 2, and 3 shell ``pharos install {id}@{ver}`` so client
+        configs are written (Cursor remotes need ``{type,url}``). Kind 2
+        also runs ``pharos start``. If the CLI binary is missing, kind 1
+        falls back to in-memory registration; kinds 2 and 3 return an error.
 
         Args:
             server_id: The server ID from search results (e.g. "test-echo-server")
@@ -2249,12 +2805,26 @@ if not MCP_APPS_MODE:
         """
         # Cache-first when the card is already connectable (emoji/space names
         # 400 on /v1/packages/{name}). Incomplete search cards are hydrated
-        # from package detail before we decide remote-vs-stdio.
+        # from package detail before we classify.
         card, _fetch_err = await _resolve_server_card(server_id)
+        if card is None:
+            name, _ver = _split_name_version(server_id)
+            if name != server_id:
+                card, _fetch_err = await _resolve_server_card(name)
+
+        kind = _install_kind(card) if card is not None else None
+        if remote_only_blocks(kind):
+            return json.dumps(_remote_only_error(server_id))
+
         transport = getattr(card, "transport", None) if card is not None else None
         endpoint = getattr(card, "endpoint", None) if card is not None else None
 
-        # Remote transport: register endpoint without CLI
+        # Kind 1/2/3: shell ``pharos install {id}@{ver}``; kind 2 also starts.
+        # Kind 1 FileNotFoundError falls back to in-memory register.
+        if kind in (1, 2, 3):
+            return await _cli_install_and_maybe_start(server_id, card, kind)
+
+        # Unclassifiable: keep the previous remote-vs-CLI fallback.
         remote_transports = ("sse", "streamable-http", "http", "http+sse", "http-sse")
         transports = _card_transports(card) if card is not None else []
         if transport and any(t in remote_transports for t in transports):
@@ -2264,54 +2834,23 @@ if not MCP_APPS_MODE:
                     "error": f"Server '{server_id}' has transport '{transport_str}' but no endpoint URL",
                     "server_id": server_id,
                 })
-            _installed_servers[server_id] = {
+            store_id = _canonical_server_id(server_id)
+            _installed_servers[store_id] = {
                 "installed_at": datetime.now(timezone.utc).isoformat(),
                 "transport": transport,
                 "endpoint": endpoint,
+                "install_kind": 1,
+                "source": "mcp_registered",
             }
             return json.dumps({
                 "status": "registered",
-                "server_id": server_id,
+                "server_id": store_id,
                 "transport": transport,
                 "endpoint": endpoint,
                 "message": "Remote server registered.",
             })
 
-        # stdio transport: use pharos CLI
-        cli = _get_pharos_cli()
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                cli, "install", server_id,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        except asyncio.TimeoutError:
-            return json.dumps({"error": "Install timed out (120s)", "server_id": server_id})
-        except FileNotFoundError:
-            return json.dumps({
-                "error": f"pharos CLI not found at '{cli}'",
-                "server_id": server_id,
-                "hint": "For remote servers, use pharos_search(remote_only=True) to find servers that don't require local installation. To install stdio servers, install the pharos CLI first: pip install pharos-mcp",
-            })
-
-        if proc.returncode != 0:
-            return json.dumps({
-                "error": "Install failed",
-                "stderr": stderr.decode() if stderr else "",
-                "server_id": server_id,
-            })
-
-        _installed_servers[server_id] = {
-            "installed_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        return json.dumps({
-            "status": "installed",
-            "server_id": server_id,
-            "output": stdout.decode().strip() if stdout else "",
-        })
+        return await _cli_install_and_maybe_start(server_id, card, kind)
 
 
     @mcp.tool()
@@ -2326,76 +2865,14 @@ if not MCP_APPS_MODE:
             JSON array of installed servers with id, transport, status,
             and install metadata.
         """
-        results = []
-
-        # 1. Report in-memory remote registrations
-        for sid, meta in _installed_servers.items():
-            results.append({
-                "server_id": sid,
-                "transport": meta.get("transport", "unknown"),
-                "endpoint": meta.get("endpoint"),
-                "installed_at": meta.get("installed_at"),
-                "source": "mcp_registered",
-            })
-
-        # 2. Query the pharos CLI for locally installed servers
-        cli = _get_pharos_cli()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                cli, "list", "--json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            return json.dumps({"error": "pharos list timed out", "installed": results})
-        except FileNotFoundError:
-            # CLI not installed — return only in-memory registrations
-            return json.dumps({"installed": results, "count": len(results),
-                               "note": "pharos CLI not found; only showing MCP-registered servers."})
-        except Exception as e:
-            return json.dumps({"error": f"pharos list failed: {e}", "installed": results})
-
-        # Parse CLI output
-        cli_output = ""
-        if proc.returncode == 0 and stdout:
-            cli_output = stdout.decode().strip()
-            try:
-                # Try JSON parse first (--json flag)
-                parsed = json.loads(cli_output)
-                if isinstance(parsed, list):
-                    for entry in parsed:
-                        sid = entry.get("name") or entry.get("id") or "unknown"
-                        results.append({
-                            "server_id": sid,
-                            "transport": entry.get("transport", "unknown"),
-                            "status": entry.get("status", "unknown"),
-                            "source": "cli",
-                        })
-                elif isinstance(parsed, dict) and "servers" in parsed:
-                    for entry in parsed["servers"]:
-                        sid = entry.get("name") or entry.get("id") or "unknown"
-                        results.append({
-                            "server_id": sid,
-                            "transport": entry.get("transport", "unknown"),
-                            "status": entry.get("status", "unknown"),
-                            "source": "cli",
-                        })
-            except json.JSONDecodeError:
-                # CLI may not support --json; parse text output
-                for line in cli_output.splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("NAME") and not line.startswith("-"):
-                        parts = line.split()
-                        if parts:
-                            results.append({
-                                "server_id": parts[0],
-                                "transport": parts[1] if len(parts) > 1 else "unknown",
-                                "status": parts[2] if len(parts) > 2 else "unknown",
-                                "source": "cli",
-                            })
-
-        return json.dumps({"installed": results, "count": len(results)})
+        results, note = await _collect_installed_rows()
+        payload: dict[str, Any] = {"installed": results, "count": len(results)}
+        if note:
+            if "timed out" in note or "failed" in note:
+                payload["error"] = note
+            else:
+                payload["note"] = note
+        return json.dumps(payload)
 
 
     @mcp.tool()
@@ -2514,6 +2991,9 @@ else:
         query: str,
         limit: int = 10,
         remote_only: bool = False,
+        transport: str = "",
+        registry: str = "",
+        page: int = 1,
     ) -> str:
         """Search the PHAROS registry for MCP servers (Apps mode).
 
@@ -2525,6 +3005,12 @@ else:
             query: Natural-language search query
             limit: Maximum number of results (default 10, max 50)
             remote_only: If True, only return remote-transport servers
+            transport: Filter by transport (stdio, http-sse, streamable-http,
+                sse, http). Empty = no transport filter.
+            registry: Filter by source catalog (mcp.io, mcp.so, pharos,
+                smithery). Empty = no registry filter.
+            page: 1-based page mapped to registry cursor offset
+                ``(page-1)*limit``.
 
         Returns:
             JSON with status, results array, search_id, and an html field
@@ -2534,13 +3020,19 @@ else:
 
         client = _get_client()
         limit = min(max(limit, 1), 50)
+        if page < 1:
+            page = 1
 
-        filters: dict[str, Any] = {}
-        if remote_only:
-            filters["transport"] = ["sse", "streamable-http", "http"]
+        filters = _search_filters(
+            remote_only=remote_only,
+            transport=transport,
+            registry=registry,
+            page=page,
+            limit=limit,
+        )
 
         try:
-            results = await client.search(text=query, filters=filters or None, limit=limit)
+            results = await client.search(text=query, filters=filters, limit=limit)
         except NoServersFound:
             search_id = _new_ui_token("sr")
             _cache_put(_search_results_cache, search_id, [])
@@ -2558,6 +3050,20 @@ else:
                 "error": f"Registry unavailable: {e}",
                 "results": [],
             })
+
+        if _remote_only_env():
+            filtered = [
+                r for r in results
+                if _is_http_endpoint(getattr(r.card, "endpoint", None))
+            ]
+            if isinstance(results, SearchResults):
+                results = SearchResults(
+                    filtered,
+                    next_cursor=results.next_cursor,
+                    total=results.total,
+                )
+            else:
+                results = filtered
 
         # Cache cards for later use (same logic as pharos_search)
         for r in results:
@@ -2579,7 +3085,7 @@ else:
             )
             stars = raw.get("stars") or raw.get("github_stars")
             category = raw.get("category") or raw.get("categories")
-            source_registry = getattr(card, "source_registry", None) or raw.get("source_registry")
+            source_registry = raw.get("source_registry") or getattr(card, "source_registry", None)
 
             # Pricing — use the structured PricingSpec if present, otherwise
             # fall back to the raw registry field.
@@ -2624,7 +3130,7 @@ else:
         _cache_put(_search_results_cache, search_id, output)
         _current_search_id = search_id
 
-        return json.dumps({
+        payload: dict[str, Any] = {
             "status": "ok",
             "count": len(output),
             "search_id": search_id,
@@ -2635,6 +3141,7 @@ else:
                     "name": r["name"],
                     "version": r["version"],
                     "transport": r["transport"],
+                    "source_registry": r["source_registry"],
                     "publisher": r["publisher"]["name"],
                     "verified": r["publisher"]["verified"],
                     "tools_count": r["tools_count"],
@@ -2642,7 +3149,9 @@ else:
                 }
                 for r in output
             ],
-        })
+        }
+        payload.update(_search_page_meta(results))
+        return json.dumps(payload)
 
 
     @mcp.tool(meta={"ui": {"resourceUri": "ui://pharos/info"}})
@@ -2741,41 +3250,44 @@ else:
         # package detail. Errors never advertise an approval UI.
         card, fetch_err = await _resolve_server_card(server_id)
         if card is None:
+            name, _ver = _split_name_version(server_id)
+            if name != server_id:
+                card, fetch_err = await _resolve_server_card(name)
+        if card is None:
             return json.dumps({
                 "status": "error",
                 "error": f"Cannot install: server '{server_id}' not found: {fetch_err}",
                 "server_id": server_id,
             })
 
+        kind = _install_kind(card)
+        if remote_only_blocks(kind):
+            return json.dumps(_remote_only_error(server_id))
+
         # Determine endpoint from the (possibly hydrated) card
         endpoint = getattr(card, "endpoint", None)
 
-        # Validate that the server is actually connectable before asking the
-        # user to approve. For remote transports, an endpoint is required.
-        # For stdio, a stdio_command/command/bin is required. If neither is
-        # available, there's nothing to connect to — don't show an approval card.
-        transports = _card_transports(card)
-        has_remote = any(t in _REMOTE_TRANSPORTS for t in transports)
-        has_stdio = "stdio" in transports
-        stdio_cmd = _card_str_field(card, "stdio_command", "command", "bin")
-
-        if has_remote and not endpoint and not has_stdio:
+        # Kind 1 needs a publisher URL. Kind 2/3 are launched locally — do
+        # not refuse them for a missing endpoint, and never show an
+        # approval card for unclassifiable cards.
+        if kind is None:
+            transports = _card_transports(card)
             return json.dumps({
                 "status": "error",
                 "server_id": server_id,
                 "error": (
-                    f"Server '{server_id}' has transport {transports} but no endpoint URL. "
-                    f"The server cannot be connected to. Contact the publisher or try a "
-                    f"different server."
+                    f"Server '{server_id}' is not installable "
+                    f"(transport {transports}, no endpoint or launch command)."
                 ),
             })
-        if has_stdio and not stdio_cmd and not endpoint:
+        if kind == 1 and not _is_http_endpoint(endpoint):
             return json.dumps({
                 "status": "error",
                 "server_id": server_id,
                 "error": (
-                    f"Server '{server_id}' has stdio transport but no command configured. "
-                    f"The server cannot be started."
+                    f"Server '{server_id}' has no endpoint URL. "
+                    f"The server cannot be connected to. Contact the publisher or try a "
+                    f"different server."
                 ),
             })
 
@@ -3157,69 +3669,7 @@ else:
             JSON with status, servers array, and an html field containing
             the rendered installed servers table for the iframe.
         """
-        results: list[dict] = []
-
-        # 1. Report in-memory remote registrations (same logic as pharos_list)
-        for sid, meta in _installed_servers.items():
-            results.append({
-                "server_id": sid,
-                "transport": meta.get("transport", "unknown"),
-                "endpoint": meta.get("endpoint"),
-                "installed_at": meta.get("installed_at"),
-                "source": "mcp_registered",
-                "status": "registered",
-            })
-
-        # 1b. Report connected servers not already in results
-        for sid, conn in _connections.items():
-            if not any(r.get("server_id") == sid for r in results):
-                results.append({
-                    "server_id": sid,
-                    "transport": "connected",
-                    "endpoint": None,
-                    "installed_at": None,
-                    "source": "mcp_connected",
-                    "status": "connected",
-                })
-
-        # 2. Query the pharos CLI for locally installed servers
-        cli = _get_pharos_cli()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                cli, "list", "--json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except Exception:
-            # CLI not available or timed out — return only in-memory registrations
-            pass
-        else:
-            cli_output = stdout.decode().strip() if stdout else ""
-            if proc.returncode == 0 and cli_output:
-                try:
-                    parsed = json.loads(cli_output)
-                    entries = parsed if isinstance(parsed, list) else parsed.get("servers", [])
-                    for entry in entries:
-                        sid = entry.get("name") or entry.get("id") or "unknown"
-                        results.append({
-                            "server_id": sid,
-                            "transport": entry.get("transport", "unknown"),
-                            "status": entry.get("status", "unknown"),
-                            "source": "cli",
-                        })
-                except json.JSONDecodeError:
-                    for line in cli_output.splitlines():
-                        line = line.strip()
-                        if line and not line.startswith("NAME") and not line.startswith("-"):
-                            parts = line.split()
-                            if parts:
-                                results.append({
-                                    "server_id": parts[0],
-                                    "transport": parts[1] if len(parts) > 1 else "unknown",
-                                    "status": parts[2] if len(parts) > 2 else "unknown",
-                                    "source": "cli",
-                                })
+        results, _note = await _collect_installed_rows()
 
         # Cache for UI resource rendering
         installed_key = _new_ui_token("inst")
@@ -3231,16 +3681,7 @@ else:
             "status": "ok",
             "count": len(results),
             "ui_resource_uri": _ui_resource_uri("installed", installed_key),
-            "servers": [
-                {
-                    "id": s.get("id", s.get("server_id", "unknown")),
-                    "name": s.get("name", s.get("display_name", "unknown")),
-                    "version": s.get("version", "unknown"),
-                    "transport": s.get("transport", "unknown"),
-                    "status": s.get("status", "unknown"),
-                }
-                for s in results
-            ],
+            "servers": [_compact_list_server(s) for s in results],
         })
 
 
@@ -3442,26 +3883,49 @@ async def approve_endpoint(request: Request) -> JSONResponse:
             "message": "Server removed successfully.",
         })
 
-    # Validate that we have something to connect to. Servers with a `bin`
-    # field but no endpoint cannot be started in this environment (no source
-    # code or runtime to launch them). Provide a clear error rather than a
-    # confusing connection failure.
-    if not endpoint and not getattr(card, "stdio_command", None):
-        has_bin = bool(getattr(card, "bin", None))
-        if has_bin:
-            error_msg = (
-                "Server has no endpoint and cannot be started from source in "
-                "this environment. The publisher must provide an endpoint URL."
-            )
-        else:
-            error_msg = "Server has no endpoint or launch command and cannot be connected to."
+    kind = _install_kind(card)
+    if remote_only_blocks(kind):
+        error_msg = _remote_only_error(server_id)["error"]
         if approval_token in _approval_results:
             _approval_results[approval_token]["result"] = "error"
             _approval_results[approval_token]["error"] = error_msg
-        return JSONResponse({
-            "error": error_msg,
-            "server_id": server_id,
-        })
+        return JSONResponse({"error": error_msg, "server_id": server_id})
+
+    # Kind 2: start the local process, then connect to the resolved URL.
+    # Missing endpoint after start is "need start first", never
+    # "publisher must provide an endpoint".
+    if kind == 2:
+        start_raw = await _run_pharos_cli("start", server_id)
+        start_data = json.loads(start_raw)
+        started_endpoint = _endpoint_from_cli_payload(start_raw)
+        if not started_endpoint:
+            started_endpoint = await _resolve_local_endpoint(server_id)
+        if started_endpoint:
+            endpoint = started_endpoint
+            _apply_launch_fields(card, endpoint=started_endpoint)
+        elif not _is_http_endpoint(endpoint):
+            error_msg = (
+                "Need to start this server first. "
+                f"pharos start did not yield a local endpoint ({start_data.get('error') or start_data.get('stderr') or start_data.get('status')})."
+            )
+            if approval_token in _approval_results:
+                _approval_results[approval_token]["result"] = "error"
+                _approval_results[approval_token]["error"] = error_msg
+            return JSONResponse({"error": error_msg, "server_id": server_id})
+    elif kind == 3:
+        _apply_launch_fields(card)
+    elif kind == 1 and not _is_http_endpoint(endpoint):
+        error_msg = "Server has no endpoint or launch command and cannot be connected to."
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "error"
+            _approval_results[approval_token]["error"] = error_msg
+        return JSONResponse({"error": error_msg, "server_id": server_id})
+    elif kind is None and not _is_http_endpoint(endpoint) and not launch_command(_card_kind_input(card)):
+        error_msg = "Server has no endpoint or launch command and cannot be connected to."
+        if approval_token in _approval_results:
+            _approval_results[approval_token]["result"] = "error"
+            _approval_results[approval_token]["error"] = error_msg
+        return JSONResponse({"error": error_msg, "server_id": server_id})
 
     # Check if already connected (race condition guard)
     if server_id in _connections:
@@ -3520,6 +3984,8 @@ async def approve_endpoint(request: Request) -> JSONResponse:
             "transport": getattr(card, "transport", None),
             "endpoint": endpoint,
             "source": "approved",
+            "install_kind": kind,
+            "name": str(getattr(card, "display_name", server_id)) if card is not None else server_id,
         }
 
         # List initial tools
@@ -3545,11 +4011,18 @@ async def approve_endpoint(request: Request) -> JSONResponse:
             "tools": tools,
         })
     except ConnectionFailed as e:
-        # Record the failure for pharos_check_approval
+        detail = str(e)
+        lowered = detail.lower()
+        if "not ready" in lowered or ("local" in lowered and "endpoint" in lowered):
+            detail = (
+                "Need to start this server first. "
+                "Local HTTP endpoint is not ready after pharos start."
+            )
+        error_msg = f"Connection failed: {detail}"
         if approval_token in _approval_results:
             _approval_results[approval_token]["result"] = "error"
-            _approval_results[approval_token]["error"] = f"Connection failed: {e}"
-        return JSONResponse({"error": f"Connection failed: {e}", "server_id": server_id})
+            _approval_results[approval_token]["error"] = error_msg
+        return JSONResponse({"error": error_msg, "server_id": server_id})
     except Exception as e:
         # Record the failure for pharos_check_approval
         if approval_token in _approval_results:
@@ -4333,9 +4806,10 @@ def main():
         mcp.settings.transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "0.0.0.0:*",
-                           "pharos-mcp:*", "host.docker.internal:*"],
+                           "pharos-mcp:*", "pharos-mcp-noapps:*", "host.docker.internal:*"],
             allowed_origins=["http://localhost:*", "http://127.0.0.1:*",
-                             "http://pharos-mcp:*", "http://host.docker.internal:*"],
+                             "http://pharos-mcp:*", "http://pharos-mcp-noapps:*",
+                             "http://host.docker.internal:*"],
         )
 
     # mypy/pyright: transport is str but run() wants a Literal; cast at runtime

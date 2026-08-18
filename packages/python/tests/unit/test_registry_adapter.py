@@ -101,6 +101,56 @@ class TestSearch:
             assert params.get("text") == "flights"
             assert params.get("limit") == 10
 
+    @pytest.mark.anyio
+    async def test_search_forwards_cursor_registry_transport(self, adapter):
+        """cursor/registry/transport filters become query params, never page=."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "results": [_mock_card()],
+            "nextCursor": "MTA=",
+            "total": 37,
+        }
+        mock_response.text = ""
+
+        with patch.object(httpx.AsyncClient, "get", new=AsyncMock(return_value=mock_response)) as mock_get:
+            results = await adapter.search(
+                text="echo",
+                filters={
+                    "transport": "http-sse",
+                    "registry": "pharos",
+                    "cursor": "MTA=",
+                },
+                limit=10,
+            )
+            params = mock_get.call_args.kwargs.get("params", {})
+            assert params["transport"] == "http-sse"
+            assert params["registry"] == "pharos"
+            assert params["cursor"] == "MTA="
+            assert "page" not in params
+
+        assert getattr(results, "next_cursor", None) == "MTA="
+        assert getattr(results, "total", None) == 37
+
+    @pytest.mark.anyio
+    async def test_search_omits_empty_filter_values(self, adapter):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"results": [_mock_card()]}
+        mock_response.text = ""
+
+        with patch.object(httpx.AsyncClient, "get", new=AsyncMock(return_value=mock_response)) as mock_get:
+            await adapter.search(
+                text="echo",
+                filters={"transport": "", "registry": None, "cursor": ""},
+                limit=10,
+            )
+            params = mock_get.call_args.kwargs.get("params", {})
+            assert "transport" not in params
+            assert "registry" not in params
+            assert "cursor" not in params
+            assert "page" not in params
+
 
 class TestGetServerCard:
     @pytest.mark.anyio

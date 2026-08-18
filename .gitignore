@@ -29,3 +29,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local CLI install state
+pharos.lock
+**/pharos.lock

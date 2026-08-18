@@ -68,6 +68,25 @@ class SearchResult:
         self.raw_item = raw_item or {}
 
 
+class SearchResults(list):
+    """Search hits plus the live registry pagination envelope.
+
+    Behaves as ``list[SearchResult]`` so existing callers can iterate.
+    ``next_cursor`` / ``total`` are populated when GET /v1/search returns them.
+    """
+
+    def __init__(
+        self,
+        items: list[SearchResult] | None = None,
+        *,
+        next_cursor: str | None = None,
+        total: int | None = None,
+    ):
+        super().__init__(items or [])
+        self.next_cursor = next_cursor or None
+        self.total = total
+
+
 def _normalize_to_server_card(
     item: dict[str, Any],
     source_registry: str,
@@ -296,6 +315,10 @@ class PharosRegistryAdapter:
             params["text"] = text
         if filters:
             for key, value in filters.items():
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
                 if isinstance(value, list):
                     params[key] = ",".join(str(v) for v in value)
                 else:
@@ -332,7 +355,9 @@ class PharosRegistryAdapter:
             score = item.get("_score") or item.get("score")
             results.append(SearchResult(card=card, score=score, raw_item=item))
 
-        return results
+        next_cursor = data.get("nextCursor") or data.get("next_cursor") or None
+        total = data.get("total")
+        return SearchResults(results, next_cursor=next_cursor, total=total)
 
     async def get_server_card(
         self,

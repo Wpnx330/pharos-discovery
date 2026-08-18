@@ -2145,14 +2145,15 @@ This is the component that makes PHAROS universally accessible. Instead of requi
 │ PHAROS Discovery MCP Server                                      │
 │ (pharos_discovery.mcp_server — wraps PharosClient)               │
 │                                                                  │
-│  Tools:                    Resources (MCP Apps):                 │
+│  Tools (CLI mode / Apps mode):     Resources (MCP Apps):         │
 │  ┌──────────────────────┐  ┌──────────────────────────────────┐ │
-│  │ pharos_search        │  │ ui://pharos/results  (search UI) │ │
-│  │ pharos_install       │  │ ui://pharos/approval (consent UI)│ │
-│  │ pharos_connect       │  │ ui://pharos/oauth    (OAuth UI)  │ │
-│  │ pharos_list_tools    │  └──────────────────────────────────┘ │
-│  │ pharos_call_tool     │                                       │
-│  └──────────────────────┘  _meta.ui.resourceUri on search+connect│
+│  │ pharos_search[_apps] │  │ ui://pharos/results  (search UI) │ │
+│  │ pharos_install[_apps]│  │ ui://pharos/approval (consent UI)│ │
+│  │ pharos_list[_apps]   │  │ ui://pharos/oauth    (OAuth UI)  │ │
+│  │ pharos_list_tools    │  │ ui://pharos/installed            │ │
+│  │ pharos_call_tool     │  └──────────────────────────────────┘ │
+│  └──────────────────────┘  NO pharos_connect tool. Approval is  │
+│                            POST /approve (physical click).      │
 └──────────────────────────┬───────────────────────────────────────┘
                            │ HTTP
                            ▼
@@ -2165,7 +2166,9 @@ The MCP server is a thin wrapper around `PharosClient` (§8). It does not reimpl
 
 ### 18.2 Tool definitions
 
-Five tools are exposed. Each returns JSON as text content.
+See `docs/INSTALL_KINDS.md` for the three install kinds and the `PHAROS_REMOTE_ONLY` switch. `PHAROS_MCP_APPS` selects iframe/_apps tools. It does **not** disable local installs.
+
+There is **no** `pharos_connect` / `pharos_approve` tool. Approval is `@mcp.custom_route("/approve")` plus a physical click in Apps mode.
 
 #### pharos_search(query, limit, remote_only)
 
@@ -2181,31 +2184,23 @@ Searches the PHAROS registry for MCP servers matching the query.
 
 Installs or registers an MCP server from the registry. Behavior is transport-aware:
 
-- **Remote transports (sse, streamable-http, http):** Registers the endpoint directly without requiring the pharos CLI. The server card endpoint URL is stored for use by pharos_connect. This enables zero-binary installations in environments like mobile agents or cloud containers.
-- **stdio transport:** Downloads and installs the package via the pharos CLI (subprocess). The CLI resolves and installs any declared dependencies recursively (see S19).
+- **Kind 1 remote (endpoint URL):** Registers the endpoint. No tarball. Connect after approval (Apps) or immediately (CLI-mode MCP if policy allows).
+- **Kind 2 local HTTP (`bin`/`command`, no endpoint):** `pharos install` + `pharos start`. Not an error.
+- **Kind 3 stdio:** `pharos install` (tarball or npx/uvx launch line). CLI on PATH required.
+- **`PHAROS_REMOTE_ONLY`:** kinds 2 and 3 are rejected. Search requires an endpoint.
 
 - **Input:** server_id (registry ID)
 - **Output (stdio):** status=installed, server_id, output
 - **Output (remote):** status=registered, server_id, transport, endpoint, message
 - **Errors:** Install failed with stderr on CLI failure; Install timed out after 120s; pharos CLI not found with hint (includes pip install pharos-mcp guidance and remote_only search suggestion) when CLI is missing for stdio install
 
-#### `pharos_connect(server_id: string, purpose?: string) → string`
-
-Connects to a running MCP server after user approval. Triggers the MCP Apps approval UI.
-
-- **Input:** `server_id`, `purpose` (shown to user in approval card, default "User request")
-- **Output:** `{"status": "connected", "server_id": "...", "endpoint": "...", "tools_count": N, "tools": [...]}`
-- **Errors:** `{"error": "Connection denied by user"}`, `{"error": "Connection failed: ..."}`
-- **MCP Apps:** `_meta.ui.resourceUri = "ui://pharos/approval"` — host renders approval card with Approve/Deny buttons
-- **Local endpoint resolution:** If the server card has no `endpoint` (registry stores packages, not live endpoints), the tool checks `~/.pharos/run/<server-id>.pid` and `ss -tlnp` to find the local port
-
 #### `pharos_list_tools(server_id: string) → string`
 
 Lists available tools on a connected server.
 
-- **Input:** `server_id` (must be already connected via `pharos_connect`)
+- **Input:** `server_id` (must already be connected after install/approval)
 - **Output:** `{"server_id": "...", "tools": [{name, description, input_schema}], "count": N}`
-- **Errors:** `{"error": "Not connected. Use pharos_connect first."}`
+- **Errors:** `{"error": "Not connected. Install and approve first."}`
 
 #### `pharos_call_tool(server_id: string, tool_name: string, arguments?: object) → string`
 

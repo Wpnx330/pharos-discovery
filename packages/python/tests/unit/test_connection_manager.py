@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import asyncio
 import httpx
@@ -218,3 +220,127 @@ class TestGetTransport:
     @pytest.mark.anyio
     async def test_get_transport_nonexistent(self, manager):
         assert manager.get_transport("urn:pharos:unknown") is None
+
+
+def _card_with_extras(card: ServerCard, **extras) -> SimpleNamespace:
+    """Duck-typed card: ServerCard fields plus launch extras T2b may attach."""
+    data = card.model_dump()
+    data.update(extras)
+    return SimpleNamespace(**data)
+
+
+class TestKind1Unchanged:
+    @pytest.mark.anyio
+    async def test_remote_https_endpoint_uses_http_transport(self, manager):
+        card = make_card("http+sse", endpoint="https://world-time.example/mcp")
+        transport = manager._create_transport(card, make_token())
+        assert isinstance(transport, HttpSSETransport)
+        assert transport.endpoint == "https://world-time.example/mcp"
+
+    @pytest.mark.anyio
+    async def test_endpoint_plus_bin_tiebreak_stays_http_not_stdio(self, manager):
+        """F2: remote endpoint + bin is Kind 1 — connect the URL, do not spawn."""
+        card = make_card("http+sse", endpoint="http://host.docker.internal:8765")
+        proxied = _card_with_extras(card, bin="npx -y test-echo-server")
+        transport = manager._create_transport(proxied, make_token())
+        assert isinstance(transport, HttpSSETransport)
+        assert transport.endpoint == "http://host.docker.internal:8765"
+
+
+class TestKind2LocalHttp:
+    @pytest.mark.anyio
+    async def test_uses_card_endpoint_after_start(self, manager):
+        card = make_card("http+sse", endpoint="http://127.0.0.1:8765")
+        transport = manager._create_transport(card, make_token())
+        assert isinstance(transport, HttpSSETransport)
+        assert transport.endpoint == "http://127.0.0.1:8765"
+
+    @pytest.mark.anyio
+    async def test_uses_local_endpoint_field_when_publisher_endpoint_missing(self, manager):
+        card = make_card("streamable-http", endpoint=None)
+        proxied = _card_with_extras(card, local_endpoint="http://127.0.0.1:9000/mcp")
+        transport = manager._create_transport(proxied, make_token())
+        assert isinstance(transport, StreamableHTTPTransport)
+        assert transport.endpoint == "http://127.0.0.1:9000/mcp"
+
+    @pytest.mark.anyio
+    async def test_missing_local_url_raises_catchable_connection_failed(self, manager):
+        """Kind 2 before T2b start — T2b must catch this, not a publisher-blame message."""
+        card = make_card("http+sse", endpoint=None)
+        proxied = _card_with_extras(card, bin="npx -y test-echo-server")
+        with pytest.raises(ConnectionFailed) as excinfo:
+            manager._create_transport(proxied, make_token())
+        detail = str(excinfo.value).lower()
+        assert "publisher must provide" not in detail
+        assert "local" in detail and "endpoint" in detail
+        assert "not ready" in detail
+
+    @pytest.mark.anyio
+    async def test_http_sse_alias_uses_resolved_local_url(self, manager):
+        card = make_card("http+sse", endpoint=None)
+        # transport alias used by registry / INSTALL_KINDS classifier
+        proxied = _card_with_extras(
+            card,
+            transport=["http-sse"],
+            local_endpoint="http://127.0.0.1:8765",
+        )
+        transport = manager._create_transport(proxied, make_token())
+        assert isinstance(transport, HttpSSETransport)
+        assert transport.endpoint == "http://127.0.0.1:8765"
+
+
+class TestKind3StdioLaunchMapping:
+    @pytest.mark.anyio
+    async def test_stdio_command_unchanged(self, manager):
+        card = make_card("stdio", endpoint=None, stdio_cmd="python -m myserver")
+        transport = manager._create_transport(card, make_token())
+        assert isinstance(transport, StdioTransport)
+        assert transport.command == "python -m myserver"
+
+    @pytest.mark.parametrize(
+        "extras,expected",
+        [
+            ({"command": "npx -y @scope/mcp-server"}, "npx -y @scope/mcp-server"),
+            ({"bin": "./mcp-server"}, "./mcp-server"),
+            ({"runtime": "npx", "package": "@scope/mcp-server"}, "npx -y @scope/mcp-server"),
+            ({"runtime": "uvx", "package": "mcp-server-git"}, "uvx mcp-server-git"),
+            ({"runtime": "docker", "package": "myimg:latest"}, "docker run -i --rm myimg:latest"),
+            ({"runtime": "python", "package": "src.server"}, "python3 src.server"),
+            ({"runtime": "binary", "package": "bin/server"}, "bin/server"),
+        ],
+    )
+    @pytest.mark.anyio
+    async def test_maps_command_bin_runtime_like_install_kinds(self, manager, extras, expected):
+        card = make_card("stdio", endpoint=None, stdio_cmd=None)
+        proxied = _card_with_extras(card, **extras)
+        transport = manager._create_transport(proxied, make_token())
+        assert isinstance(transport, StdioTransport)
+        assert transport.command == expected
+
+    @pytest.mark.anyio
+    async def test_prefers_explicit_stdio_command_over_runtime(self, manager):
+        card = make_card("stdio", endpoint=None, stdio_cmd="uvx mcp-server-git")
+        proxied = _card_with_extras(card, runtime="npx", package="@scope/other")
+        transport = manager._create_transport(proxied, make_token())
+        assert isinstance(transport, StdioTransport)
+        assert transport.command == "uvx mcp-server-git"
+
+    @pytest.mark.anyio
+    async def test_mixed_http_and_stdio_without_endpoint_falls_back_to_stdio(self, manager):
+        card = make_card("http+sse", endpoint=None, stdio_cmd="npx -y echo")
+        card.transport = ["http+sse", "stdio"]
+        transport = manager._create_transport(card, make_token())
+        assert isinstance(transport, StdioTransport)
+        assert transport.command == "npx -y echo"
+
+
+class TestStdioTransportSafety:
+    def test_stdio_connect_does_not_use_shell_true(self):
+        import inspect
+        from pharos_discovery.connection import manager as mgr_mod
+
+        source = inspect.getsource(mgr_mod.StdioTransport.connect)
+        source += inspect.getsource(mgr_mod.ConnectionManager._create_transport)
+        assert "shell=True" not in source
+        assert "create_subprocess_shell" not in source
+        assert "pharos " not in source
